@@ -464,28 +464,6 @@ def _read_key(timeout=0.1):
         return None
 
 
-def _open_sources(mic_index, capture_system):
-    """
-    Start the mic recorder (and the optional system-audio tap) concurrently.
-    Returns (started_recorders, note). Raises if the mic cannot be opened
-    (critical); a tap failure is non-fatal and reported via `note`.
-    """
-    started = []
-    if mic_index is not None:
-        mic = DeviceRecorder(mic_index)
-        mic.start()                   # propagate mic errors to caller
-        started.append(mic)
-    note = None
-    if capture_system:
-        try:
-            tap = TapRecorder()
-            tap.start()
-            started.append(tap)
-        except Exception as e:
-            note = f"system audio unavailable: {e}"
-    return started, note
-
-
 def _finalize_to_wav(started, audio_path, target_fs=16000):
     """Stop already-stopped sources' data: resample each to 16k mono, mix, write
     a mono WAV. Returns the number of samples written (0 if nothing captured)."""
@@ -631,6 +609,12 @@ def _tui_body(state):
         title = f"[blink bold red]●[/] [bold]REC[/] {mm:02d}:{ss:02d}"
         return Panel(Text.from_markup(_meters_markup(state.recorders)),
                      title=title, title_align="left", border_style="red")
+    if state.mode == "preparing":
+        msg = (f"[bold yellow]Preparing to record…[/bold yellow]\n\n"
+               f"[dim]{state.status}[/dim]\n\n"
+               f"[dim]The first run may compile a helper or ask for a permission; "
+               f"recording starts as soon as this finishes.[/dim]")
+        return Panel(Text.from_markup(msg), title="Please wait", border_style="yellow")
     if state.mode == "transcribing":
         msg = ("[bold yellow]Transcribing…[/bold yellow]\n\n"
                "[dim]The model loads on first use — this can take a moment.[/dim]")
@@ -662,6 +646,7 @@ def _tui_body(state):
 def _tui_footer(state):
     keymap = {
         "home": "[r] Record   [l] Language   [d] Microphone   [s] System audio   [p] Folder   [q] Quit",
+        "preparing": "please wait…",
         "recording": "[q] Stop & transcribe",
         "transcribing": "working…",
         "mic_picker": "[1-9] Select   [Esc] Cancel",
@@ -682,30 +667,79 @@ def _tui_render(state):
     return layout
 
 
-def _start_recording(state):
+def _start_recording(state, live):
+    """
+    Set up the recording sources, keeping the user informed during the (possibly
+    slow) initialization — opening the mic, and especially starting the system
+    audio tap, which on the first run may compile a helper or wait on a macOS
+    permission. Shows a "Preparing…" screen, then switches to the recording view
+    only once capture has actually begun.
+    """
+    def announce(msg):
+        state.status = msg
+        live.update(_tui_render(state))
+
+    state.mode = "preparing"
+    announce("Creating project folder…")
+
     project_dir = state.base_path / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     try:
         project_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         state.status = f"Folder error: {e}"
+        state.mode = "home"
         return
-    try:
-        started, note = _open_sources(state.mic_index, state.capture_system)
-    except Exception as e:
-        state.status = f"Microphone error: {e}"
-        return
+
+    started = []
+    sys_failed = False
+
+    # Microphone — critical: abort the recording if it can't open.
+    if state.mic_index is not None:
+        announce(f"Opening microphone ({device_name(state.mic_index)})…")
+        try:
+            mic = DeviceRecorder(state.mic_index)
+            mic.start()
+            started.append(mic)
+        except Exception as e:
+            for r in started:
+                try:
+                    r.stop()
+                except Exception:
+                    pass
+            state.status = f"Microphone error: {e}"
+            state.mode = "home"
+            try:
+                project_dir.rmdir()
+            except Exception:
+                pass
+            return
+
+    # System audio — best effort: continue mic-only if it can't start.
+    if state.capture_system:
+        announce("Starting system audio… (first run may compile a helper or ask for permission)")
+        try:
+            tap = TapRecorder()
+            tap.start()
+            started.append(tap)
+        except Exception as e:
+            sys_failed = True
+            announce(f"System audio unavailable ({e}); continuing mic-only")
+
     if not started:
         state.status = "No microphone available."
+        state.mode = "home"
         try:
             project_dir.rmdir()
         except Exception:
             pass
         return
+
     state.recorders = started
     state.project_dir = project_dir
     state.rec_start = time.monotonic()
-    state.status = note or "Recording…"
     state.mode = "recording"
+    if not sys_failed:
+        state.status = "Recording started — speak now."
 
 
 def _stop_and_transcribe(state, live):
@@ -753,7 +787,7 @@ def _tui_handle_key(key, state, live):
         if key in ("q", "Q"):
             return False
         if key in ("r", "R", " "):
-            _start_recording(state)
+            _start_recording(state, live)
         elif key in ("l", "L"):
             state.language = "en" if state.language == "tr" else "tr"
             state.cfg["language"] = state.language

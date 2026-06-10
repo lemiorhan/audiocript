@@ -93,6 +93,12 @@ The app opens a full-screen interface. Controls are single keypresses (no Enter)
 
 `Ctrl-C` exits cleanly at any time.
 
+When you press `r`, the app shows a **"Preparing to record…"** screen while it
+opens the microphone and starts system-audio capture (the first run may compile a
+small helper or ask for a permission). It switches to the recording view and shows
+**"Recording started — speak now."** only once capture has actually begun — so you
+never start talking before it's listening.
+
 While recording, the panel shows a live **VU meter** for each source:
 
 ![Microphone picker](assets/screenshot-mic-picker.png)
