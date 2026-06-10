@@ -24,6 +24,9 @@ All notable changes to this project are documented here. The format is based on
 - **Open the transcript in an app** after each run, chosen from a filterable list
   of installed apps (`o`). Defaults to Sublime Text if installed; can be disabled.
   Stored as `open_app` in `config.json`.
+- **Import an existing media file** (`f`): pick an `mp4`/`mov`/`wav`/`mp3`/`m4a`
+  via the native file picker; its audio is extracted with ffmpeg into a new
+  project folder (`audio.wav`, 16 kHz mono) and transcribed like a recording.
 - Per-language transcription models: `selimc/whisper-large-v3-turbo-turkish`
   (Turkish, Transformers) and `ggml-distil-large-v3` (English, whisper.cpp).
 - Automatic device selection for models (CUDA → Apple Silicon MPS/Metal → CPU).

@@ -22,6 +22,9 @@ machine; no audio leaves your computer.
 - **Record mic + system audio together** — your voice (microphone) and the
   computer's output (a call, a video) are captured simultaneously and mixed into
   one mono track for transcription.
+- **Transcribe an existing file** — import an `mp4`, `mov`, `wav`, `mp3` or `m4a`
+  file (native file picker); its audio is extracted into a new project folder and
+  transcribed just like a recording.
 - **System audio without BlackHole** — uses a native macOS **Core Audio process
   tap**, so playback keeps playing through your speakers/headphones normally. No
   virtual cable, no Multi-Output Device, no rerouting.
@@ -50,6 +53,8 @@ machine; no audio leaves your computer.
 - **Xcode / Command Line Tools (`swiftc`)** — only needed for the optional
   system-audio capture (a tiny Swift helper is compiled on first use). Plain
   microphone recording does not require it.
+- **ffmpeg** — only needed to import/transcribe existing media files
+  (`brew install ffmpeg`). Recording does not require it.
 
 The first run downloads the transcription models (English ≈ 1.5 GB, Turkish
 ≈ 1.6 GB) and caches them; later runs are offline-capable for cached models.
@@ -88,6 +93,7 @@ The app opens a full-screen interface. Controls are single keypresses (no Enter)
 | Key | Action |
 |-----|--------|
 | `r` (or `Space`) | Start recording |
+| `f` | Import an existing audio/video file and transcribe it |
 | `q` | While recording: **stop & transcribe**. On the home screen: **quit** |
 | `l` | Toggle transcription language (TR ⇄ EN) |
 | `d` | Open the microphone picker (`1`–`9` to choose, `Esc` to cancel) |
@@ -110,6 +116,14 @@ While recording, the panel shows a live **VU meter** for each source:
 When you stop, the app shows a "Transcribing…" panel (the model loads on first
 use), then displays the transcript, saves it, and (optionally) opens it in your
 chosen app.
+
+### Transcribe an existing file
+
+Press `f` to transcribe a file you already have. A native file picker opens; choose
+an `mp4`, `mov`, `wav`, `mp3` or `m4a` file. Its audio is extracted (via ffmpeg)
+into a **new project folder** as `audio.wav` (16 kHz mono) and transcribed using
+the current language — identical to a recording, including the saved
+`transcription.txt` and auto-open.
 
 ### Open the transcript in an app
 
@@ -210,8 +224,9 @@ requirements.txt
 docs/superpowers/specs/        # design notes
 ```
 
-There is also `mp4-transcriptor.py`, an unrelated helper for transcribing MP4
-files (not part of the TUI app).
+There is also a standalone `mp4-transcriptor.py` helper that predates the in-app
+**Import file** feature (`f`); for most uses, importing a file in the app is the
+simpler path.
 
 ---
 

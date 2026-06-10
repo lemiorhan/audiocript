@@ -507,6 +507,53 @@ def _open_in_app(app, path):
         return str(e)
 
 
+# Importable external media: audio is extracted from these and transcribed.
+IMPORT_EXTS = (".mp4", ".mov", ".wav", ".mp3", ".m4a")
+
+
+def _choose_media_file():
+    """Open the native macOS file picker for an audio/video file.
+    Returns the chosen POSIX path, or None if cancelled/unavailable."""
+    osa = shutil.which("osascript")
+    if not osa:
+        return None
+    script = (
+        'set theFile to choose file with prompt "Select an audio or video file to transcribe" '
+        'of type {"mp4","mov","wav","mp3","m4a","public.movie","public.audio"}\n'
+        'POSIX path of theFile'
+    )
+    try:
+        res = subprocess.run([osa, "-e", script], capture_output=True, text=True)
+        if res.returncode != 0:
+            return None  # user cancelled or an error occurred
+        path = res.stdout.strip()
+        return path or None
+    except Exception:
+        return None
+
+
+def _extract_audio(src, dest_wav, target_fs=16000):
+    """Extract/convert `src` media to a 16 kHz mono PCM WAV at `dest_wav` using
+    ffmpeg. Returns None on success or an error string."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return "ffmpeg not found — install it (e.g. 'brew install ffmpeg')"
+    try:
+        res = subprocess.run(
+            [ffmpeg, "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", str(target_fs),
+             "-c:a", "pcm_s16le", str(dest_wav)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+        if res.returncode != 0:
+            tail = (res.stderr or "").strip().splitlines()
+            return f"ffmpeg failed: {tail[-1] if tail else res.returncode}"
+        if not Path(dest_wav).exists() or Path(dest_wav).stat().st_size == 0:
+            return "ffmpeg produced no audio (no audio track?)"
+        return None
+    except Exception as e:
+        return str(e)
+
+
 def pick_device():
     """transformers pipeline için uygun cihazı seçer (CUDA > MPS > CPU)."""
     import torch
@@ -682,10 +729,10 @@ def _tui_body(state):
         return Panel(Text.from_markup(_meters_markup(state.recorders)),
                      title=title, title_align="left", border_style="red")
     if state.mode == "preparing":
-        msg = (f"[bold yellow]Preparing to record…[/bold yellow]\n\n"
+        msg = (f"[bold yellow]Preparing…[/bold yellow]\n\n"
                f"[dim]{state.status}[/dim]\n\n"
-               f"[dim]The first run may compile a helper or ask for a permission; "
-               f"recording starts as soon as this finishes.[/dim]")
+               f"[dim]The first run may compile a helper, ask for a permission, or "
+               f"load a model; this can take a moment.[/dim]")
         return Panel(Text.from_markup(msg), title="Please wait", border_style="yellow")
     if state.mode == "transcribing":
         msg = ("[bold yellow]Transcribing…[/bold yellow]\n\n"
@@ -729,7 +776,7 @@ def _tui_body(state):
 
 def _tui_footer(state):
     keymap = {
-        "home": "[r] Record  [l] Language  [d] Microphone  [s] System audio  [o] Open-with  [p] Folder  [q] Quit",
+        "home": "[r] Record  [f] Import file  [l] Language  [d] Microphone  [s] System audio  [o] Open-with  [p] Folder  [q] Quit",
         "preparing": "please wait…",
         "recording": "[q] Stop & transcribe",
         "transcribing": "working…",
@@ -844,7 +891,13 @@ def _stop_and_transcribe(state, live):
             pass
         state.mode = "home"
         return
-    # Show the transcribing screen before the (blocking) model call.
+    _transcribe_and_save(state, live, state.project_dir, audio_path)
+
+
+def _transcribe_and_save(state, live, project_dir, audio_path):
+    """Transcribe `audio_path` (in `project_dir`), save transcription.txt, update
+    the UI, and open the transcript in the chosen app. Shared by recording and
+    file-import flows."""
     state.mode = "transcribing"
     state.status = "Transcribing…"
     live.update(_tui_render(state))
@@ -854,7 +907,7 @@ def _stop_and_transcribe(state, live):
         state.status = f"Transcription error: {e}"
         state.mode = "home"
         return
-    transcript_path = state.project_dir / "transcription.txt"
+    transcript_path = project_dir / "transcription.txt"
     try:
         with open(transcript_path, "w", encoding="utf-8") as f:
             f.write(text + "\n")
@@ -863,14 +916,55 @@ def _stop_and_transcribe(state, live):
         state.mode = "home"
         return
     state.last_transcript = text
-    state.last_project = state.project_dir
-    state.status = f"Saved to {state.project_dir.name}"
-    # Open the transcript in the chosen app (if any).
+    state.last_project = project_dir
+    state.status = f"Saved to {project_dir.name}"
     if state.open_app:
         err = _open_in_app(state.open_app, transcript_path)
         state.status = (f"Saved — could not open in {state.open_app}"
                         if err else f"Saved & opened in {state.open_app}")
     state.mode = "home"
+
+
+def _import_file(state, live):
+    """Let the user pick an external media file, extract its audio into a new
+    project folder, and transcribe it like a recording."""
+    state.mode = "preparing"
+    state.status = "Opening file picker…"
+    live.update(_tui_render(state))
+
+    src = _choose_media_file()
+    if not src:
+        state.status = "Import cancelled."
+        state.mode = "home"
+        return
+    ext = os.path.splitext(src)[1].lower()
+    if ext not in IMPORT_EXTS:
+        state.status = f"Unsupported file type '{ext}' (use mp4/mov/wav/mp3/m4a)."
+        state.mode = "home"
+        return
+
+    project_dir = state.base_path / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    try:
+        project_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        state.status = f"Folder error: {e}"
+        state.mode = "home"
+        return
+
+    state.status = f"Extracting audio from {os.path.basename(src)}…"
+    live.update(_tui_render(state))
+    audio_path = project_dir / "audio.wav"
+    err = _extract_audio(src, audio_path)
+    if err:
+        state.status = f"Import failed: {err}"
+        try:
+            project_dir.rmdir()
+        except Exception:
+            pass
+        state.mode = "home"
+        return
+
+    _transcribe_and_save(state, live, project_dir, audio_path)
 
 
 def _tui_handle_key(key, state, live):
@@ -881,6 +975,8 @@ def _tui_handle_key(key, state, live):
             return False
         if key in ("r", "R", " "):
             _start_recording(state, live)
+        elif key in ("f", "F"):
+            _import_file(state, live)
         elif key in ("l", "L"):
             state.language = "en" if state.language == "tr" else "tr"
             state.cfg["language"] = state.language
