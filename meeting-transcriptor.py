@@ -450,12 +450,18 @@ def _read_key(timeout=0.1):
     ch = os.read(fd, 1)
     if not ch:
         return None
-    if ch == b"\x1b":                 # ESC or an arrow/escape sequence
+    if ch == b"\x1b":                 # ESC, or an arrow/navigation sequence
         r2, _, _ = select.select([sys.stdin], [], [], 0.0008)
-        if r2:
-            os.read(fd, 8)            # swallow the rest of the sequence
-            return "ESC_SEQ"
-        return "ESC"
+        if not r2:
+            return "ESC"
+        seq = os.read(fd, 8).decode("ascii", "ignore")
+        nav = {
+            "[A": "UP", "[B": "DOWN", "[C": "RIGHT", "[D": "LEFT",
+            "OA": "UP", "OB": "DOWN", "OC": "RIGHT", "OD": "LEFT",
+            "[5~": "PGUP", "[6~": "PGDN", "[H": "HOME", "[F": "END",
+            "[1~": "HOME", "[4~": "END",
+        }
+        return nav.get(seq, "ESC_SEQ")
     if ch in (b"\r", b"\n"):
         return "ENTER"
     if ch in (b"\x7f", b"\x08"):
@@ -668,6 +674,66 @@ def transcribe_audio(filepath, language_code, on_progress=None, duration=None):
     return result.get("text", "")
 
 
+# =========================== Recordings (metadata + listing) ===========================
+
+def _read_meta(project_dir):
+    """Read a recording's meta.json ({name, language, …}); {} if missing/bad."""
+    try:
+        with open(Path(project_dir) / "meta.json", encoding="utf-8") as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_meta(project_dir, **fields):
+    """Merge non-None `fields` into the recording's meta.json."""
+    meta = _read_meta(project_dir)
+    meta.update({k: v for k, v in fields.items() if v is not None})
+    try:
+        with open(Path(project_dir) / "meta.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _fmt_created(dirname):
+    """Format a 'YYYY-MM-DD_HH-MM-SS' folder name as 'YYYY-MM-DD HH:MM'."""
+    try:
+        return datetime.strptime(dirname, "%Y-%m-%d_%H-%M-%S").strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return dirname
+
+
+def list_recordings(base_path):
+    """List recording projects under base_path (newest first). Each item:
+    {dir, name, language, created, sortkey, has_transcript}."""
+    recs = []
+    try:
+        entries = [d for d in Path(base_path).iterdir() if d.is_dir()]
+    except Exception:
+        entries = []
+    for d in entries:
+        has_tx = (d / "transcription.txt").exists()
+        if not has_tx and not (d / "audio.wav").exists():
+            continue
+        meta = _read_meta(d)
+        recs.append({
+            "dir": d,
+            "name": meta.get("name", "") or "",
+            "language": meta.get("language", "") or "",
+            "created": _fmt_created(d.name),
+            "sortkey": d.name,
+            "has_transcript": has_tx,
+        })
+    recs.sort(key=lambda r: r["sortkey"], reverse=True)
+    return recs
+
+
+def _rec_display_name(rec):
+    return rec["name"] or "Untitled"
+
+
 # =========================== Full-screen TUI ===========================
 
 def _resolve_mic_index(cfg):
@@ -690,7 +756,9 @@ class _TuiState:
         self.language = cfg.get("language") or "tr"
         self.mic_index = _resolve_mic_index(cfg)
         self.capture_system = bool(cfg.get("capture_system_audio", False))
-        self.mode = "home"           # home | recording | transcribing | mic_picker | path_edit
+        # modes: menu | recording | preparing | transcribing | importing |
+        #        viewer | name_input | rename | mic_picker | app_picker | path_edit
+        self.mode = "menu"
         self.status = "Ready."
         self.last_transcript = ""
         self.last_project = None
@@ -720,6 +788,21 @@ class _TuiState:
             self.base_path.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
+        # menu navigation
+        self.menu_index = 0
+        self.menu_expanded = {"recordings"}     # which groups are open
+        self.recordings = list_recordings(self.base_path)
+        # transcript viewer
+        self.viewer_rec = None
+        self.viewer_text = ""
+        self.viewer_scroll = 0
+        # naming a new recording/import, and renaming existing ones
+        self.name_buffer = ""
+        self.pending_action = None              # "record" | "import"
+        self.pending_name = ""
+        self.rename_buffer = ""
+        self.rename_target = None               # project dir being renamed
+        self.rename_return = "menu"
 
 
 def _warm_model_async(state, language):
@@ -814,6 +897,99 @@ def _tui_header(state):
                  subtitle=clock, subtitle_align="right", border_style="cyan")
 
 
+def _menu_items(state):
+    """Build the flat list of visible menu rows from the group/expanded state."""
+    items = [
+        {"kind": "action", "action": "record", "label": "  New recording"},
+        {"kind": "action", "action": "import", "label": "  Import file"},
+    ]
+    rec_open = "recordings" in state.menu_expanded
+    items.append({"kind": "group", "group": "recordings",
+                  "label": f"{'▾' if rec_open else '▸'} Recordings ({len(state.recordings)})"})
+    if rec_open:
+        if state.recordings:
+            for rec in state.recordings:
+                items.append({"kind": "recording", "rec": rec})
+        else:
+            items.append({"kind": "info", "label": "      (no recordings yet)"})
+    set_open = "settings" in state.menu_expanded
+    items.append({"kind": "group", "group": "settings",
+                  "label": f"{'▾' if set_open else '▸'} Settings"})
+    if set_open:
+        mic = device_name(state.mic_index) if state.mic_index is not None else "—"
+        items += [
+            {"kind": "setting", "setting": "language", "label": f"      Language: {state.language.upper()}"},
+            {"kind": "setting", "setting": "mic", "label": f"      Microphone: {mic}"},
+            {"kind": "setting", "setting": "system", "label": f"      System audio: {'on' if state.capture_system else 'off'}"},
+            {"kind": "setting", "setting": "openwith", "label": f"      Open with: {state.open_app or 'off'}"},
+            {"kind": "setting", "setting": "folder", "label": f"      Folder: {state.base_path}"},
+        ]
+    items.append({"kind": "action", "action": "quit", "label": "  Quit"})
+    return items
+
+
+def _menu_row_text(it, width):
+    """Plain display text for a menu row (no markup; safe for arbitrary names)."""
+    if it["kind"] == "recording":
+        rec = it["rec"]
+        nm = _rec_display_name(rec)
+        lang = (rec["language"] or "").upper()
+        tx = "" if rec["has_transcript"] else " (no transcript)"
+        return f"      {nm[:30]:<30}  {rec['created']}  {lang}{tx}"
+    return it["label"]
+
+
+def _render_menu(state):
+    items = _menu_items(state)
+    if state.menu_index >= len(items):
+        state.menu_index = len(items) - 1
+    if state.menu_index < 0:
+        state.menu_index = 0
+    # Window the list so the selected row stays visible on small terminals.
+    h = console.size.height
+    visible = max(5, h - 12)
+    n = len(items)
+    start = 0 if n <= visible else min(max(0, state.menu_index - visible // 2), n - visible)
+    window = items[start:start + visible]
+    width = max(20, console.size.width - 6)
+    lines = []
+    if start > 0:
+        lines.append(Text("  ↑ more", style="dim"))
+    for i, it in enumerate(window, start=start):
+        t = Text(_menu_row_text(it, width))
+        if it["kind"] == "group":
+            t.stylize("bold")
+        if i == state.menu_index:
+            t.stylize("reverse")
+        lines.append(t)
+    if start + visible < n:
+        lines.append(Text("  ↓ more", style="dim"))
+    return Panel(Group(*lines) if lines else Text(""),
+                 title="Menu", title_align="left", border_style="cyan")
+
+
+def _render_viewer(state):
+    import textwrap
+    rec = state.viewer_rec or {}
+    title = f"{_rec_display_name(rec)} — transcript"
+    width = max(20, console.size.width - 6)
+    raw = (state.viewer_text or "").splitlines() or ["(empty transcript)"]
+    wrapped = []
+    for ln in raw:
+        wrapped += textwrap.wrap(ln, width) or [""]
+    h = console.size.height
+    visible = max(5, h - 12)
+    total = len(wrapped)
+    state.viewer_scroll = max(0, min(state.viewer_scroll, max(0, total - visible)))
+    window = wrapped[state.viewer_scroll:state.viewer_scroll + visible]
+    lines = [Text(ln) for ln in window]
+    if total > visible:
+        pos = f"  [{state.viewer_scroll + 1}-{min(total, state.viewer_scroll + visible)}/{total}]"
+        title += pos
+    return Panel(Group(*lines) if lines else Text(""),
+                 title=title, title_align="left", border_style="green")
+
+
 def _tui_body(state):
     if state.mode == "importing":
         return _import_panel(state)
@@ -859,23 +1035,36 @@ def _tui_body(state):
         filt = f"\n\n[dim]filter:[/dim] {state.app_filter}[blink]▏[/blink]"
         return Panel(Text.from_markup("\n".join(lines) + extra + filt),
                      title="Open transcript with", border_style="cyan")
-    # home
-    if state.last_transcript:
-        name = state.last_project.name if state.last_project else ""
-        head = Text.from_markup(f"[bold green]Last transcript[/bold green]  [dim]{name}[/dim]")
-        return Panel(Group(head, Text(""), Text(state.last_transcript.strip() or "(empty)")),
-                     border_style="green")
-    return Panel(Text.from_markup("[dim]Press [/dim][bold]r[/bold][dim] to start recording.[/dim]"),
-                 title="Transcript", border_style="green")
+    if state.mode == "viewer":
+        return _render_viewer(state)
+    if state.mode == "name_input":
+        body = Group(
+            Text.from_markup("Name this recording [dim](optional — Enter to skip)[/dim]:"),
+            Text(""),
+            Text(state.name_buffer + "▏"),
+        )
+        return Panel(body, title="Name", border_style="cyan")
+    if state.mode == "rename":
+        body = Group(
+            Text("New name:"),
+            Text(""),
+            Text(state.rename_buffer + "▏"),
+        )
+        return Panel(body, title="Rename recording", border_style="cyan")
+    # default: the main menu
+    return _render_menu(state)
 
 
 def _tui_footer(state):
     keymap = {
-        "home": "[r] Record  [f] Import file  [l] Language  [d] Microphone  [s] System audio  [o] Open-with  [p] Folder  [q] Quit",
+        "menu": "↑/↓ move   Enter open/expand   →/← expand/collapse   q quit",
         "preparing": "please wait…",
         "importing": "importing… please wait",
         "recording": "[q] Stop & transcribe",
         "transcribing": "working…",
+        "viewer": "↑/↓ scroll   PgUp/PgDn page   Enter open in app   r rename   Esc back",
+        "name_input": "[Enter] Start   [Esc] Cancel",
+        "rename": "[Enter] Save   [Backspace] Delete   [Esc] Cancel",
         "mic_picker": "[1-9] Select   [Esc] Cancel",
         "path_edit": "[Enter] Save   [Backspace] Delete   [Esc] Cancel",
         "app_picker": "[1-9] Select   [0] Off   [Enter] First match   type to filter   [Esc] Cancel",
@@ -915,8 +1104,9 @@ def _start_recording(state, live):
         project_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         state.status = f"Folder error: {e}"
-        state.mode = "home"
+        state.mode = "menu"
         return
+    _write_meta(project_dir, name=state.pending_name, language=state.language)
 
     started = []
     sys_failed = False
@@ -935,7 +1125,7 @@ def _start_recording(state, live):
                 except Exception:
                     pass
             state.status = f"Microphone error: {e}"
-            state.mode = "home"
+            state.mode = "menu"
             try:
                 project_dir.rmdir()
             except Exception:
@@ -955,7 +1145,7 @@ def _start_recording(state, live):
 
     if not started:
         state.status = "No microphone available."
-        state.mode = "home"
+        state.mode = "menu"
         try:
             project_dir.rmdir()
         except Exception:
@@ -985,13 +1175,13 @@ def _stop_and_transcribe(state, live):
             state.project_dir.rmdir()
         except Exception:
             pass
-        state.mode = "home"
+        state.mode = "menu"
         return
     _transcribe_and_save(state, live, state.project_dir, audio_path)
 
 
 def _save_and_open(state, project_dir, text):
-    """Write transcription.txt, update last-transcript/status, and open the
+    """Write transcription.txt + meta, refresh the recordings list, and open the
     transcript in the chosen app. Sets state.status; does not change state.mode."""
     transcript_path = project_dir / "transcription.txt"
     try:
@@ -1000,13 +1190,14 @@ def _save_and_open(state, project_dir, text):
     except Exception as e:
         state.status = f"Save error: {e}"
         return
-    state.last_transcript = text
-    state.last_project = project_dir
-    state.status = f"Saved to {project_dir.name}"
+    _write_meta(project_dir, name=state.pending_name, language=state.language)
+    state.recordings = list_recordings(state.base_path)
+    label = state.pending_name or project_dir.name
+    state.status = f"Saved “{label}”"
     if state.open_app:
         err = _open_in_app(state.open_app, transcript_path)
         state.status = (f"Saved — could not open in {state.open_app}"
-                        if err else f"Saved & opened in {state.open_app}")
+                        if err else f"Saved “{label}” & opened in {state.open_app}")
 
 
 def _transcribe_and_save(state, live, project_dir, audio_path):
@@ -1018,10 +1209,10 @@ def _transcribe_and_save(state, live, project_dir, audio_path):
         text = transcribe_audio(audio_path, state.language)
     except Exception as e:
         state.status = f"Transcription error: {e}"
-        state.mode = "home"
+        state.mode = "menu"
         return
     _save_and_open(state, project_dir, text)
-    state.mode = "home"
+    state.mode = "menu"
 
 
 def _import_worker(state, src, project_dir):
@@ -1043,7 +1234,7 @@ def _import_worker(state, src, project_dir):
             project_dir.rmdir()
         except Exception:
             pass
-        state.mode = "home"
+        state.mode = "menu"
         return
 
     # Phase 2: transcribe (real % for English via segments; indeterminate for tr).
@@ -1059,11 +1250,11 @@ def _import_worker(state, src, project_dir):
         )
     except Exception as e:
         state.status = f"Transcription error: {e}"
-        state.mode = "home"
+        state.mode = "menu"
         return
 
     _save_and_open(state, project_dir, text)
-    state.mode = "home"
+    state.mode = "menu"
 
 
 def _import_file(state, live):
@@ -1076,12 +1267,12 @@ def _import_file(state, live):
     src = _choose_media_file()
     if not src:
         state.status = "Import cancelled."
-        state.mode = "home"
+        state.mode = "menu"
         return
     ext = os.path.splitext(src)[1].lower()
     if ext not in IMPORT_EXTS:
         state.status = f"Unsupported file type '{ext}' (use mp4/mov/wav/mp3/m4a)."
-        state.mode = "home"
+        state.mode = "menu"
         return
 
     project_dir = state.base_path / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1089,8 +1280,12 @@ def _import_file(state, live):
         project_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         state.status = f"Folder error: {e}"
-        state.mode = "home"
+        state.mode = "menu"
         return
+    # Default an unnamed import to the source file's base name.
+    if not state.pending_name:
+        state.pending_name = os.path.splitext(os.path.basename(src))[0]
+    _write_meta(project_dir, name=state.pending_name, language=state.language)
 
     state.import_src = os.path.basename(src)
     state.import_phase = ""
@@ -1101,43 +1296,170 @@ def _import_file(state, live):
                      daemon=True).start()
 
 
+def _begin_named(state, action):
+    """Ask for a name, then run `action` ('record' or 'import')."""
+    state.pending_action = action
+    state.name_buffer = ""
+    state.mode = "name_input"
+
+
+def _open_viewer(state, rec):
+    state.viewer_rec = rec
+    state.viewer_scroll = 0
+    tx = rec["dir"] / "transcription.txt"
+    try:
+        state.viewer_text = tx.read_text(encoding="utf-8") if tx.exists() else "(no transcript)"
+    except Exception as e:
+        state.viewer_text = f"(could not read transcript: {e})"
+    state.mode = "viewer"
+
+
+def _activate_setting(state, live, setting):
+    if setting == "language":
+        state.language = "en" if state.language == "tr" else "tr"
+        state.cfg["language"] = state.language
+        save_config(state.cfg)
+        state.status = f"Language set to {state.language.upper()}"
+        _warm_model_async(state, state.language)
+    elif setting == "system":
+        state.capture_system = not state.capture_system
+        state.cfg["capture_system_audio"] = state.capture_system
+        save_config(state.cfg)
+        state.status = f"System audio {'on' if state.capture_system else 'off'}"
+    elif setting == "mic":
+        state.devices = list_input_devices()
+        state.mode = "mic_picker"
+    elif setting == "openwith":
+        state.apps = list_installed_apps()
+        state.app_filter = ""
+        state.mode = "app_picker"
+    elif setting == "folder":
+        state.path_buffer = str(state.base_path)
+        state.mode = "path_edit"
+
+
+def _menu_activate(state, live, cur):
+    kind = cur["kind"]
+    if kind == "group":
+        g = cur["group"]
+        if g in state.menu_expanded:
+            state.menu_expanded.discard(g)
+        else:
+            state.menu_expanded.add(g)
+            if g == "recordings":
+                state.recordings = list_recordings(state.base_path)
+    elif kind == "action":
+        if cur["action"] in ("record", "import"):
+            _begin_named(state, cur["action"])
+    elif kind == "recording":
+        _open_viewer(state, cur["rec"])
+    elif kind == "setting":
+        _activate_setting(state, live, cur["setting"])
+
+
+def _start_rename(state, rec, return_mode):
+    state.rename_target = rec["dir"]
+    state.rename_buffer = rec["name"]
+    state.rename_return = return_mode
+    state.mode = "rename"
+
+
 def _tui_handle_key(key, state, live):
     """Dispatch a keystroke. Returns False to quit, True to keep running."""
     mode = state.mode
-    if mode == "home":
+    if mode == "menu":
+        items = _menu_items(state)
+        state.menu_index = max(0, min(state.menu_index, len(items) - 1))
+        cur = items[state.menu_index]
         if key in ("q", "Q"):
             return False
-        if key in ("r", "R", " "):
-            _start_recording(state, live)
-        elif key in ("f", "F"):
-            _import_file(state, live)
-        elif key in ("l", "L"):
-            state.language = "en" if state.language == "tr" else "tr"
-            state.cfg["language"] = state.language
-            save_config(state.cfg)
-            state.status = f"Language set to {state.language.upper()}"
-            _warm_model_async(state, state.language)  # pre-load the new language
-        elif key in ("s", "S"):
-            state.capture_system = not state.capture_system
-            state.cfg["capture_system_audio"] = state.capture_system
-            save_config(state.cfg)
-            state.status = f"System audio {'on' if state.capture_system else 'off'}"
-        elif key in ("d", "D"):
-            state.devices = list_input_devices()
-            state.mode = "mic_picker"
-        elif key in ("o", "O"):
-            state.apps = list_installed_apps()
-            state.app_filter = ""
-            state.mode = "app_picker"
-        elif key in ("p", "P"):
-            state.path_buffer = str(state.base_path)
-            state.mode = "path_edit"
+        elif key in ("UP", "k"):
+            state.menu_index = (state.menu_index - 1) % len(items)
+        elif key in ("DOWN", "j"):
+            state.menu_index = (state.menu_index + 1) % len(items)
+        elif key == "RIGHT":
+            if cur["kind"] == "group":
+                state.menu_expanded.add(cur["group"])
+                if cur["group"] == "recordings":
+                    state.recordings = list_recordings(state.base_path)
+        elif key == "LEFT":
+            if cur["kind"] == "group":
+                state.menu_expanded.discard(cur["group"])
+        elif key == "ENTER":
+            if cur["kind"] == "action" and cur["action"] == "quit":
+                return False
+            _menu_activate(state, live, cur)
+        elif key in ("r", "R") and cur["kind"] == "recording":
+            _start_rename(state, cur["rec"], "menu")
+    elif mode == "name_input":
+        if key == "ESC":
+            state.mode = "menu"
+        elif key == "ENTER":
+            state.pending_name = state.name_buffer.strip()
+            action = state.pending_action
+            state.pending_action = None
+            if action == "record":
+                _start_recording(state, live)
+            elif action == "import":
+                _import_file(state, live)
+            else:
+                state.mode = "menu"
+        elif key == "BACKSPACE":
+            state.name_buffer = state.name_buffer[:-1]
+        elif key and len(key) == 1 and key.isprintable():
+            state.name_buffer += key
+    elif mode == "viewer":
+        page = max(1, console.size.height - 12)
+        if key in ("ESC", "LEFT", "q", "Q"):
+            state.mode = "menu"
+        elif key in ("UP", "k"):
+            state.viewer_scroll = max(0, state.viewer_scroll - 1)
+        elif key in ("DOWN", "j"):
+            state.viewer_scroll += 1
+        elif key == "PGUP":
+            state.viewer_scroll = max(0, state.viewer_scroll - page)
+        elif key == "PGDN":
+            state.viewer_scroll += page
+        elif key == "HOME":
+            state.viewer_scroll = 0
+        elif key == "END":
+            state.viewer_scroll = 10 ** 9   # clamped at render
+        elif key == "ENTER":
+            tx = state.viewer_rec["dir"] / "transcription.txt"
+            if state.open_app:
+                err = _open_in_app(state.open_app, tx)
+                state.status = (f"Could not open in {state.open_app}" if err
+                                else f"Opened in {state.open_app}")
+            else:
+                try:
+                    subprocess.run(["open", str(tx)], check=False)
+                    state.status = "Opened transcript"
+                except Exception as e:
+                    state.status = f"Open error: {e}"
+        elif key in ("r", "R"):
+            _start_rename(state, state.viewer_rec, "viewer")
+    elif mode == "rename":
+        if key == "ESC":
+            state.mode = state.rename_return
+        elif key == "ENTER":
+            new = state.rename_buffer.strip()
+            if state.rename_target is not None:
+                _write_meta(state.rename_target, name=new)
+            state.recordings = list_recordings(state.base_path)
+            if state.viewer_rec and state.viewer_rec.get("dir") == state.rename_target:
+                state.viewer_rec["name"] = new
+            state.status = f"Renamed to “{new or 'Untitled'}”"
+            state.mode = state.rename_return
+        elif key == "BACKSPACE":
+            state.rename_buffer = state.rename_buffer[:-1]
+        elif key and len(key) == 1 and key.isprintable():
+            state.rename_buffer += key
     elif mode == "recording":
         if key in ("q", "Q", "r", "R", " "):
             _stop_and_transcribe(state, live)
     elif mode == "mic_picker":
-        if key in ("ESC", "q", "Q", "d", "D"):
-            state.mode = "home"
+        if key in ("ESC", "q", "Q"):
+            state.mode = "menu"
         elif key and key.isdigit() and key != "0":
             i = int(key)
             if 1 <= i <= len(state.devices):
@@ -1146,18 +1468,18 @@ def _tui_handle_key(key, state, live):
                 state.cfg["input_device"] = name
                 save_config(state.cfg)
                 state.status = f"Microphone: {name}"
-                state.mode = "home"
+                state.mode = "menu"
     elif mode == "app_picker":
         flt = state.app_filter.lower()
         matches = [a for a in state.apps if flt in a.lower()]
         if key == "ESC":
-            state.mode = "home"
+            state.mode = "menu"
         elif key == "0":
             state.open_app = None
             state.cfg["open_app"] = None
             save_config(state.cfg)
             state.status = "Auto-open disabled"
-            state.mode = "home"
+            state.mode = "menu"
         elif key and key.isdigit():
             i = int(key)
             if 1 <= i <= min(9, len(matches)):
@@ -1165,21 +1487,21 @@ def _tui_handle_key(key, state, live):
                 state.cfg["open_app"] = state.open_app
                 save_config(state.cfg)
                 state.status = f"Open transcripts with: {state.open_app}"
-                state.mode = "home"
+                state.mode = "menu"
         elif key == "ENTER":
             if matches:
                 state.open_app = matches[0]
                 state.cfg["open_app"] = state.open_app
                 save_config(state.cfg)
                 state.status = f"Open transcripts with: {state.open_app}"
-                state.mode = "home"
+                state.mode = "menu"
         elif key == "BACKSPACE":
             state.app_filter = state.app_filter[:-1]
         elif key and len(key) == 1 and key.isprintable():
             state.app_filter += key
     elif mode == "path_edit":
         if key == "ESC":
-            state.mode = "home"
+            state.mode = "menu"
         elif key == "ENTER":
             raw = state.path_buffer.strip() or str(state.base_path)
             p = Path(os.path.expanduser(raw)).resolve()
@@ -1188,10 +1510,12 @@ def _tui_handle_key(key, state, live):
                 state.base_path = p
                 state.cfg["base_path"] = str(p)
                 save_config(state.cfg)
+                state.recordings = list_recordings(p)
+                state.menu_index = 0
                 state.status = f"Folder: {p}"
             except Exception as e:
                 state.status = f"Folder error: {e}"
-            state.mode = "home"
+            state.mode = "menu"
         elif key == "BACKSPACE":
             state.path_buffer = state.path_buffer[:-1]
         elif key and len(key) == 1 and key.isprintable():

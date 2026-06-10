@@ -6,8 +6,15 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
-- Full-screen terminal UI (Rich) with single-key controls: record, language,
-  microphone picker, system-audio toggle, folder edit, quit.
+- **Arrow-key navigation** with a grouped, collapsible menu (New recording,
+  Import file, Recordings ▸ list, Settings ▸ language/mic/system-audio/open-with/
+  folder, Quit) — replaces the long single-key shortcut row.
+- **Named recordings**: name a recording/import when creating it, and rename any
+  recording at any time (`r`). Names are stored per project in `meta.json`.
+- **Recordings list**: browse all recordings (name, date, language) in the menu.
+- **In-app transcript viewer**: open a recording to read its transcript with
+  scrolling (↑/↓, PgUp/PgDn, Home/End); `Enter` opens it in your external app.
+- Full-screen terminal UI (Rich).
 - Record the **microphone and system audio together**, mixed into one 16 kHz mono
   track for transcription.
 - System-audio capture via a native macOS **Core Audio process tap** (Swift
