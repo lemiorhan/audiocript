@@ -493,12 +493,18 @@ def record_audio(filepath, mic_device, capture_system=False, target_fs=16000):
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
-    while not stop_flag[0]:
-        sd.sleep(100)
-    listener.join()
-
-    for r in started:
-        r.stop()
+    # try/finally: Ctrl-C (KeyboardInterrupt) veya başka bir hata olsa bile tüm
+    # kayıt kaynaklarını (özellikle tap alt sürecini) mutlaka durdur.
+    try:
+        while not stop_flag[0]:
+            sd.sleep(100)
+    finally:
+        try:
+            listener.stop()
+        except Exception:
+            pass
+        for r in started:
+            r.stop()
 
     # Her kaynağı KENDİ hızından 16000 Hz mono'ya yeniden örnekle, sonra birleştir.
     resampled = []
@@ -637,5 +643,21 @@ def main():
         # Diğer her durumda (Enter dahil) yeni kayda devam edilir.
 
 
+def _handle_sigterm(signum, frame):
+    # `kill` (SIGTERM) gelince Ctrl-C ile aynı temiz çıkış yolunu kullan:
+    # KeyboardInterrupt fırlatınca record_audio'daki finally tüm kaynakları
+    # (tap alt süreci dahil) durdurur ve aşağıdaki handler temiz mesaj basar.
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
-    main()
+    import signal
+    try:
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    except Exception:
+        pass
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[bold yellow]Çıkılıyor...[/bold yellow]")
+        sys.exit(0)
