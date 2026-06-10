@@ -162,38 +162,28 @@ def select_input_device(cfg):
     return idx
 
 
-def resolve_input_device(cfg):
-    """Config'teki cihazı çözer; kayıtlı cihaz yoksa/bulunamazsa seçim ister."""
-    name = cfg.get("input_device")
-    if name:
-        for idx, dev_name in list_input_devices():
-            if dev_name == name:
-                console.print(f"[blue]Giriş cihazı:[/blue] [cyan]{name}[/cyan] (index {idx})\n")
-                return idx
-        console.print(f"[yellow]Kayıtlı cihaz '{name}' bulunamadı; lütfen yeniden seçin.[/yellow]")
-    return select_input_device(cfg)
-
-
-def select_system_device(cfg):
+def select_speaker_device(cfg):
     """
-    İsteğe bağlı 'sistem sesi' (ör. Zoom çıkışı) kaynağını seçtirir. Kullanıcı
-    'kapalı' seçerse mikrofon-tek kayda dönülür. Seçimi config'e isimle kaydeder
-    ve index'i (veya kapalıysa None) döndürür.
+    İsteğe bağlı 'hoparlör / sistem sesi' (ör. Zoom çıkışı) kaynağını seçtirir.
+    macOS bir çıkış (hoparlör) cihazını doğrudan kaydetmeye izin vermediği için,
+    hoparlör sesi yakalanabilir bir loopback giriş cihazından (ör. BlackHole)
+    alınır. Kullanıcı 'kapalı' seçerse mikrofon-tek kayda dönülür. Seçimi config'e
+    isimle kaydeder ve index'i (veya kapalıysa None) döndürür.
     """
     devices = list_input_devices()
     if not devices:
         console.print("[bold red]Giriş yapabilen ses cihazı bulunamadı![/bold red]")
         return None
 
-    console.print("[bold blue]Sistem sesi (Zoom/toplantı) kaynağı seçin:[/bold blue]")
+    console.print("[bold blue]Hoparlör (sistem sesi) kaynağı seçin:[/bold blue]")
     console.print("  [cyan]0[/cyan]) (Kapalı — sadece mikrofon)")
     for n, (idx, name) in enumerate(devices, start=1):
-        hint = "  [dim]<- önerilen[/dim]" if "blackhole" in name.lower() else ""
+        hint = "  [dim]<- önerilen (loopback)[/dim]" if "blackhole" in name.lower() else ""
         console.print(f"  [cyan]{n}[/cyan]) {name}{hint}")
-    console.print("[dim]Not: Zoom sesini yakalamak için Zoom/sistem çıkışını bu cihaza (ör. BlackHole) yönlendirmiş olmalısınız.[/dim]")
+    console.print("[dim]Not: Hoparlör/Zoom sesini yakalamak için sistem (veya Zoom) çıkışını bu loopback cihaza (ör. BlackHole) yönlendirmiş olmalısınız.[/dim]")
 
     # Varsayılan: önceki seçim, yoksa BlackHole varsa onu öner, yoksa kapalı.
-    current_name = cfg.get("system_device")
+    current_name = cfg.get("speaker_device")
     default_choice = "0"
     for n, (_, name) in enumerate(devices, start=1):
         if name == current_name:
@@ -211,28 +201,15 @@ def select_system_device(cfg):
         default=default_choice,
     )
     if choice == "0":
-        cfg.pop("system_device", None)
+        cfg.pop("speaker_device", None)
         save_config(cfg)
-        console.print("[green]Sistem sesi kaynağı kapalı (sadece mikrofon).[/green]\n")
+        console.print("[green]Hoparlör kaynağı kapalı (sadece mikrofon).[/green]\n")
         return None
     idx, name = devices[int(choice) - 1]
-    cfg["system_device"] = name
+    cfg["speaker_device"] = name
     save_config(cfg)
-    console.print(f"[green]Sistem sesi kaynağı: {name} (index {idx})[/green]\n")
+    console.print(f"[green]Hoparlör (sistem sesi) kaynağı: {name} (index {idx})[/green]\n")
     return idx
-
-
-def resolve_system_device(cfg):
-    """Config'teki sistem sesi cihazını çözer; ayarlı değilse/yoksa None döndürür."""
-    name = cfg.get("system_device")
-    if not name:
-        return None
-    for idx, dev_name in list_input_devices():
-        if dev_name == name:
-            console.print(f"[blue]Sistem sesi kaynağı:[/blue] [cyan]{name}[/cyan] (index {idx})\n")
-            return idx
-    console.print(f"[yellow]Kayıtlı sistem sesi cihazı '{name}' bulunamadı; sadece mikrofon kullanılacak.[/yellow]")
-    return None
 
 
 def mix_to_mono(arrays):
@@ -387,19 +364,20 @@ def main():
     clear_console()
     console.print(Panel("Ses Transkripsiyon Uygulaması", style="bold magenta"), justify="center")
 
-    # Başlangıç: proje klasörü, dil, mikrofon ve (isteğe bağlı) sistem sesi
+    # Başlangıç: her seçim, kayıtlı değer varsayılan olarak önerilerek sorulur.
+    # (Enter'a basmak kayıtlı değeri korur.)
     base_path = confirm_base_path(cfg)
-    language = cfg.get("language") or select_language(cfg)
-    device_index = resolve_input_device(cfg)
-    system_index = resolve_system_device(cfg)
+    language = select_language(cfg)
+    device_index = select_input_device(cfg)
+    speaker_index = select_speaker_device(cfg)
 
     while True:
         # Her kayıt için zaman damgalı bir alt klasör (proje) oluştur.
         project_dir = base_path / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         project_dir.mkdir(parents=True, exist_ok=True)
 
-        # Kayıt kaynakları: mikrofon + (varsa) sistem sesi.
-        sources = [device_index] + ([system_index] if system_index is not None else [])
+        # Kayıt kaynakları: mikrofon + (varsa) hoparlör/sistem sesi.
+        sources = [device_index] + ([speaker_index] if speaker_index is not None else [])
 
         audio_path = project_dir / "audio.wav"
         if not record_audio(audio_path, sources):
@@ -423,13 +401,13 @@ def main():
         flush_stdin()
 
         # Kullanıcıya menüyü gösteriyoruz.
-        system_label = device_name(system_index) if system_index is not None else "kapalı"
+        speaker_label = device_name(speaker_index) if speaker_index is not None else "kapalı"
         console.print(
             f"[bold blue]Menü[/bold blue]\n"
             f"  [Enter] Yeni kayıt\n"
             f"  [l] Dili değiştir (mevcut: {language})\n"
             f"  [d] Mikrofonu değiştir (mevcut: {device_name(device_index)})\n"
-            f"  [s] Sistem sesi kaynağı (mevcut: {system_label})\n"
+            f"  [s] Hoparlör (sistem sesi) kaynağı (mevcut: {speaker_label})\n"
             f"  [q] Çıkış"
         )
         try:
@@ -448,7 +426,7 @@ def main():
             if new_index is not None:
                 device_index = new_index
         elif choice == "s":
-            system_index = select_system_device(cfg)
+            speaker_index = select_speaker_device(cfg)
         # Diğer her durumda (Enter dahil) yeni kayda devam edilir.
 
 

@@ -20,32 +20,33 @@ A `config.json` file lives next to the script and stores:
   "language": "tr",
   "base_path": "/abs/path/to/recordings",
   "input_device": "MX Brio",
-  "system_device": "BlackHole 2ch"
+  "speaker_device": "BlackHole 2ch"
 }
 ```
 
 - Created on first run, updated whenever the user changes language, base path,
-  input (mic) device, or the system-audio source.
+  mic device, or the speaker (system-audio) source.
 - `language` is one of `"tr"` or `"en"`.
-- `input_device` / `system_device` are device **names** (not indices), since
+- `input_device` / `speaker_device` are device **names** (not indices), since
   indices change between sessions as devices connect/disconnect.
-- `system_device` is optional/absent. When absent, recording is mic-only.
+- `speaker_device` is optional/absent. When absent, recording is mic-only.
 
 ### Startup flow
 
+Every launch prompts for each setting **with the saved value pre-filled as the
+default** — pressing Enter keeps the last choice, typing/selecting changes it.
+
 1. Load `config.json` if present.
-2. **Confirm base project folder.** Prompt shows the saved path, or the default
-   `./recordings` on first run. Enter accepts; typing a new path overrides it.
-   The folder is created if it does not exist. Saved to config.
-3. **Transcription language.** On first run (no saved language), ask the user to
-   pick `tr` or `en`. Otherwise use the saved language. Saved to config.
-4. **Input device.** Resolve the saved device name to a current index. If none is
-   saved or it is no longer present, list all input-capable devices (physical mics
-   plus virtual/app-audio devices like BlackHole/Zoom/Teams) and let the user
-   pick one. Saved to config by name.
-5. **System audio source (optional).** Resolve the saved `system_device` name. If
-   set and present, the app records mic + system audio together (see below). If
-   unset or missing, recording is mic-only.
+2. **Confirm base project folder.** Default = saved path, or `./recordings` on
+   first run. Created if missing. Saved to config.
+3. **Transcription language.** Default = saved language (or `tr`). Saved to config.
+4. **Mic device.** List all input-capable devices (physical mics plus
+   virtual/app-audio devices like BlackHole/Zoom/Teams); default = saved device's
+   position (or the first device if the saved one is gone). Saved by name.
+5. **Speaker (system audio) source — optional.** List input-capable devices plus
+   an "off (mic only)" choice; default = saved choice, else BlackHole if present,
+   else off. When set, the app records mic + speaker audio together (see below).
+   Saved by name (key `speaker_device`); choosing "off" clears it.
 
 ### Input device
 
@@ -55,12 +56,18 @@ A `config.json` file lives next to the script and stores:
   be captured once routed at the OS level, but it does not create that routing.
 - If a device cannot be opened (e.g. unsupported sample rate), `record_audio`
   reports the error and returns `False` so the user can pick another via the menu.
-- Menu gains `d` (mic) and `s` (system source) options to change devices anytime.
+- Menu gains `d` (mic) and `s` (speaker / system source) options to change
+  devices anytime.
 
-### Mic + system audio (record both)
+### Mic + speaker audio (record both)
+
+macOS does not allow capturing an output/speaker device directly, so speaker
+audio is captured from a loopback **input** device (e.g. BlackHole) that the
+user's system/Zoom output is routed into. The picker is labeled "Speaker (system
+audio)" but selects an input device.
 
 - `record_audio(filepath, devices, fs)` takes a **list** of device indices
-  (`[mic]` or `[mic, system]`) and opens one `sd.InputStream` per device
+  (`[mic]` or `[mic, speaker]`) and opens one `sd.InputStream` per device
   concurrently (via `contextlib.ExitStack`), each at `channels=1, dtype=int16,
   fs=16000`, accumulating into its own buffer.
 - On stop, buffers are concatenated per device and combined by `mix_to_mono`:
@@ -69,7 +76,7 @@ A `config.json` file lives next to the script and stores:
   instead of hard clipping). Result is written as one mono WAV.
 - Purpose is transcription, not production audio: minor inter-stream drift is
   acceptable since both voices remain intelligible in the mix.
-- The system source is optional; absent → mic-only (`[mic]`), preserving the
+- The speaker source is optional; absent → mic-only (`[mic]`), preserving the
   original single-source behavior. `BlackHole` is suggested as the default when
   present. Capturing Zoom audio still requires the user to route Zoom/system
   output into that device at the OS level (e.g. a Multi-Output Device).
@@ -102,7 +109,7 @@ Each model is lazy-loaded once and cached for the session.
 - `[Enter]` — start a new recording
 - `l` — change language (toggle/select tr or en); updates config immediately
 - `d` — change mic (input) device; updates config immediately
-- `s` — set/clear the system-audio source (e.g. BlackHole); updates config
+- `s` — set/clear the speaker (system-audio) source (e.g. BlackHole); updates config
 - `q` — quit
 
 ## Code structure
