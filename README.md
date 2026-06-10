@@ -34,8 +34,11 @@ machine; no audio leaves your computer.
 - **Runs on the best device automatically** — CUDA → Apple Silicon (MPS/Metal) → CPU.
 - **Per-recording project folders** — each recording gets its own timestamped
   folder containing `audio.wav` and `transcription.txt`.
-- **Remembers your preferences** — language, microphone, system-audio toggle and
-  recordings folder are saved to `config.json`.
+- **Opens the transcript automatically** — after each run the transcript is opened
+  in an app you pick from your installed apps (defaults to **Sublime Text** if
+  installed; can be turned off).
+- **Remembers your preferences** — language, microphone, system-audio toggle,
+  recordings folder and "open with" app are saved to `config.json`.
 - **One command to run** — `./run.sh` sets up the environment and launches the app.
 
 ---
@@ -89,6 +92,7 @@ The app opens a full-screen interface. Controls are single keypresses (no Enter)
 | `l` | Toggle transcription language (TR ⇄ EN) |
 | `d` | Open the microphone picker (`1`–`9` to choose, `Esc` to cancel) |
 | `s` | Toggle system-audio capture on/off |
+| `o` | Choose which app opens the transcript (type to filter, `0` = off) |
 | `p` | Edit the recordings folder (`Enter` to save, `Esc` to cancel) |
 
 `Ctrl-C` exits cleanly at any time.
@@ -104,7 +108,18 @@ While recording, the panel shows a live **VU meter** for each source:
 ![Microphone picker](assets/screenshot-mic-picker.png)
 
 When you stop, the app shows a "Transcribing…" panel (the model loads on first
-use), then displays the transcript and saves it.
+use), then displays the transcript, saves it, and (optionally) opens it in your
+chosen app.
+
+### Open the transcript in an app
+
+After each transcript is saved it is opened in an app of your choice (e.g.
+**Sublime Text**, VS Code, TextEdit). Press `o` to pick from your installed apps —
+just start typing to filter the list, press `1`–`9` to select (or `Enter` for the
+first match), or `0` to turn auto-open off. Your choice is saved. On first run the
+app defaults to **Sublime Text** if it is installed, otherwise auto-open is off.
+
+![Open transcript with — app picker](assets/screenshot-app-picker.png)
 
 ---
 
@@ -150,7 +165,8 @@ Saved next to the script and updated as you change settings:
   "language": "tr",
   "base_path": "/abs/path/to/recordings",
   "input_device": "Yeti Stereo Microphone",
-  "capture_system_audio": true
+  "capture_system_audio": true,
+  "open_app": "Sublime Text"
 }
 ```
 

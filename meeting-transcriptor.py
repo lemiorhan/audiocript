@@ -481,6 +481,32 @@ def _finalize_to_wav(started, audio_path, target_fs=16000):
     return len(mixed)
 
 
+def list_installed_apps():
+    """Return sorted names of installed .app bundles (for the 'open with' picker)."""
+    bases = ["/Applications", "/Applications/Utilities", "/System/Applications",
+             "/System/Applications/Utilities", os.path.expanduser("~/Applications")]
+    names = set()
+    for b in bases:
+        try:
+            for entry in os.listdir(b):
+                if entry.endswith(".app"):
+                    names.add(entry[:-4])
+        except Exception:
+            pass
+    return sorted(names, key=str.lower)
+
+
+def _open_in_app(app, path):
+    """Open `path` in the macOS app named `app`. Returns None on success or an
+    error string on failure."""
+    try:
+        subprocess.run(["open", "-a", app, str(path)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return None
+    except Exception as e:
+        return str(e)
+
+
 def pick_device():
     """transformers pipeline için uygun cihazı seçer (CUDA > MPS > CPU)."""
     import torch
@@ -576,6 +602,14 @@ class _TuiState:
         # pickers
         self.devices = []
         self.path_buffer = ""
+        self.apps = []
+        self.app_filter = ""
+        # App used to open the transcript after each run. Defaults to Sublime Text
+        # if installed (the user's stated preference); changeable via the picker.
+        if "open_app" in cfg:
+            self.open_app = cfg.get("open_app")
+        else:
+            self.open_app = "Sublime Text" if "Sublime Text" in list_installed_apps() else None
         # background model pre-warming: lang -> "loading" | "ready" | "error: …"
         self.model_state = {}
         try:
@@ -633,7 +667,8 @@ def _tui_header(state):
     line1 = (f"[bold]Language[/bold] {state.language.upper()}     "
              f"[bold]Mic[/bold] {mic}     [bold]System audio[/bold] {sysv}     "
              f"[bold]Model[/bold] {_model_label(state)}")
-    line2 = f"[dim]Folder[/dim] {state.base_path}"
+    open_with = state.open_app or "[dim]off[/dim]"
+    line2 = f"[dim]Folder[/dim] {state.base_path}     [dim]Open with[/dim] {open_with}"
     return Panel(Text.from_markup(line1 + "\n" + line2),
                  title="🎙  Voice Transcriptor", title_align="left",
                  subtitle=clock, subtitle_align="right", border_style="cyan")
@@ -670,6 +705,18 @@ def _tui_body(state):
         body = f"Recordings folder:\n\n[bold]{state.path_buffer}[/bold][blink]▏[/blink]"
         return Panel(Text.from_markup(body),
                      title="Edit folder", border_style="cyan")
+    if state.mode == "app_picker":
+        flt = state.app_filter.lower()
+        matches = [a for a in state.apps if flt in a.lower()]
+        shown = matches[:9]
+        lines = ["[cyan]0[/cyan]  [dim]Off (don't auto-open)[/dim]"]
+        for i, a in enumerate(shown, start=1):
+            marker = "[green]›[/green]" if a == state.open_app else " "
+            lines.append(f"{marker} [cyan]{i}[/cyan]  {a}")
+        extra = f"\n[dim]…and {len(matches) - 9} more — type to filter[/dim]" if len(matches) > 9 else ""
+        filt = f"\n\n[dim]filter:[/dim] {state.app_filter}[blink]▏[/blink]"
+        return Panel(Text.from_markup("\n".join(lines) + extra + filt),
+                     title="Open transcript with", border_style="cyan")
     # home
     if state.last_transcript:
         name = state.last_project.name if state.last_project else ""
@@ -682,12 +729,13 @@ def _tui_body(state):
 
 def _tui_footer(state):
     keymap = {
-        "home": "[r] Record   [l] Language   [d] Microphone   [s] System audio   [p] Folder   [q] Quit",
+        "home": "[r] Record  [l] Language  [d] Microphone  [s] System audio  [o] Open-with  [p] Folder  [q] Quit",
         "preparing": "please wait…",
         "recording": "[q] Stop & transcribe",
         "transcribing": "working…",
         "mic_picker": "[1-9] Select   [Esc] Cancel",
         "path_edit": "[Enter] Save   [Backspace] Delete   [Esc] Cancel",
+        "app_picker": "[1-9] Select   [0] Off   [Enter] First match   type to filter   [Esc] Cancel",
     }
     keys = Text(keymap.get(state.mode, ""))          # plain Text: brackets shown literally
     status = Text(state.status or "", style="dim")
@@ -806,14 +854,22 @@ def _stop_and_transcribe(state, live):
         state.status = f"Transcription error: {e}"
         state.mode = "home"
         return
+    transcript_path = state.project_dir / "transcription.txt"
     try:
-        with open(state.project_dir / "transcription.txt", "w", encoding="utf-8") as f:
+        with open(transcript_path, "w", encoding="utf-8") as f:
             f.write(text + "\n")
     except Exception as e:
         state.status = f"Save error: {e}"
+        state.mode = "home"
+        return
     state.last_transcript = text
     state.last_project = state.project_dir
     state.status = f"Saved to {state.project_dir.name}"
+    # Open the transcript in the chosen app (if any).
+    if state.open_app:
+        err = _open_in_app(state.open_app, transcript_path)
+        state.status = (f"Saved — could not open in {state.open_app}"
+                        if err else f"Saved & opened in {state.open_app}")
     state.mode = "home"
 
 
@@ -839,6 +895,10 @@ def _tui_handle_key(key, state, live):
         elif key in ("d", "D"):
             state.devices = list_input_devices()
             state.mode = "mic_picker"
+        elif key in ("o", "O"):
+            state.apps = list_installed_apps()
+            state.app_filter = ""
+            state.mode = "app_picker"
         elif key in ("p", "P"):
             state.path_buffer = str(state.base_path)
             state.mode = "path_edit"
@@ -857,6 +917,36 @@ def _tui_handle_key(key, state, live):
                 save_config(state.cfg)
                 state.status = f"Microphone: {name}"
                 state.mode = "home"
+    elif mode == "app_picker":
+        flt = state.app_filter.lower()
+        matches = [a for a in state.apps if flt in a.lower()]
+        if key == "ESC":
+            state.mode = "home"
+        elif key == "0":
+            state.open_app = None
+            state.cfg["open_app"] = None
+            save_config(state.cfg)
+            state.status = "Auto-open disabled"
+            state.mode = "home"
+        elif key and key.isdigit():
+            i = int(key)
+            if 1 <= i <= min(9, len(matches)):
+                state.open_app = matches[i - 1]
+                state.cfg["open_app"] = state.open_app
+                save_config(state.cfg)
+                state.status = f"Open transcripts with: {state.open_app}"
+                state.mode = "home"
+        elif key == "ENTER":
+            if matches:
+                state.open_app = matches[0]
+                state.cfg["open_app"] = state.open_app
+                save_config(state.cfg)
+                state.status = f"Open transcripts with: {state.open_app}"
+                state.mode = "home"
+        elif key == "BACKSPACE":
+            state.app_filter = state.app_filter[:-1]
+        elif key and len(key) == 1 and key.isprintable():
+            state.app_filter += key
     elif mode == "path_edit":
         if key == "ESC":
             state.mode = "home"

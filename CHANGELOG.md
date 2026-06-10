@@ -21,6 +21,9 @@ All notable changes to this project are documented here. The format is based on
 - Background **model pre-warming**: the current language's model loads in a
   background thread at startup (and when you switch language), so the first
   transcript is fast. The header shows `Model: loading… / ready`.
+- **Open the transcript in an app** after each run, chosen from a filterable list
+  of installed apps (`o`). Defaults to Sublime Text if installed; can be disabled.
+  Stored as `open_app` in `config.json`.
 - Per-language transcription models: `selimc/whisper-large-v3-turbo-turkish`
   (Turkish, Transformers) and `ggml-distil-large-v3` (English, whisper.cpp).
 - Automatic device selection for models (CUDA → Apple Silicon MPS/Metal → CPU).
