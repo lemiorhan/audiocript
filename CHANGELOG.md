@@ -18,6 +18,9 @@ All notable changes to this project are documented here. The format is based on
 - "Preparing to record…" screen with step-by-step status while initializing
   (opening the mic, starting the system-audio tap, first-run helper compile /
   permission), then a clear "Recording started — speak now." once capture begins.
+- Background **model pre-warming**: the current language's model loads in a
+  background thread at startup (and when you switch language), so the first
+  transcript is fast. The header shows `Model: loading… / ready`.
 - Per-language transcription models: `selimc/whisper-large-v3-turbo-turkish`
   (Turkish, Transformers) and `ggml-distil-large-v3` (English, whisper.cpp).
 - Automatic device selection for models (CUDA → Apple Silicon MPS/Metal → CPU).

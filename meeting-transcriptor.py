@@ -74,6 +74,8 @@ EN_GGML_FILE = "ggml-distil-large-v3.bin"
 # Yüklenen modelleri tekrar tekrar yüklememek için önbellek.
 _hf_pipe = None
 _cpp_model = None
+# Modeli aynı anda iki kez (ör. arka plan ön-ısıtma + transkripsiyon) yüklememek için kilit.
+_MODEL_LOCK = threading.Lock()
 
 
 def _free_cpp_model_quietly():
@@ -489,52 +491,56 @@ def pick_device():
     return "cpu"
 
 
-def _transcribe_turkish(filepath):
-    """Türkçe transkripsiyon: transformers + selimc/whisper-large-v3-turbo-turkish."""
-    global _hf_pipe
-    if _hf_pipe is None:
-        from transformers import pipeline
-        _silence_ml_logging()
-        device = pick_device()
-        if not _QUIET:
-            console.print(f"[dim]Türkçe model yükleniyor ({TR_HF_MODEL}, {device})...[/dim]")
-        _hf_pipe = pipeline("automatic-speech-recognition", model=TR_HF_MODEL, device=device)
+def _ensure_model(language_code):
+    """
+    Load and cache the model for the given language if not already loaded.
+    Thread-safe (locked) so background pre-warming and an actual transcription
+    cannot load the same model twice. Returns when the model is ready.
+    """
+    global _hf_pipe, _cpp_model
+    if language_code == "en":
+        if _cpp_model is not None:
+            return
+        with _MODEL_LOCK:
+            if _cpp_model is not None:
+                return
+            _silence_ml_logging()
+            from huggingface_hub import hf_hub_download
+            from pywhispercpp.model import Model
+            if not _QUIET:
+                console.print(f"[dim]Preparing English model ({EN_GGML_FILE})…[/dim]")
+            model_path = hf_hub_download(repo_id=EN_GGML_REPO, filename=EN_GGML_FILE)
+            # redirect_whispercpp_logs_to=None -> whisper.cpp C/Metal logs to /dev/null.
+            _cpp_model = Model(
+                model_path, print_progress=False, print_realtime=False,
+                redirect_whispercpp_logs_to=None,
+            )
+    else:
+        if _hf_pipe is not None:
+            return
+        with _MODEL_LOCK:
+            if _hf_pipe is not None:
+                return
+            from transformers import pipeline
+            _silence_ml_logging()
+            device = pick_device()
+            if not _QUIET:
+                console.print(f"[dim]Preparing Turkish model ({TR_HF_MODEL}, {device})…[/dim]")
+            _hf_pipe = pipeline("automatic-speech-recognition", model=TR_HF_MODEL, device=device)
+
+
+def transcribe_audio(filepath, language_code):
+    """Transcribe with the model for the selected language and return the text."""
+    _ensure_model(language_code)
+    if language_code == "en":
+        segments = _cpp_model.transcribe(str(filepath), language="en")
+        return "".join(segment.text for segment in segments).strip()
     result = _hf_pipe(
         str(filepath),
         return_timestamps=True,
         generate_kwargs={"language": "turkish", "task": "transcribe"},
     )
     return result.get("text", "")
-
-
-def _transcribe_english(filepath):
-    """İngilizce transkripsiyon: whisper.cpp (pywhispercpp) + ggml-distil-large-v3."""
-    global _cpp_model
-    if _cpp_model is None:
-        _silence_ml_logging()
-        from huggingface_hub import hf_hub_download
-        from pywhispercpp.model import Model
-        if not _QUIET:
-            console.print(f"[dim]İngilizce model hazırlanıyor ({EN_GGML_FILE})...[/dim]")
-        model_path = hf_hub_download(repo_id=EN_GGML_REPO, filename=EN_GGML_FILE)
-        # redirect_whispercpp_logs_to=None -> whisper.cpp'nin C/Metal logları /dev/null'a.
-        _cpp_model = Model(
-            model_path, print_progress=False, print_realtime=False,
-            redirect_whispercpp_logs_to=None,
-        )
-    segments = _cpp_model.transcribe(str(filepath), language="en")
-    return "".join(segment.text for segment in segments).strip()
-
-
-def transcribe_audio(filepath, language_code):
-    """Seçilen dile göre uygun model ile transkripsiyon yapar ve metni döndürür."""
-    if language_code == "en":
-        if not _QUIET:
-            console.print("[bold cyan]Transcribing audio (en / ggml-distil-large-v3)...[/bold cyan]")
-        return _transcribe_english(filepath)
-    if not _QUIET:
-        console.print("[bold cyan]Transcribing audio (tr / whisper-large-v3-turbo-turkish)...[/bold cyan]")
-    return _transcribe_turkish(filepath)
 
 
 # =========================== Full-screen TUI ===========================
@@ -570,10 +576,29 @@ class _TuiState:
         # pickers
         self.devices = []
         self.path_buffer = ""
+        # background model pre-warming: lang -> "loading" | "ready" | "error: …"
+        self.model_state = {}
         try:
             self.base_path.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
+
+
+def _warm_model_async(state, language):
+    """Load the transcription model for `language` in the background so the first
+    transcript is fast. Updates state.model_state for the header indicator."""
+    if state.model_state.get(language) in ("loading", "ready"):
+        return
+    state.model_state[language] = "loading"
+
+    def run():
+        try:
+            _ensure_model(language)
+            state.model_state[language] = "ready"
+        except Exception as e:
+            state.model_state[language] = f"error: {e}"
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def _meters_markup(recorders):
@@ -590,12 +615,24 @@ def _meters_markup(recorders):
     return "\n".join(rows) if rows else "[dim](no sources)[/dim]"
 
 
+def _model_label(state):
+    ms = state.model_state.get(state.language)
+    if ms == "ready":
+        return "[green]ready[/green]"
+    if ms == "loading":
+        return "[yellow]loading…[/yellow]"
+    if ms and ms.startswith("error"):
+        return "[red]error[/red]"
+    return "[dim]—[/dim]"
+
+
 def _tui_header(state):
     clock = datetime.now().strftime("%H:%M:%S")
     mic = device_name(state.mic_index) if state.mic_index is not None else "—"
     sysv = "[green]on[/green]" if state.capture_system else "[dim]off[/dim]"
     line1 = (f"[bold]Language[/bold] {state.language.upper()}     "
-             f"[bold]Mic[/bold] {mic}     [bold]System audio[/bold] {sysv}")
+             f"[bold]Mic[/bold] {mic}     [bold]System audio[/bold] {sysv}     "
+             f"[bold]Model[/bold] {_model_label(state)}")
     line2 = f"[dim]Folder[/dim] {state.base_path}"
     return Panel(Text.from_markup(line1 + "\n" + line2),
                  title="🎙  Voice Transcriptor", title_align="left",
@@ -793,6 +830,7 @@ def _tui_handle_key(key, state, live):
             state.cfg["language"] = state.language
             save_config(state.cfg)
             state.status = f"Language set to {state.language.upper()}"
+            _warm_model_async(state, state.language)  # pre-load the new language
         elif key in ("s", "S"):
             state.capture_system = not state.capture_system
             state.cfg["capture_system_audio"] = state.capture_system
@@ -851,6 +889,9 @@ def main():
         return
 
     _QUIET = True  # keep library/app prints off the full-screen UI
+    # Pre-warm the current language's model in the background so the first
+    # transcript is fast (header shows Model: loading… → ready).
+    _warm_model_async(state, state.language)
     try:
         with _cbreak_mode(), Live(_tui_render(state), screen=True, console=console,
                                   refresh_per_second=15) as live:
