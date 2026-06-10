@@ -71,3 +71,5 @@ transcription.txt
 # Sistem sesi yakalayıcı (Swift) derlenmiş ikili — kaynak commit'lenir, ikili değil
 mac_audio_tap/system_audio_tap
 mac_audio_tap/*.o
+
+docs/superpowers/
