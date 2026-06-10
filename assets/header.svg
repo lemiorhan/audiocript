@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 340" width="1200" height="340">
-  <!-- flat fills (no gradients) so it renders identically across tools -->
-  <rect x="0" y="0" width="1200" height="340" rx="28" fill="#0B3B4A"/>
+  <!-- monochrome slate, flat fills -->
+  <rect x="0" y="0" width="1200" height="340" rx="28" fill="#0F172A"/>
 
   <!-- decorative waveform -->
-  <g stroke="#22D3EE" stroke-width="5" stroke-linecap="round" opacity="0.30">
+  <g stroke="#475569" stroke-width="5" stroke-linecap="round" opacity="0.7">
     <line x1="980"  y1="298" x2="980"  y2="262"/>
     <line x1="1006" y1="298" x2="1006" y2="222"/>
     <line x1="1032" y1="298" x2="1032" y2="284"/>
@@ -13,27 +13,27 @@
     <line x1="1136" y1="298" x2="1136" y2="276"/>
   </g>
 
-  <!-- parrot logo badge (solid fills) -->
+  <!-- parrot logo badge (monochrome) -->
   <g transform="translate(70,54) scale(0.88)">
-    <rect x="0" y="0" width="256" height="256" rx="56" fill="#0E7490"/>
-    <g fill="none" stroke="#E0F2FE" stroke-linecap="round" stroke-width="9">
+    <rect x="0" y="0" width="256" height="256" rx="56" fill="#1E293B"/>
+    <g fill="none" stroke="#CBD5E1" stroke-linecap="round" stroke-width="9">
       <path d="M198 104 a40 40 0 0 1 0 56" opacity="0.95"/>
-      <path d="M216 86 a62 62 0 0 1 0 92" opacity="0.6"/>
-      <path d="M234 68 a84 84 0 0 1 0 128" opacity="0.32"/>
+      <path d="M216 86 a62 62 0 0 1 0 92" opacity="0.55"/>
+      <path d="M234 68 a84 84 0 0 1 0 128" opacity="0.3"/>
     </g>
-    <path d="M92 70 q-14 -36 10 -52 q12 22 6 50 z" fill="#F43F5E"/>
-    <path d="M108 60 q-6 -42 22 -50 q4 26 -8 52 z" fill="#FB923C"/>
-    <path d="M126 58 q4 -40 34 -40 q-6 28 -22 48 z" fill="#FACC15"/>
-    <circle cx="116" cy="150" r="64" fill="#22C55E"/>
-    <circle cx="140" cy="156" r="40" fill="#4ADE80"/>
-    <circle cx="150" cy="124" r="18" fill="#FFFFFF"/>
-    <circle cx="155" cy="126" r="9" fill="#0C4A6E"/>
-    <path d="M168 112 q44 -6 52 28 q4 22 -20 28 q-12 3 -18 -4 q16 -3 14 -20 q-3 -20 -30 -16 z" fill="#FB7185"/>
-    <path d="M168 112 q44 -6 52 28 l-34 2 q-1 -18 -18 -16 z" fill="#F97316"/>
+    <path d="M92 70 q-14 -36 10 -52 q12 22 6 50 z" fill="#94A3B8"/>
+    <path d="M108 60 q-6 -42 22 -50 q4 26 -8 52 z" fill="#CBD5E1"/>
+    <path d="M126 58 q4 -40 34 -40 q-6 28 -22 48 z" fill="#E2E8F0"/>
+    <circle cx="116" cy="150" r="64" fill="#475569"/>
+    <circle cx="140" cy="156" r="40" fill="#64748B"/>
+    <circle cx="150" cy="124" r="18" fill="#F8FAFC"/>
+    <circle cx="155" cy="126" r="9" fill="#0F172A"/>
+    <path d="M168 112 q44 -6 52 28 q4 22 -20 28 q-12 3 -18 -4 q16 -3 14 -20 q-3 -20 -30 -16 z" fill="#E2E8F0"/>
+    <path d="M168 112 q44 -6 52 28 l-34 2 q-1 -18 -18 -16 z" fill="#94A3B8"/>
   </g>
 
-  <!-- wordmark + tagline -->
-  <text x="338" y="156" font-family="Helvetica Neue, Arial, sans-serif" font-size="84" font-weight="800" fill="#F0FDFA">Audiocript</text>
-  <text x="342" y="206" font-family="Helvetica Neue, Arial, sans-serif" font-size="27" font-weight="500" fill="#A5F3FC">Record &amp; transcribe locally — your mic + system audio — on macOS</text>
-  <text x="342" y="248" font-family="Helvetica Neue, Arial, sans-serif" font-size="22" font-weight="500" fill="#5EEAD4">Whisper · runs offline · nothing leaves your computer</text>
+  <!-- wordmark + tagline (monochrome) -->
+  <text x="338" y="156" font-family="Helvetica Neue, Arial, sans-serif" font-size="84" font-weight="800" fill="#F1F5F9">Audiocript</text>
+  <text x="342" y="206" font-family="Helvetica Neue, Arial, sans-serif" font-size="27" font-weight="500" fill="#94A3B8">Record &amp; transcribe locally — your mic + system audio — on macOS</text>
+  <text x="342" y="248" font-family="Helvetica Neue, Arial, sans-serif" font-size="22" font-weight="500" fill="#64748B">Whisper · runs offline · nothing leaves your computer</text>
 </svg>

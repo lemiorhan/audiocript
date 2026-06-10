@@ -1,34 +1,34 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#14B8A6"/>
-      <stop offset="1" stop-color="#0C4A6E"/>
+      <stop offset="0" stop-color="#334155"/>
+      <stop offset="1" stop-color="#0F172A"/>
     </linearGradient>
   </defs>
 
-  <!-- app-icon background -->
+  <!-- app-icon background (monochrome slate) -->
   <rect x="0" y="0" width="256" height="256" rx="56" fill="url(#bg)"/>
 
-  <!-- voice / sound waves coming from the beak -->
-  <g fill="none" stroke="#E0F2FE" stroke-linecap="round" stroke-width="9">
+  <!-- voice / sound waves -->
+  <g fill="none" stroke="#CBD5E1" stroke-linecap="round" stroke-width="9">
     <path d="M198 104 a40 40 0 0 1 0 56" opacity="0.95"/>
-    <path d="M216 86 a62 62 0 0 1 0 92" opacity="0.6"/>
-    <path d="M234 68 a84 84 0 0 1 0 128" opacity="0.32"/>
+    <path d="M216 86 a62 62 0 0 1 0 92" opacity="0.55"/>
+    <path d="M234 68 a84 84 0 0 1 0 128" opacity="0.3"/>
   </g>
 
-  <!-- crest feathers -->
-  <path d="M92 70 q-14 -36 10 -52 q12 22 6 50 z" fill="#F43F5E"/>
-  <path d="M108 60 q-6 -42 22 -50 q4 26 -8 52 z" fill="#FB923C"/>
-  <path d="M126 58 q4 -40 34 -40 q-6 28 -22 48 z" fill="#FACC15"/>
+  <!-- crest feathers (tonal) -->
+  <path d="M92 70 q-14 -36 10 -52 q12 22 6 50 z" fill="#94A3B8"/>
+  <path d="M108 60 q-6 -42 22 -50 q4 26 -8 52 z" fill="#CBD5E1"/>
+  <path d="M126 58 q4 -40 34 -40 q-6 28 -22 48 z" fill="#E2E8F0"/>
 
   <!-- head -->
-  <circle cx="116" cy="150" r="64" fill="#22C55E"/>
+  <circle cx="116" cy="150" r="64" fill="#475569"/>
   <!-- face / cheek highlight -->
-  <circle cx="140" cy="156" r="40" fill="#4ADE80"/>
+  <circle cx="140" cy="156" r="40" fill="#64748B"/>
 
   <!-- eye -->
-  <circle cx="150" cy="124" r="18" fill="#FFFFFF"/>
-  <circle cx="155" cy="126" r="9" fill="#0C4A6E"/>
+  <circle cx="150" cy="124" r="18" fill="#F8FAFC"/>
+  <circle cx="155" cy="126" r="9" fill="#0F172A"/>
 
   <!-- hooked beak -->
   <path d="M168 112
@@ -36,6 +36,6 @@
            q4 22 -20 28
            q-12 3 -18 -4
            q16 -3 14 -20
-           q-3 -20 -30 -16 z" fill="#FB7185"/>
-  <path d="M168 112 q44 -6 52 28 l-34 2 q-1 -18 -18 -16 z" fill="#F97316"/>
+           q-3 -20 -30 -16 z" fill="#E2E8F0"/>
+  <path d="M168 112 q44 -6 52 28 l-34 2 q-1 -18 -18 -16 z" fill="#94A3B8"/>
 </svg>
