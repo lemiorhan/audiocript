@@ -69,7 +69,9 @@ The first run downloads the transcription models (English ≈ 1.5 GB, Turkish
 
 `run.sh` creates the virtual environment, installs dependencies from
 `requirements.txt` the first time (and only re-installs when that file changes),
-then launches the app.
+checks for the optional external tools (`ffmpeg` for file import, `swiftc` for
+system-audio capture) and offers to install any that are missing, then launches
+the app. (Set `SKIP_DEP_CHECK=1` to skip the tool check.)
 
 > If you get `./run.sh: Permission denied`, either run `chmod +x run.sh` once or
 > start it with `bash run.sh`. To pick a specific interpreter:
