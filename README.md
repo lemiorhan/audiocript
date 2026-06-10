@@ -211,3 +211,4 @@ Released under the [MIT License](LICENSE).
 - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) /
   [`pywhispercpp`](https://github.com/absadiki/pywhispercpp)
 - [Rich](https://github.com/Textualize/rich), [sounddevice](https://python-sounddevice.readthedocs.io/)
+- Semih Şahan as the owner of original idea and [base repository](https://github.com/semihshn/voice_transcriptor)
