@@ -8,7 +8,7 @@ import select
 import contextlib
 import threading
 import subprocess
-import termios  # Unix tabanlı sistemlerde çalışır.
+import termios  # available on Unix-based systems.
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -22,13 +22,13 @@ from rich.live import Live
 from rich.text import Text
 from rich.layout import Layout
 
-# Uyarıları bastır (FutureWarning, DeprecationWarning, UserWarning)
+# Suppress warnings (FutureWarning, DeprecationWarning, UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# transformers / huggingface_hub gürültüsünü kapat (import'tan ÖNCE ayarlanmalı;
-# bu kütüphaneler tembel (lazy) import edildiği için burada ayarlamak yeterli).
+# Quiet transformers / huggingface_hub noise (must be set BEFORE importing them;
+# they are imported lazily, so setting it here is enough).
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -37,8 +37,8 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 def _silence_ml_logging():
-    """transformers ilerleme çubuklarını ve transformers/huggingface_hub uyarı
-    loglarını (ör. 'unauthenticated requests', logits processor uyarıları) kapatır."""
+    """Silence transformers progress bars and transformers/huggingface_hub warning
+    logs (e.g. 'unauthenticated requests', logits processor warnings)."""
     import logging
     try:
         import transformers
@@ -50,39 +50,39 @@ def _silence_ml_logging():
         logging.getLogger(name).setLevel(logging.ERROR)
 
 
-# Rich için konsol nesnesi oluşturuyoruz
+# Rich console object
 console = Console()
 
-# Tam ekran TUI etkinken kütüphane/uygulama yazdırmaları ekranı bozmasın diye
-# bastırılır (durum bilgisi arayüzde gösterilir).
+# While the full-screen TUI is active, library/app prints are suppressed so they
+# don't corrupt the screen (status is shown in the UI instead).
 _QUIET = False
 
-# Yapılandırma dosyası, scriptin yanında saklanır.
+# Config file, stored next to the script.
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 DEFAULT_BASE_PATH = Path.home() / "Audiocript" / "recordings"
 
-# Desteklenen diller: kod -> Whisper dil adı
+# Supported languages: code -> Whisper language name
 LANGUAGES = {"tr": "turkish", "en": "english"}
 
-# Her dil için kullanılacak model ve çalışma zamanı (runtime).
-#  - Türkçe: Hugging Face transformers ile Türkçe'ye ince ayarlı model.
-#  - İngilizce: whisper.cpp (pywhispercpp) ile ggml-distil-large-v3 modeli.
+# Model and runtime used per language.
+#  - Turkish: a Turkish fine-tuned model via Hugging Face transformers.
+#  - English: ggml-distil-large-v3 via whisper.cpp (pywhispercpp).
 TR_HF_MODEL = "selimc/whisper-large-v3-turbo-turkish"
 EN_GGML_REPO = "distil-whisper/distil-large-v3-ggml"
 EN_GGML_FILE = "ggml-distil-large-v3.bin"
 
-# Yüklenen modelleri tekrar tekrar yüklememek için önbellek.
+# Cache loaded models so they are not reloaded.
 _hf_pipe = None
 _cpp_model = None
-# Modeli aynı anda iki kez (ör. arka plan ön-ısıtma + transkripsiyon) yüklememek için kilit.
+# Lock so the model is not loaded twice at once (e.g. background pre-warm + transcription).
 _MODEL_LOCK = threading.Lock()
 
 
 def _free_cpp_model_quietly():
     """
-    whisper.cpp modeli serbest bırakılırken çıkardığı C/Metal teardown logunu
-    ('ggml_metal_free: deallocating') gizlemek için, modeli stderr (fd 2)
-    /dev/null'a yönlendirilmişken serbest bırakır. Çıkışta (atexit) çağrılır.
+    Free the whisper.cpp model while stderr (fd 2) is redirected to /dev/null, to
+    hide the C/Metal teardown log ('ggml_metal_free: deallocating') it prints on
+    release. Called at exit (atexit).
     """
     global _cpp_model
     if _cpp_model is None:
@@ -92,7 +92,7 @@ def _free_cpp_model_quietly():
         devnull = os.open(os.devnull, os.O_WRONLY)
         saved = os.dup(2)
         os.dup2(devnull, 2)
-        _cpp_model = None  # serbest bırakma logları /dev/null'a gider
+        _cpp_model = None  # release logs go to /dev/null
     except Exception:
         _cpp_model = None
     finally:
@@ -119,8 +119,8 @@ def clear_console():
 
 def flush_stdin():
     """
-    sys.stdin'de bekleyen (kalan) karakterleri temizler.
-    Unix tabanlı sistemlerde termios.tcflush() kullanarak giriş tamponunu temizler.
+    Clear any pending characters left in sys.stdin (using termios.tcflush()
+    on Unix-based systems).
     """
     try:
         termios.tcflush(sys.stdin, termios.TCIFLUSH)
@@ -129,7 +129,7 @@ def flush_stdin():
 
 
 def load_config():
-    """config.json'u okur. Dosya yoksa veya bozuksa boş bir sözlük döndürür."""
+    """Read config.json; return an empty dict if missing or invalid."""
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -139,7 +139,7 @@ def load_config():
 
 
 def save_config(cfg):
-    """Yapılandırmayı config.json'a yazar."""
+    """Write the config to config.json."""
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
@@ -150,7 +150,7 @@ def lang_name(code):
 
 
 def list_input_devices():
-    """Giriş (input) yapabilen ses cihazlarının (index, name) listesini döndürür."""
+    """Return (index, name) of audio devices that can capture input."""
     result = []
     for idx, dev in enumerate(sd.query_devices()):
         if dev.get("max_input_channels", 0) > 0:
@@ -168,10 +168,9 @@ def device_name(index):
 
 def mix_to_mono(arrays):
     """
-    Bir veya daha fazla mono int16 sinyali tek bir int16 sinyalde birleştirir.
-    Akışları en kısa olanın uzunluğuna göre kırpar (cihazların saatleri biraz
-    kayabilir). Toplama yapar ve gerekirse kırpılmayı (clipping) önlemek için
-    tepe değere göre ölçekler.
+    Mix one or more mono int16 signals into a single int16 signal. Trims streams
+    to the shortest length (device clocks drift slightly), sums them, and scales
+    down by the peak if needed to avoid clipping.
     """
     arrays = [a for a in arrays if a is not None and len(a) > 0]
     if not arrays:
@@ -190,15 +189,15 @@ def mix_to_mono(arrays):
 
 def resample_to_target(arr, src_fs, target_fs=16000):
     """
-    Bir sinyali (int16 veya float32; mono ya da çok kanallı) hedef örnekleme
-    hızında (Whisper için 16000 Hz) mono int16'ya dönüştürür. Çok kanallıysa
-    kanalları ortalar. src_fs == target_fs ise yeniden örnekleme yapmadan sadece
-    mono'ya indirger. Yeniden örnekleme torchaudio ile yapılır (anti-aliasing'li).
+    Convert a signal (int16 or float32; mono or multi-channel) to mono int16 at
+    the target sample rate (16000 Hz for Whisper). Averages channels if multi-
+    channel. If src_fs == target_fs, just downmix to mono without resampling.
+    Resampling uses torchaudio (anti-aliased).
     """
     if arr is None or len(arr) == 0:
         return None
     if np.issubdtype(arr.dtype, np.floating):
-        f = arr.astype(np.float32)            # zaten [-1, 1] aralığında
+        f = arr.astype(np.float32)            # already in [-1, 1]
     else:
         f = arr.astype(np.float32) / 32768.0  # int16 -> [-1, 1]
     if f.ndim == 2:                       # (N, kanal) -> ortalama ile mono
@@ -207,24 +206,24 @@ def resample_to_target(arr, src_fs, target_fs=16000):
         import torch
         import torchaudio.functional as AF
         w = torch.from_numpy(np.ascontiguousarray(f))
-        # Yüksek kaliteli, anti-aliasing'li yeniden örnekleme (soxr-VHQ'ya yakın).
-        # Varsayılan parametreler 8 kHz Nyquist üzerindeki tonları yeterince
-        # bastırmaz; Kaiser penceresi ile dar geçiş bandı sağlanır.
+        # High-quality anti-aliased resampling (close to soxr-VHQ). The default
+        # parameters don't suppress tones above the 8 kHz Nyquist enough; the
+        # Kaiser window provides a narrow transition band.
         f = AF.resample(
             w, orig_freq=src_fs, new_freq=target_fs,
             lowpass_filter_width=64, rolloff=0.945,
             resampling_method="sinc_interp_kaiser", beta=14.769656459379492,
         ).numpy()
-    # float -> int16: ölçekle, yuvarla ve taşmayı önlemek için kırp.
+    # float -> int16: scale, round, and clip to avoid overflow.
     i16 = np.clip(np.round(f * 32768.0), -32768, 32767).astype(np.int16)
     return i16
 
 
 def _coreaudio_extra_settings():
     """
-    macOS'ta PortAudio'nun cihazın global örnekleme hızını değiştirmesini
-    engelleyen ayarı döndürür (varsa). Bu, bir cihaza bağlanırken o cihazdan
-    çalan sesin kesilmesini önler. Desteklenmiyorsa None döner.
+    Return the setting that stops PortAudio from changing a device's global
+    sample rate on macOS (if available). This keeps audio playing from a device
+    from being interrupted when we connect to it. Returns None if unsupported.
     """
     settings_cls = getattr(sd, "CoreAudioSettings", None)
     if settings_cls is None:
@@ -235,7 +234,7 @@ def _coreaudio_extra_settings():
         return None
 
 
-# --- Core Audio sistem sesi yakalayıcı (Swift yardımcı program) ---
+# --- Core Audio system-audio capture (Swift helper) ---
 TAP_DIR = Path(__file__).resolve().parent / "mac_audio_tap"
 TAP_SRC = TAP_DIR / "system_audio_tap.swift"
 TAP_BIN = TAP_DIR / "system_audio_tap"
@@ -243,8 +242,8 @@ TAP_BIN = TAP_DIR / "system_audio_tap"
 
 def build_tap_binary():
     """
-    Sistem sesi yakalayan Swift yardımcı programını gerekiyorsa derler ve yolunu
-    döndürür. swiftc yoksa veya derleme başarısızsa RuntimeError fırlatır.
+    Compile the Swift system-audio helper if needed and return its path. Raises
+    RuntimeError if swiftc is missing or compilation fails.
     """
     if not TAP_SRC.exists():
         raise RuntimeError(f"tap source file not found: {TAP_SRC}")
@@ -266,7 +265,7 @@ def build_tap_binary():
 
 
 class DeviceRecorder:
-    """sounddevice ile bir giriş cihazından (mikrofon) doğal hızda kayıt yapar."""
+    """Record from one input device (microphone) at its native rate via sounddevice."""
 
     def __init__(self, index):
         self.index = index
@@ -276,7 +275,7 @@ class DeviceRecorder:
         self.channels = max(1, min(2, int(info['max_input_channels'])))
         self._frames = []
         self._stream = None
-        self._level = 0.0  # canlı VU göstergesi için anlık seviye (0..1)
+        self._level = 0.0  # instantaneous level for the live VU meter (0..1)
         self.meter_name = f"🎤 {self.name}"
 
     @property
@@ -293,7 +292,7 @@ class DeviceRecorder:
             self._frames.append(indata.copy())
             if indata.size:
                 peak = float(np.max(np.abs(indata))) / 32768.0
-                # peak-hold + sönümleme: VU çubuğu sese tepki verir, yumuşak iner.
+                # peak-hold + decay: the VU bar reacts to sound and falls smoothly.
                 self._level = max(peak, self._level * 0.85)
         kwargs = dict(samplerate=self.rate, channels=self.channels,
                       dtype='int16', device=self.index, callback=callback)
@@ -320,9 +319,9 @@ class DeviceRecorder:
 
 class TapRecorder:
     """
-    macOS Core Audio process tap ile TÜM sistem sesini (hoparlör/Zoom/YouTube)
-    yakalar. Swift yardımcı programını alt süreç olarak çalıştırır; ses çalmaya
-    DEVAM eder (unmuted), BlackHole/yeniden yönlendirme gerekmez.
+    Capture the ENTIRE system audio (speakers/Zoom/YouTube) via a macOS Core
+    Audio process tap. Runs the Swift helper as a subprocess; playback KEEPS
+    PLAYING (unmuted), and no BlackHole / rerouting is needed.
     """
 
     def __init__(self):
@@ -337,13 +336,13 @@ class TapRecorder:
         self._stderr = []
         self._ready = threading.Event()
         self._error = None
-        self._level = 0.0  # canlı VU göstergesi için anlık seviye (0..1)
+        self._level = 0.0  # instantaneous level for the live VU meter (0..1)
 
     def level(self):
         return self._level
 
     def start(self):
-        binpath = build_tap_binary()  # gerekiyorsa derler; başarısızsa RuntimeError
+        binpath = build_tap_binary()  # compiles if needed; raises on failure
         self._proc = subprocess.Popen(
             [str(binpath)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
         )
@@ -351,7 +350,7 @@ class TapRecorder:
         self._stderr_reader.start()
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
-        # Başlık satırını (örnekleme hızı/kanal) bekle; gelmezse izin sorunu olabilir.
+        # Wait for the header (sample rate/channels); if it never arrives, likely a permission issue.
         if not self._ready.wait(timeout=10):
             self.stop()
             raise RuntimeError(
@@ -372,7 +371,7 @@ class TapRecorder:
 
     def _read_stdout(self):
         f = self._proc.stdout
-        # 1) Başlık satırını oku: "samplerate=<r> channels=<c> format=f32le\n"
+        # 1) Read the header line: "samplerate=<r> channels=<c> format=f32le\n"
         header = b""
         while not header.endswith(b"\n"):
             b = f.read(1)
@@ -390,7 +389,7 @@ class TapRecorder:
             self._ready.set()
             return
         self._ready.set()
-        # 2) Kalan veriyi (float32 PCM) topla ve canlı seviyeyi güncelle.
+        # 2) Collect the remaining data (float32 PCM) and update the live level.
         while True:
             data = f.read(8192)
             if not data:
@@ -597,7 +596,7 @@ def _extract_audio(src, dest_wav, target_fs=16000, on_pct=None, duration=None):
 
 
 def pick_device():
-    """transformers pipeline için uygun cihazı seçer (CUDA > MPS > CPU)."""
+    """Pick a suitable device for the transformers pipeline (CUDA > MPS > CPU)."""
     import torch
     if torch.cuda.is_available():
         return "cuda:0"
