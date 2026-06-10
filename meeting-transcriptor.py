@@ -141,6 +141,12 @@ def record_audio(filepath, fs=16000):
             sd.sleep(100)
 
     listener.join()
+
+    if not audio_frames:
+        # 'q' kayıt başlamadan (mikrofon ilk veriyi üretmeden) basılmış olabilir.
+        console.print("[bold red]Hiç ses kaydedilemedi; kayıt atlanıyor.[/bold red]")
+        return False
+
     audio_data = np.concatenate(audio_frames, axis=0)
 
     with wave.open(str(filepath), 'wb') as wf:
@@ -149,6 +155,7 @@ def record_audio(filepath, fs=16000):
         wf.setframerate(fs)
         wf.writeframes(audio_data.tobytes())
     console.print(f"[green]Audio saved to {filepath} ({len(audio_data)} samples)[/green]")
+    return True
 
 
 def pick_device():
@@ -215,7 +222,14 @@ def main():
         project_dir.mkdir(parents=True, exist_ok=True)
 
         audio_path = project_dir / "audio.wav"
-        record_audio(audio_path)
+        if not record_audio(audio_path):
+            # Kayıt alınamadı: boş proje klasörünü temizle ve baştan başla.
+            try:
+                project_dir.rmdir()
+            except OSError:
+                pass
+            flush_stdin()
+            continue
 
         transcribed_text = transcribe_audio(audio_path, language)
         console.print(Panel(f"[bold green]Transcription:[/bold green]\n{transcribed_text}", style="green"), justify="center")
