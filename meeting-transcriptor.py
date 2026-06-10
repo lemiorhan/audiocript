@@ -16,9 +16,33 @@ from rich.prompt import Prompt
 from rich.console import Console
 from rich.panel import Panel
 
-# Uyarıları bastır (FutureWarning, DeprecationWarning)
+# Uyarıları bastır (FutureWarning, DeprecationWarning, UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# transformers / huggingface_hub gürültüsünü kapat (import'tan ÖNCE ayarlanmalı;
+# bu kütüphaneler tembel (lazy) import edildiği için burada ayarlamak yeterli).
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def _silence_ml_logging():
+    """transformers ilerleme çubuklarını ve transformers/huggingface_hub uyarı
+    loglarını (ör. 'unauthenticated requests', logits processor uyarıları) kapatır."""
+    import logging
+    try:
+        import transformers
+        transformers.logging.set_verbosity_error()
+        transformers.utils.logging.disable_progress_bar()
+    except Exception:
+        pass
+    for name in ("transformers", "huggingface_hub"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
 
 # Rich için konsol nesnesi oluşturuyoruz
 console = Console()
@@ -40,6 +64,41 @@ EN_GGML_FILE = "ggml-distil-large-v3.bin"
 # Yüklenen modelleri tekrar tekrar yüklememek için önbellek.
 _hf_pipe = None
 _cpp_model = None
+
+
+def _free_cpp_model_quietly():
+    """
+    whisper.cpp modeli serbest bırakılırken çıkardığı C/Metal teardown logunu
+    ('ggml_metal_free: deallocating') gizlemek için, modeli stderr (fd 2)
+    /dev/null'a yönlendirilmişken serbest bırakır. Çıkışta (atexit) çağrılır.
+    """
+    global _cpp_model
+    if _cpp_model is None:
+        return
+    saved = devnull = None
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        saved = os.dup(2)
+        os.dup2(devnull, 2)
+        _cpp_model = None  # serbest bırakma logları /dev/null'a gider
+    except Exception:
+        _cpp_model = None
+    finally:
+        if saved is not None:
+            try:
+                os.dup2(saved, 2)
+                os.close(saved)
+            except Exception:
+                pass
+        if devnull is not None:
+            try:
+                os.close(devnull)
+            except Exception:
+                pass
+
+
+import atexit as _atexit
+_atexit.register(_free_cpp_model_quietly)
 
 
 def clear_console():
@@ -541,6 +600,7 @@ def _transcribe_turkish(filepath):
     global _hf_pipe
     if _hf_pipe is None:
         from transformers import pipeline
+        _silence_ml_logging()
         device = pick_device()
         console.print(f"[dim]Türkçe model yükleniyor ({TR_HF_MODEL}, {device})...[/dim]")
         _hf_pipe = pipeline("automatic-speech-recognition", model=TR_HF_MODEL, device=device)
@@ -556,11 +616,16 @@ def _transcribe_english(filepath):
     """İngilizce transkripsiyon: whisper.cpp (pywhispercpp) + ggml-distil-large-v3."""
     global _cpp_model
     if _cpp_model is None:
+        _silence_ml_logging()
         from huggingface_hub import hf_hub_download
         from pywhispercpp.model import Model
         console.print(f"[dim]İngilizce model hazırlanıyor ({EN_GGML_FILE})...[/dim]")
         model_path = hf_hub_download(repo_id=EN_GGML_REPO, filename=EN_GGML_FILE)
-        _cpp_model = Model(model_path, print_progress=False, print_realtime=False)
+        # redirect_whispercpp_logs_to=None -> whisper.cpp'nin C/Metal logları /dev/null'a.
+        _cpp_model = Model(
+            model_path, print_progress=False, print_realtime=False,
+            redirect_whispercpp_logs_to=None,
+        )
     segments = _cpp_model.transcribe(str(filepath), language="en")
     return "".join(segment.text for segment in segments).strip()
 
