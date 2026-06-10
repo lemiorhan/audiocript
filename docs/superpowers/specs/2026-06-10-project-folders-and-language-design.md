@@ -16,14 +16,20 @@ transcription language (Turkish or English), remembered across runs.
 A `config.json` file lives next to the script and stores:
 
 ```json
-{ "language": "tr", "base_path": "/abs/path/to/recordings", "input_device": "MX Brio" }
+{
+  "language": "tr",
+  "base_path": "/abs/path/to/recordings",
+  "input_device": "MX Brio",
+  "system_device": "BlackHole 2ch"
+}
 ```
 
-- Created on first run, updated whenever the user changes language, base path, or
-  input device.
+- Created on first run, updated whenever the user changes language, base path,
+  input (mic) device, or the system-audio source.
 - `language` is one of `"tr"` or `"en"`.
-- `input_device` is the device **name** (not index), since indices change between
-  sessions as devices connect/disconnect.
+- `input_device` / `system_device` are device **names** (not indices), since
+  indices change between sessions as devices connect/disconnect.
+- `system_device` is optional/absent. When absent, recording is mic-only.
 
 ### Startup flow
 
@@ -37,18 +43,36 @@ A `config.json` file lives next to the script and stores:
    saved or it is no longer present, list all input-capable devices (physical mics
    plus virtual/app-audio devices like BlackHole/Zoom/Teams) and let the user
    pick one. Saved to config by name.
+5. **System audio source (optional).** Resolve the saved `system_device` name. If
+   set and present, the app records mic + system audio together (see below). If
+   unset or missing, recording is mic-only.
 
 ### Input device
 
-- `record_audio` opens `sd.InputStream(device=<index>, channels=1, ...)`; the
-  chosen device name is shown before and during recording.
 - The macOS system default input may be a virtual device (e.g. BlackHole), which
   records silence unless audio is routed into it — the selector lets the user
   avoid that. The app exposes virtual/loopback devices so Zoom/computer audio can
   be captured once routed at the OS level, but it does not create that routing.
-- If the device cannot be opened (e.g. unsupported sample rate), `record_audio`
+- If a device cannot be opened (e.g. unsupported sample rate), `record_audio`
   reports the error and returns `False` so the user can pick another via the menu.
-- Menu gains a `d` option to change the device anytime.
+- Menu gains `d` (mic) and `s` (system source) options to change devices anytime.
+
+### Mic + system audio (record both)
+
+- `record_audio(filepath, devices, fs)` takes a **list** of device indices
+  (`[mic]` or `[mic, system]`) and opens one `sd.InputStream` per device
+  concurrently (via `contextlib.ExitStack`), each at `channels=1, dtype=int16,
+  fs=16000`, accumulating into its own buffer.
+- On stop, buffers are concatenated per device and combined by `mix_to_mono`:
+  trim all signals to the shortest length (independent device clocks drift),
+  sum as int32, then scale down if the peak exceeds the int16 range (soft limit
+  instead of hard clipping). Result is written as one mono WAV.
+- Purpose is transcription, not production audio: minor inter-stream drift is
+  acceptable since both voices remain intelligible in the mix.
+- The system source is optional; absent → mic-only (`[mic]`), preserving the
+  original single-source behavior. `BlackHole` is suggested as the default when
+  present. Capturing Zoom audio still requires the user to route Zoom/system
+  output into that device at the OS level (e.g. a Multi-Output Device).
 
 ### Per recording
 
@@ -77,7 +101,8 @@ Each model is lazy-loaded once and cached for the session.
 
 - `[Enter]` — start a new recording
 - `l` — change language (toggle/select tr or en); updates config immediately
-- `d` — change input device; updates config immediately
+- `d` — change mic (input) device; updates config immediately
+- `s` — set/clear the system-audio source (e.g. BlackHole); updates config
 - `q` — quit
 
 ## Code structure

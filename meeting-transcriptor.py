@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import contextlib
 import termios  # Unix tabanlı sistemlerde çalışır.
 import wave
 from datetime import datetime
@@ -173,22 +174,116 @@ def resolve_input_device(cfg):
     return select_input_device(cfg)
 
 
-def record_audio(filepath, device, fs=16000):
+def select_system_device(cfg):
+    """
+    İsteğe bağlı 'sistem sesi' (ör. Zoom çıkışı) kaynağını seçtirir. Kullanıcı
+    'kapalı' seçerse mikrofon-tek kayda dönülür. Seçimi config'e isimle kaydeder
+    ve index'i (veya kapalıysa None) döndürür.
+    """
+    devices = list_input_devices()
+    if not devices:
+        console.print("[bold red]Giriş yapabilen ses cihazı bulunamadı![/bold red]")
+        return None
+
+    console.print("[bold blue]Sistem sesi (Zoom/toplantı) kaynağı seçin:[/bold blue]")
+    console.print("  [cyan]0[/cyan]) (Kapalı — sadece mikrofon)")
+    for n, (idx, name) in enumerate(devices, start=1):
+        hint = "  [dim]<- önerilen[/dim]" if "blackhole" in name.lower() else ""
+        console.print(f"  [cyan]{n}[/cyan]) {name}{hint}")
+    console.print("[dim]Not: Zoom sesini yakalamak için Zoom/sistem çıkışını bu cihaza (ör. BlackHole) yönlendirmiş olmalısınız.[/dim]")
+
+    # Varsayılan: önceki seçim, yoksa BlackHole varsa onu öner, yoksa kapalı.
+    current_name = cfg.get("system_device")
+    default_choice = "0"
+    for n, (_, name) in enumerate(devices, start=1):
+        if name == current_name:
+            default_choice = str(n)
+            break
+    else:
+        for n, (_, name) in enumerate(devices, start=1):
+            if "blackhole" in name.lower():
+                default_choice = str(n)
+                break
+
+    choice = Prompt.ask(
+        "Seçiminiz (numara)",
+        choices=[str(n) for n in range(len(devices) + 1)],
+        default=default_choice,
+    )
+    if choice == "0":
+        cfg.pop("system_device", None)
+        save_config(cfg)
+        console.print("[green]Sistem sesi kaynağı kapalı (sadece mikrofon).[/green]\n")
+        return None
+    idx, name = devices[int(choice) - 1]
+    cfg["system_device"] = name
+    save_config(cfg)
+    console.print(f"[green]Sistem sesi kaynağı: {name} (index {idx})[/green]\n")
+    return idx
+
+
+def resolve_system_device(cfg):
+    """Config'teki sistem sesi cihazını çözer; ayarlı değilse/yoksa None döndürür."""
+    name = cfg.get("system_device")
+    if not name:
+        return None
+    for idx, dev_name in list_input_devices():
+        if dev_name == name:
+            console.print(f"[blue]Sistem sesi kaynağı:[/blue] [cyan]{name}[/cyan] (index {idx})\n")
+            return idx
+    console.print(f"[yellow]Kayıtlı sistem sesi cihazı '{name}' bulunamadı; sadece mikrofon kullanılacak.[/yellow]")
+    return None
+
+
+def mix_to_mono(arrays):
+    """
+    Bir veya daha fazla mono int16 sinyali tek bir int16 sinyalde birleştirir.
+    Akışları en kısa olanın uzunluğuna göre kırpar (cihazların saatleri biraz
+    kayabilir). Toplama yapar ve gerekirse kırpılmayı (clipping) önlemek için
+    tepe değere göre ölçekler.
+    """
+    arrays = [a for a in arrays if a is not None and len(a) > 0]
+    if not arrays:
+        return None
+    if len(arrays) == 1:
+        return arrays[0].astype(np.int16)
+    n = min(len(a) for a in arrays)
+    acc = np.zeros(n, dtype=np.int32)
+    for a in arrays:
+        acc += a[:n].astype(np.int32)
+    peak = int(np.max(np.abs(acc))) if n else 0
+    if peak > 32767:
+        acc = (acc * (32767.0 / peak)).astype(np.int32)
+    return acc.astype(np.int16)
+
+
+def record_audio(filepath, devices, fs=16000):
+    """
+    Bir veya iki giriş cihazından eşzamanlı kayıt yapar ve tek bir mono WAV'a
+    birleştirir. `devices`: cihaz index'lerinin listesi (ör. [mic] veya
+    [mic, sistem_sesi]). Başarılıysa True döndürür.
+    """
+    if not isinstance(devices, (list, tuple)):
+        devices = [devices]
+    devices = [d for d in devices if d is not None]
+    names = [device_name(d) for d in devices]
+
     clear_console()
     console.print(Panel("Ses Transkripsiyon Uygulamasına Hoşgeldiniz!", style="bold green"), justify="center")
-    dev_name = device_name(device)
-    console.print(f"[dim]Giriş cihazı: {dev_name}[/dim]")
+    console.print(f"[dim]Giriş cihaz(lar)ı: {', '.join(names)}[/dim]")
     console.print("[bold blue]Kayda başlamak için 'Enter'a basın. Kayıt sırasında durdurmak için 'q' tuşuna basın.[/bold blue]\n")
     input()  # Kullanıcı Enter'a bastığında devam eder
 
-    console.print(f"[bold yellow]Recording from '{dev_name}'... (Press 'q' to stop)[/bold yellow]")
-    audio_frames = []
-    stop_flag = [False]  # Kayıt durdurulması için mutable bayrak
+    console.print(f"[bold yellow]Recording from {', '.join(repr(n) for n in names)}... (Press 'q' to stop)[/bold yellow]")
+    frames = [[] for _ in devices]   # her cihaz için ayrı tampon
+    stop_flag = [False]
 
-    def callback(indata, frames, time, status):
-        if status:
-            console.log(f"[red]{status}[/red]")
-        audio_frames.append(indata.copy())
+    def make_callback(i):
+        def callback(indata, n, t, status):
+            if status:
+                console.log(f"[red]{status}[/red]")
+            frames[i].append(indata.copy())
+        return callback
 
     def on_press(key):
         try:
@@ -203,30 +298,38 @@ def record_audio(filepath, device, fs=16000):
     listener.start()
 
     try:
-        with sd.InputStream(samplerate=fs, channels=1, dtype='int16', device=device, callback=callback):
+        with contextlib.ExitStack() as stack:
+            for i, dev in enumerate(devices):
+                stack.enter_context(
+                    sd.InputStream(samplerate=fs, channels=1, dtype='int16',
+                                   device=dev, callback=make_callback(i))
+                )
             while not stop_flag[0]:
                 sd.sleep(100)
     except Exception as e:
         listener.stop()
-        console.print(f"[bold red]Cihaz açılamadı ({dev_name}): {e}[/bold red]")
-        console.print("[yellow]Menüden 'd' ile farklı bir giriş cihazı seçmeyi deneyin.[/yellow]")
+        console.print(f"[bold red]Cihaz açılamadı ({', '.join(names)}): {e}[/bold red]")
+        console.print("[yellow]Menüden 'd'/'s' ile farklı bir giriş cihazı seçmeyi deneyin.[/yellow]")
         return False
 
     listener.join()
 
-    if not audio_frames:
+    per_device = [
+        np.concatenate(buf, axis=0).reshape(-1) if buf else None
+        for buf in frames
+    ]
+    mixed = mix_to_mono(per_device)
+    if mixed is None or len(mixed) == 0:
         # 'q' kayıt başlamadan (mikrofon ilk veriyi üretmeden) basılmış olabilir.
         console.print("[bold red]Hiç ses kaydedilemedi; kayıt atlanıyor.[/bold red]")
         return False
-
-    audio_data = np.concatenate(audio_frames, axis=0)
 
     with wave.open(str(filepath), 'wb') as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)  # 16-bit (2 byte)
         wf.setframerate(fs)
-        wf.writeframes(audio_data.tobytes())
-    console.print(f"[green]Audio saved to {filepath} ({len(audio_data)} samples)[/green]")
+        wf.writeframes(mixed.tobytes())
+    console.print(f"[green]Audio saved to {filepath} ({len(mixed)} samples, {len(devices)} kaynak)[/green]")
     return True
 
 
@@ -284,18 +387,22 @@ def main():
     clear_console()
     console.print(Panel("Ses Transkripsiyon Uygulaması", style="bold magenta"), justify="center")
 
-    # Başlangıç: proje klasörü, dil ve giriş cihazı seçimi
+    # Başlangıç: proje klasörü, dil, mikrofon ve (isteğe bağlı) sistem sesi
     base_path = confirm_base_path(cfg)
     language = cfg.get("language") or select_language(cfg)
     device_index = resolve_input_device(cfg)
+    system_index = resolve_system_device(cfg)
 
     while True:
         # Her kayıt için zaman damgalı bir alt klasör (proje) oluştur.
         project_dir = base_path / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         project_dir.mkdir(parents=True, exist_ok=True)
 
+        # Kayıt kaynakları: mikrofon + (varsa) sistem sesi.
+        sources = [device_index] + ([system_index] if system_index is not None else [])
+
         audio_path = project_dir / "audio.wav"
-        if not record_audio(audio_path, device_index):
+        if not record_audio(audio_path, sources):
             # Kayıt alınamadı: boş proje klasörünü temizle ve baştan başla.
             try:
                 project_dir.rmdir()
@@ -316,12 +423,14 @@ def main():
         flush_stdin()
 
         # Kullanıcıya menüyü gösteriyoruz.
+        system_label = device_name(system_index) if system_index is not None else "kapalı"
         console.print(
-            f"[bold blue]Menü[/bold blue]  "
-            f"[Enter] Yeni kayıt   "
-            f"[l] Dili değiştir (mevcut: {language})   "
-            f"[d] Cihazı değiştir (mevcut: {device_name(device_index)})   "
-            f"[q] Çıkış"
+            f"[bold blue]Menü[/bold blue]\n"
+            f"  [Enter] Yeni kayıt\n"
+            f"  [l] Dili değiştir (mevcut: {language})\n"
+            f"  [d] Mikrofonu değiştir (mevcut: {device_name(device_index)})\n"
+            f"  [s] Sistem sesi kaynağı (mevcut: {system_label})\n"
+            f"  [q] Çıkış"
         )
         try:
             response = Prompt.ask("Seçiminiz", default="")
@@ -338,6 +447,8 @@ def main():
             new_index = select_input_device(cfg)
             if new_index is not None:
                 device_index = new_index
+        elif choice == "s":
+            system_index = select_system_device(cfg)
         # Diğer her durumda (Enter dahil) yeni kayda devam edilir.
 
 

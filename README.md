@@ -19,7 +19,11 @@ Bu proje, mikrofon aracılığıyla ses kaydı alıp, Hugging Face Whisper model
   Transkripsiyon dilini terminalden seçersiniz: `tr` (Türkçe) veya `en` (İngilizce). Seçiminiz `config.json` dosyasında saklanır ve siz değiştirene kadar kullanılır. Menüden `l` tuşu ile dili her zaman değiştirebilirsiniz.
 
 - **Giriş Cihazı Seçimi:**  
-  Başlangıçta, giriş yapabilen ses cihazları (fiziksel mikrofonlar ve `BlackHole`, `ZoomAudioDevice`, `Microsoft Teams Audio` gibi sanal/uygulama cihazları) listelenir ve birini seçersiniz. Seçim `config.json`'a **isimle** kaydedilir (cihaz indeksi oturumlar arasında değişebildiği için), siz değiştirene kadar kullanılır. Menüden `d` tuşu ile cihazı değiştirebilirsiniz. *Not: Zoom/bilgisayar sesini kaydetmek için sesin bir loopback cihazına (ör. BlackHole veya bir Aggregate/Multi-Output cihaz) yönlendirilmesi gerekir; bu yönlendirme işletim sistemi tarafında yapılır, uygulama yalnızca cihazı seçmenizi sağlar.*
+  Başlangıçta, giriş yapabilen ses cihazları (fiziksel mikrofonlar ve `BlackHole`, `ZoomAudioDevice`, `Microsoft Teams Audio` gibi sanal/uygulama cihazları) listelenir ve birini seçersiniz. Seçim `config.json`'a **isimle** kaydedilir (cihaz indeksi oturumlar arasında değişebildiği için), siz değiştirene kadar kullanılır. Menüden `d` tuşu ile cihazı değiştirebilirsiniz.
+
+- **Mikrofon + Sistem Sesi (Zoom) Birlikte Kayıt:**  
+  İsteğe bağlı bir **sistem sesi kaynağı** seçebilirsiniz (varsayılan öneri: `BlackHole`). Seçildiğinde uygulama **mikrofonu ve sistem sesini aynı anda** kaydeder ve tek bir mono WAV dosyasında birleştirir (transkripsiyon için yeterli; kaynaklar en kısa olana göre kırpılır, toplanır ve gerekirse kırpılmayı önlemek için ölçeklenir). Menüden `s` tuşu ile bu kaynağı seçebilir veya kapatabilirsiniz; kapalıyken yalnızca mikrofon kaydedilir.  
+  *Not: Zoom/bilgisayar sesini yakalamak için Zoom (veya sistem) çıkışını bir loopback cihazına (ör. `BlackHole`) yönlendirmiş olmanız gerekir — genelde `BlackHole` + hoparlörünüzü içeren bir **Multi-Output Device** ile, böylece sesi hem duyar hem kaydedersiniz. Bu yönlendirme işletim sistemi tarafında yapılır; uygulama yalnızca cihazı seçip kaydı birleştirir.*
 
 - **Dile Göre Model:**  
   Her dil için en iyi sonucu veren ayrı bir model kullanılır:
@@ -120,7 +124,8 @@ Her kayıttan sonra bir menü gösterilir:
 
 - `[Enter]` — yeni kayıt başlatır.
 - `l` — transkripsiyon dilini (`tr`/`en`) değiştirir; tercih hemen `config.json`'a kaydedilir.
-- `d` — giriş ses cihazını değiştirir; tercih hemen `config.json`'a kaydedilir.
+- `d` — mikrofon (giriş) cihazını değiştirir; tercih hemen `config.json`'a kaydedilir.
+- `s` — sistem sesi (Zoom/toplantı) kaynağını seçer veya kapatır; tercih hemen `config.json`'a kaydedilir.
 - `q` — uygulamadan çıkar.
 
 ### Notlar:
