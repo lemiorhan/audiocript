@@ -5,7 +5,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Removed
+- Deleted the unused legacy `mp4-transcriptor.py` (Turkish-only, superseded by the
+  in-app **Import file** feature).
+
 ### Changed
+- **All UI text, prompts, logs, comments and docstrings are in English.**
 - **Renamed the app to Audiocript** (logo, header banner, all UI text and the
   main script `audiocript.py`).
 - Default recordings folder is now `~/Audiocript/recordings` (was inside the repo
