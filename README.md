@@ -18,8 +18,11 @@ Bu proje, mikrofon aracılığıyla ses kaydı alıp, Hugging Face Whisper model
 - **Dil Seçimi:**  
   Transkripsiyon dilini terminalden seçersiniz: `tr` (Türkçe) veya `en` (İngilizce). Seçiminiz `config.json` dosyasında saklanır ve siz değiştirene kadar kullanılır. Menüden `l` tuşu ile dili her zaman değiştirebilirsiniz.
 
-- **Transkripsiyon:**  
-  Hugging Face’in Whisper modeli kullanılarak, seçilen dilde alınan ses dosyası metne dönüştürülür.
+- **Dile Göre Model:**  
+  Her dil için en iyi sonucu veren ayrı bir model kullanılır:
+  - **Türkçe:** [`selimc/whisper-large-v3-turbo-turkish`](https://huggingface.co/selimc/whisper-large-v3-turbo-turkish) (Hugging Face transformers ile çalışır; ilk kullanımda indirilir).
+  - **İngilizce:** [`ggml-distil-large-v3`](https://huggingface.co/distil-whisper/distil-large-v3-ggml) (whisper.cpp / `pywhispercpp` ile çalışır; ilk kullanımda ~1.5 GB model indirilir).
+  - Modeller CUDA / Apple Silicon (MPS/Metal) / CPU arasından uygun olan cihazda çalıştırılır.
 
 - **Kullanıcı Dostu Konsol Çıktıları:**  
   [Rich](https://rich.readthedocs.io/en/stable/) kütüphanesi ile stilize edilmiş paneller, renkli mesajlar ve interaktif promptlar kullanılır.
@@ -42,8 +45,10 @@ Bu projede aşağıdaki kütüphaneler kullanılmaktadır:
 - `sounddevice`
 - `pynput`
 - `transformers`
+- `huggingface_hub`
+- `pywhispercpp`
 - `rich`
-- `tensorflow`
+- `torch`
 
 Projeyi çalıştırmadan önce bu kütüphaneleri yüklemeniz gerekmektedir. Bunun için `requirements.txt` dosyasını kullanabilirsiniz.
 
@@ -105,7 +110,7 @@ Kayıt yapmak için Enter tuşuna basın. Kayıt başladıktan sonra, kaydı dur
 Uygulama açıldığında önce kayıtların saklanacağı proje klasörünü onaylamanız istenir (Enter ile varsayılanı kabul edebilir veya yeni bir yol girebilirsiniz). İlk çalıştırmada ayrıca transkripsiyon dilini (`tr`/`en`) seçersiniz. Bu tercihler `config.json` dosyasına kaydedilir.
 
 ### Transkripsiyon:
-Kayıt durduktan sonra, ses dosyası ilgili proje alt klasörüne `audio.wav` olarak kaydedilir ve model (Whisper) seçilen dilde transkripsiyon yapar. Sonuç konsolda görüntülenir ve aynı klasöre `transcription.txt` olarak yazılır.
+Kayıt durduktan sonra, ses dosyası ilgili proje alt klasörüne `audio.wav` olarak kaydedilir ve seçilen dile uygun model (Türkçe için `selimc/whisper-large-v3-turbo-turkish`, İngilizce için `ggml-distil-large-v3`) transkripsiyon yapar. Sonuç konsolda görüntülenir ve aynı klasöre `transcription.txt` olarak yazılır.
 
 ### Menü:
 Her kayıttan sonra bir menü gösterilir:

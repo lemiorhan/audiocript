@@ -9,7 +9,6 @@ import numpy as np
 import sounddevice as sd
 import warnings
 from pynput import keyboard
-from transformers import pipeline
 from rich.prompt import Prompt
 from rich.console import Console
 from rich.panel import Panel
@@ -27,6 +26,17 @@ DEFAULT_BASE_PATH = Path(__file__).resolve().parent / "recordings"
 
 # Desteklenen diller: kod -> Whisper dil adı
 LANGUAGES = {"tr": "turkish", "en": "english"}
+
+# Her dil için kullanılacak model ve çalışma zamanı (runtime).
+#  - Türkçe: Hugging Face transformers ile Türkçe'ye ince ayarlı model.
+#  - İngilizce: whisper.cpp (pywhispercpp) ile ggml-distil-large-v3 modeli.
+TR_HF_MODEL = "selimc/whisper-large-v3-turbo-turkish"
+EN_GGML_REPO = "distil-whisper/distil-large-v3-ggml"
+EN_GGML_FILE = "ggml-distil-large-v3.bin"
+
+# Yüklenen modelleri tekrar tekrar yüklememek için önbellek.
+_hf_pipe = None
+_cpp_model = None
 
 
 def clear_console():
@@ -141,15 +151,52 @@ def record_audio(filepath, fs=16000):
     console.print(f"[green]Audio saved to {filepath} ({len(audio_data)} samples)[/green]")
 
 
-def transcribe_audio(filepath, language_name):
-    console.print(f"[bold cyan]Transcribing audio ({language_name})...[/bold cyan]")
-    pipe = pipeline("automatic-speech-recognition", model="openai/whisper-large-v3-turbo", device=0)
-    transcription = pipe(
+def pick_device():
+    """transformers pipeline için uygun cihazı seçer (CUDA > MPS > CPU)."""
+    import torch
+    if torch.cuda.is_available():
+        return "cuda:0"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _transcribe_turkish(filepath):
+    """Türkçe transkripsiyon: transformers + selimc/whisper-large-v3-turbo-turkish."""
+    global _hf_pipe
+    if _hf_pipe is None:
+        from transformers import pipeline
+        device = pick_device()
+        console.print(f"[dim]Türkçe model yükleniyor ({TR_HF_MODEL}, {device})...[/dim]")
+        _hf_pipe = pipeline("automatic-speech-recognition", model=TR_HF_MODEL, device=device)
+    result = _hf_pipe(
         str(filepath),
         return_timestamps=True,
-        generate_kwargs={"language": language_name, "task": "transcribe"},
+        generate_kwargs={"language": "turkish", "task": "transcribe"},
     )
-    return transcription
+    return result.get("text", "")
+
+
+def _transcribe_english(filepath):
+    """İngilizce transkripsiyon: whisper.cpp (pywhispercpp) + ggml-distil-large-v3."""
+    global _cpp_model
+    if _cpp_model is None:
+        from huggingface_hub import hf_hub_download
+        from pywhispercpp.model import Model
+        console.print(f"[dim]İngilizce model hazırlanıyor ({EN_GGML_FILE})...[/dim]")
+        model_path = hf_hub_download(repo_id=EN_GGML_REPO, filename=EN_GGML_FILE)
+        _cpp_model = Model(model_path, print_progress=False, print_realtime=False)
+    segments = _cpp_model.transcribe(str(filepath), language="en")
+    return "".join(segment.text for segment in segments).strip()
+
+
+def transcribe_audio(filepath, language_code):
+    """Seçilen dile göre uygun model ile transkripsiyon yapar ve metni döndürür."""
+    if language_code == "en":
+        console.print("[bold cyan]Transcribing audio (en / ggml-distil-large-v3)...[/bold cyan]")
+        return _transcribe_english(filepath)
+    console.print("[bold cyan]Transcribing audio (tr / whisper-large-v3-turbo-turkish)...[/bold cyan]")
+    return _transcribe_turkish(filepath)
 
 
 def main():
@@ -170,8 +217,7 @@ def main():
         audio_path = project_dir / "audio.wav"
         record_audio(audio_path)
 
-        transcription = transcribe_audio(audio_path, lang_name(language))
-        transcribed_text = transcription.get('text', '')
+        transcribed_text = transcribe_audio(audio_path, language)
         console.print(Panel(f"[bold green]Transcription:[/bold green]\n{transcribed_text}", style="green"), justify="center")
 
         transcription_path = project_dir / "transcription.txt"

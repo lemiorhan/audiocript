@@ -35,9 +35,24 @@ A `config.json` file lives next to the script and stores:
 
 - Create a timestamped subfolder `<base>/YYYY-MM-DD_HH-MM-SS/`.
 - Record audio and save as `audio.wav` inside that subfolder.
-- Transcribe with Whisper using the selected language:
-  `generate_kwargs={"language": "turkish"|"english", "task": "transcribe"}`.
+- Transcribe with the model chosen by the selected language (see "Models").
 - Save the transcription to `transcription.txt` inside the same subfolder.
+
+## Models (per language)
+
+`distil-large-v3` is English-only, so each language uses a different model and
+runtime:
+
+- **Turkish (`tr`):** `selimc/whisper-large-v3-turbo-turkish` via the Hugging
+  Face `transformers` pipeline (`generate_kwargs={"language": "turkish",
+  "task": "transcribe"}`). Downloaded/cached by `transformers` on first use.
+- **English (`en`):** `ggml-distil-large-v3` via whisper.cpp (`pywhispercpp`).
+  The `.bin` (~1.5 GB) is fetched from `distil-whisper/distil-large-v3-ggml`
+  with `huggingface_hub.hf_hub_download` and cached on first use.
+
+Device selection picks CUDA → Apple Silicon (MPS/Metal) → CPU automatically.
+(The previous code hardcoded `device=0`/CUDA, which fails on non-CUDA machines.)
+Each model is lazy-loaded once and cached for the session.
 
 ### Menu after each recording (replaces the y/n prompt)
 
@@ -71,3 +86,5 @@ are: config load/save round-trip, default handling when config is missing, and
 - No translation to a non-English target (Whisper translates reliably only to
   English).
 - No changes to `mp4-transcriptor.py`.
+- Distil-Whisper is English-only; Turkish quality relies on the separate
+  `selimc` model, not on `distil-large-v3`.

@@ -2,6 +2,8 @@ numpy
 sounddevice
 pynput
 transformers
+huggingface_hub
+pywhispercpp
 rich
 torch
 torchvision
