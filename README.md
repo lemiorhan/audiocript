@@ -1,163 +1,213 @@
-# Ses Transkripsiyon Uygulaması
+# Voice Transcriptor
 
-Bu proje, mikrofon aracılığıyla ses kaydı alıp, Hugging Face Whisper modeli kullanarak transkripsiyon yapan bir Python uygulamasıdır. Uygulama, kullanıcının "q" tuşu ile kaydı durdurmasına olanak tanır. Her kayıt için, seçtiğiniz proje klasörünün altında zaman damgalı bir alt klasör (proje) oluşturulur ve ses dosyası (`audio.wav`) ile transkripsiyon (`transcription.txt`) bu klasöre kaydedilir. Transkripsiyon dili (Türkçe `tr` veya İngilizce `en`) terminalden seçilir ve `config.json` dosyasında saklanarak sonraki çalıştırmalarda hatırlanır. Konsol çıktıları, [Rich](https://rich.readthedocs.io/en/stable/) kütüphanesi kullanılarak kullanıcı dostu hale getirilmiştir.
+A full-screen terminal app for **recording audio and transcribing it locally** with
+Whisper — on macOS. Capture your **microphone and the system audio (Zoom, Meet,
+YouTube, …) at the same time**, watch live input/output level meters while you
+record, and get a transcript saved next to the recording. Everything runs on your
+machine; no audio leaves your computer.
 
+> The interface is in English. The **transcription language** is selectable
+> (Turkish or English) and each language uses a dedicated, high-quality model.
 
-> **Önemli:** Bu projede, modelin çalışması için **PyTorch** paketi bilgisayarınızda kurulu olmalıdır. Uygulama, transkripsiyon işlemi sırasında GPU yerine CPU kullanır.
+![Voice Transcriptor — home](assets/screenshot-home.png)
 
----
-
-## Özellikler
-
-- **Interaktif Ses Kaydı:**  
-  Kaydı başlatmak için Enter tuşuna basın, kaydı durdurmak için "q" tuşuna basın.
-
-- **Proje Klasörleri:**  
-  Başlangıçta kayıtların saklanacağı proje klasörünü onaylarsınız (varsayılan `./recordings`). Her kayıt için bu klasörün altında `YYYY-MM-DD_HH-MM-SS` biçiminde zaman damgalı bir alt klasör oluşturulur; ses dosyası `audio.wav`, transkripsiyon ise `transcription.txt` olarak bu klasöre kaydedilir.
-
-- **Dil Seçimi:**  
-  Transkripsiyon dilini terminalden seçersiniz: `tr` (Türkçe) veya `en` (İngilizce). Seçiminiz `config.json` dosyasında saklanır ve siz değiştirene kadar kullanılır. Menüden `l` tuşu ile dili her zaman değiştirebilirsiniz.
-
-- **Başlangıçta Hatırlanan Varsayılanlar:**  
-  Her açılışta proje klasörü, dil, mikrofon ve sistem sesi kaydı seçeneği sırayla sorulur ve **en son seçiminiz varsayılan olarak önerilir** — değiştirmek istemiyorsanız sadece `Enter`'a basın. Tüm seçimler `config.json`'da saklanır (mikrofon **isimle**, çünkü cihaz indeksleri oturumlar arasında değişebilir).
-
-- **Mikrofon (Giriş) Seçimi:**  
-  Giriş yapabilen ses cihazları (fiziksel mikrofonlar ve `ZoomAudioDevice`, `Microsoft Teams Audio` gibi sanal/uygulama cihazları) listelenir ve birini seçersiniz. Menüden `d` tuşu ile her zaman değiştirebilirsiniz.
-
-- **Sistem Sesi Kaydı (Hoparlör/Zoom/YouTube) — Mikrofon ile Birlikte:**  
-  İsteğe bağlı olarak **sistem sesini** de kaydedebilirsiniz. Açıldığında uygulama, **mikrofonu ve tüm sistem sesini aynı anda** kaydedip tek bir mono WAV'da birleştirir (transkripsiyon için). Menüden `s` tuşu ile açıp kapatabilirsiniz; kapalıyken yalnızca mikrofon kaydedilir.  
-  **BlackHole veya yeniden yönlendirme GEREKMEZ:** Sistem sesi, macOS **Core Audio process tap** ile yakalanır ve **sesi duymaya normal şekilde devam edersiniz** (çalan ses kesilmez/sessizleşmez). Bunun için küçük bir Swift yardımcı programı (`mac_audio_tap/system_audio_tap.swift`) ilk kullanımda otomatik derlenir.  
-  *Gereksinimler:* macOS 14.4+ ve Xcode/Command Line Tools (`swiftc`). İlk kullanımda macOS **"Sistem Sesi Kaydı"** izni isteyebilir — onaylayın (Sistem Ayarları → Gizlilik ve Güvenlik). İzin verilmezse uygulama sadece mikrofonla devam eder.
-
-  *Teknik not: Her kaynak kendi **doğal örnekleme hızında** yakalanır ve yazılımda (torchaudio, anti-aliasing'li) 16 kHz mono'ya indirilip birleştirilir (kaynaklar en kısa olana göre kırpılır, toplanır ve gerekirse kırpılmayı önlemek için ölçeklenir).*
-
-- **Dile Göre Model:**  
-  Her dil için en iyi sonucu veren ayrı bir model kullanılır:
-  - **Türkçe:** [`selimc/whisper-large-v3-turbo-turkish`](https://huggingface.co/selimc/whisper-large-v3-turbo-turkish) (Hugging Face transformers ile çalışır; ilk kullanımda indirilir).
-  - **İngilizce:** [`ggml-distil-large-v3`](https://huggingface.co/distil-whisper/distil-large-v3-ggml) (whisper.cpp / `pywhispercpp` ile çalışır; ilk kullanımda ~1.5 GB model indirilir).
-  - Modeller CUDA / Apple Silicon (MPS/Metal) / CPU arasından uygun olan cihazda çalıştırılır.
-
-- **Kullanıcı Dostu Konsol Çıktıları:**  
-  [Rich](https://rich.readthedocs.io/en/stable/) kütüphanesi ile stilize edilmiş paneller, renkli mesajlar ve interaktif promptlar kullanılır.
-
-- **Sürekli Kullanım:**  
-  Her kayıttan sonra bir menü gösterilir: `[Enter]` yeni kayıt, `l` dili değiştir, `q` çıkış.
+![Voice Transcriptor — recording with live level meters](assets/screenshot-recording.png)
 
 ---
 
-## Gereksinimler
+## Features
 
-- **Python:** 3.10 sürümü gereklidir.
-- **pip:** Python paket yöneticisi
-- **(İsteğe bağlı, sistem sesi kaydı için)** macOS 14.4+ ve Xcode / Command Line Tools (`swiftc`). Yalnızca "Sistem Sesi Kaydı" özelliğini kullanırsanız gerekir; sadece mikrofon kaydı için gerekmez.
-
-### Gerekli Python Paketleri
-
-Bu projede aşağıdaki kütüphaneler kullanılmaktadır:
-
-- `numpy`
-- `sounddevice`
-- `pynput`
-- `transformers`
-- `huggingface_hub`
-- `pywhispercpp`
-- `rich`
-- `torch`
-
-Projeyi çalıştırmadan önce bu kütüphaneleri yüklemeniz gerekmektedir. Bunun için `requirements.txt` dosyasını kullanabilirsiniz.
+- **Full-screen terminal UI** — header (current settings + clock), a main panel,
+  and a footer with single-key shortcuts. No typing commands, no Enter needed.
+- **Record mic + system audio together** — your voice (microphone) and the
+  computer's output (a call, a video) are captured simultaneously and mixed into
+  one mono track for transcription.
+- **System audio without BlackHole** — uses a native macOS **Core Audio process
+  tap**, so playback keeps playing through your speakers/headphones normally. No
+  virtual cable, no Multi-Output Device, no rerouting.
+- **Live level meters (VU)** — speak and the mic bar moves; play audio and the
+  system bar moves. Instantly see whether capture is actually working (`no signal`
+  is shown for a silent source).
+- **Per-language models** for the best quality in each language:
+  - **Turkish** → [`selimc/whisper-large-v3-turbo-turkish`](https://huggingface.co/selimc/whisper-large-v3-turbo-turkish) (Hugging Face Transformers)
+  - **English** → [`ggml-distil-large-v3`](https://huggingface.co/distil-whisper/distil-large-v3-ggml) (whisper.cpp via `pywhispercpp`)
+- **Runs on the best device automatically** — CUDA → Apple Silicon (MPS/Metal) → CPU.
+- **Per-recording project folders** — each recording gets its own timestamped
+  folder containing `audio.wav` and `transcription.txt`.
+- **Remembers your preferences** — language, microphone, system-audio toggle and
+  recordings folder are saved to `config.json`.
+- **One command to run** — `./run.sh` sets up the environment and launches the app.
 
 ---
 
-## Hızlı Başlangıç (Tek Komut)
+## Requirements
 
-Sanal ortam oluşturma, bağımlılık yükleme ve uygulamayı başlatma — hepsi tek komutta:
+- **macOS 14.4+** (Core Audio process taps are used for system-audio capture).
+- **Python 3.10+**.
+- **Xcode / Command Line Tools (`swiftc`)** — only needed for the optional
+  system-audio capture (a tiny Swift helper is compiled on first use). Plain
+  microphone recording does not require it.
+
+The first run downloads the transcription models (English ≈ 1.5 GB, Turkish
+≈ 1.6 GB) and caches them; later runs are offline-capable for cached models.
+
+---
+
+## Quick start (one command)
 
 ```bash
 ./run.sh
 ```
 
-`run.sh` ilk çalıştırmada `.venv` sanal ortamını oluşturur ve `requirements.txt`
-içindeki paketleri yükler (torch vb. büyük olduğundan ilk kurulum biraz sürebilir),
-sonraki çalıştırmalarda bunları atlayıp doğrudan uygulamayı başlatır. Bağımlılıklar
-yalnızca `requirements.txt` değiştiğinde yeniden yüklenir.
+`run.sh` creates the virtual environment, installs dependencies from
+`requirements.txt` the first time (and only re-installs when that file changes),
+then launches the app.
 
-> Eğer `./run.sh: Permission denied` alırsanız, ya bir kez `chmod +x run.sh`
-> çalıştırın ya da `bash run.sh` ile başlatın (ikisi de tek komuttur).
-> Farklı bir Python sürümü kullanmak için: `PYTHON=python3.11 ./run.sh`
+> If you get `./run.sh: Permission denied`, either run `chmod +x run.sh` once or
+> start it with `bash run.sh`. To pick a specific interpreter:
+> `PYTHON=python3.11 ./run.sh`.
 
-Aşağıdaki manuel adımlar, kurulumu elle yapmak isteyenler içindir.
+### Manual setup (alternative)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .\.venv\Scripts\activate
+pip install -r requirements.txt
+python meeting-transcriptor.py
+```
 
 ---
 
-## Kurulum Adımları (Manuel)
+## Usage
 
-Bu projeyi sıfırdan çalıştırmak isteyenler için adım adım yapılması gerekenler aşağıdadır:
+The app opens a full-screen interface. Controls are single keypresses (no Enter):
 
-1. **Repo'yu Klonlayın / İndirin:**  
-   Proje dosyalarını bilgisayarınıza indirin veya repoyu klonlayın.
+| Key | Action |
+|-----|--------|
+| `r` (or `Space`) | Start recording |
+| `q` | While recording: **stop & transcribe**. On the home screen: **quit** |
+| `l` | Toggle transcription language (TR ⇄ EN) |
+| `d` | Open the microphone picker (`1`–`9` to choose, `Esc` to cancel) |
+| `s` | Toggle system-audio capture on/off |
+| `p` | Edit the recordings folder (`Enter` to save, `Esc` to cancel) |
 
-2. **Virtual Environment Oluşturun:**  
-   Terminali açın ve proje dizinine gidin. Aşağıdaki komutla sanal ortam oluşturun:
-   ```bash
-   python3 -m venv .venv
+`Ctrl-C` exits cleanly at any time.
 
-3. **Virtual Environment'ı Aktif Edin:**
-   Oluşturduğunuz sanal ortamı şu komut ile aktif edin:
-   ```bash
-   source .venv/bin/activate
-(Windows kullanıyorsanız .\.venv\Scripts\activate komutunu kullanabilirsiniz.)
+While recording, the panel shows a live **VU meter** for each source:
 
-4. **Python 3.10 Yüklemesi (macOS için):**  
-   Eğer macOS kullanıyorsanız ve sisteminizde uygun bir Python sürümü yoksa, Homebrew üzerinden Python 3.10 yükleyebilirsiniz:
-   ```bash
-   brew install python@3.10
+![Microphone picker](assets/screenshot-mic-picker.png)
 
-5. **Mimari Kontrolü (Apple Silicon için):**
-   Projenin ARM64 mimaride çalıştığından emin olmak isterseniz aşağıdaki komutları çalıştırın:
-    ```bash
-   python3 -c "import platform; print(platform.machine())"
+When you stop, the app shows a "Transcribing…" panel (the model loads on first
+use), then displays the transcript and saves it.
 
-   ve
+---
 
-    uname -m
+## How it works
 
-Her iki komut da arm64 çıktısı vermelidir. Özellikle Apple Silicon (M1/M2) cihazlarda doğru mimaride çalıştığınız bu şekilde doğrulanır.
+### Recording both mic and system audio
 
-6. **Gerekli Paketleri Yükleyin:**  
-   Proje dizininde bulunan requirements.txt dosyasını kullanarak gerekli kütüphaneleri yükleyin:
-   ```bash
-   pip install -r requirements.txt
-   
-7. **Uygulamayı Çalıştırın:**
-Sanal ortam aktifken aşağıdaki komutla başlatın:
-    ```bash
-    python meeting-transcriptor.py
-    ```
-    (Veya kurulum/aktivasyonla uğraşmadan tek komut: `./run.sh`)
+macOS does not let an app record an output (speaker) device directly. Many tools
+work around this with a virtual cable (BlackHole) and a Multi-Output Device, but
+that mutes your own playback or requires fiddly routing. Instead, this app uses a
+**Core Audio process tap** (`CATapDescription` with `muteBehavior = .unmuted`)
+via a small Swift helper (`mac_audio_tap/system_audio_tap.swift`, compiled on
+first use). The tap captures the whole system mix **while you keep hearing it**.
 
-## Kullanım
+The mic is captured with `sounddevice`. Each source is opened at its **native
+sample rate** (never forced to 16 kHz) with
+`CoreAudioSettings(change_device_parameters=False)`, so the app never changes a
+device's global sample rate — which previously could interrupt playing audio.
 
-### Uygulamayı Başlatma:
-Terminalde scripti çalıştırdığınızda, "Ses Transkripsiyon Uygulamasına Hoşgeldiniz!" mesajı görüntülenecektir.
+### Mixing and transcription
 
-### Kayda Başlama:
-Kayıt yapmak için Enter tuşuna basın. Kayıt başladıktan sonra, kaydı durdurmak için "q" tuşuna basın.
+Each source is resampled to **16 kHz mono** with `torchaudio` (Kaiser
+anti-aliasing filter), the sources are trimmed to the shortest and mixed (summed
+with peak-limiting), and written as a single 16 kHz mono `audio.wav` — exactly
+what Whisper expects. The transcript is produced by the model for the selected
+language and written to `transcription.txt`.
 
-### Başlangıç (Proje Klasörü, Dil, Mikrofon, Sistem Sesi):
-Uygulama her açıldığında sırayla şunları sorar: proje klasörü, transkripsiyon dili (`tr`/`en`), mikrofon ve sistem sesi kaydı (açık/kapalı). **Her birinde en son seçiminiz varsayılan olarak gelir; korumak için `Enter`'a basın, değiştirmek için yeni değeri girin/seçin.** Tercihler `config.json` dosyasına kaydedilir. **Önemli:** Mikrofon olarak gerçek mikrofonunuzu seçtiğinizden emin olun (varsayılan giriş sanal bir cihazsa kayıt sessiz olabilir).
+### Output layout
 
-### Transkripsiyon:
-Kayıt durduktan sonra, ses dosyası ilgili proje alt klasörüne `audio.wav` olarak kaydedilir ve seçilen dile uygun model (Türkçe için `selimc/whisper-large-v3-turbo-turkish`, İngilizce için `ggml-distil-large-v3`) transkripsiyon yapar. Sonuç konsolda görüntülenir ve aynı klasöre `transcription.txt` olarak yazılır.
+```
+<recordings folder>/
+└── 2026-06-10_14-30-15/
+    ├── audio.wav          # 16 kHz mono mix
+    └── transcription.txt  # transcript
+```
 
-### Menü:
-Her kayıttan sonra bir menü gösterilir:
+### Configuration (`config.json`)
 
-- `[Enter]` — yeni kayıt başlatır.
-- `l` — transkripsiyon dilini (`tr`/`en`) değiştirir; tercih hemen `config.json`'a kaydedilir.
-- `d` — mikrofon (giriş) cihazını değiştirir; tercih hemen `config.json`'a kaydedilir.
-- `s` — sistem sesi kaydını açar/kapatır (Core Audio tap); tercih hemen `config.json`'a kaydedilir.
-- `q` — uygulamadan çıkar.
+Saved next to the script and updated as you change settings:
 
-### Notlar:
-- macOS ortamında "This process is not trusted! Input event monitoring will not be possible until it is added to accessibility clients." uyarısı alabilirsiniz. Bu, sistem erişilebilirlik izinleriyle ilgilidir ve uygulamanın çalışmasını etkilemez. Uyarının görünmemesini istiyorsanız, Terminal veya kullandığınız IDE'yi Erişilebilirlik listesine eklemeniz gerekebilir.
-- Sistem sesi kaydını ilk kez açtığınızda macOS **"Sistem Sesi Kaydı"** izni isteyebilir. İzin verilmezse (veya `swiftc` yoksa) uygulama otomatik olarak sadece mikrofonla devam eder.
+```json
+{
+  "language": "tr",
+  "base_path": "/abs/path/to/recordings",
+  "input_device": "Yeti Stereo Microphone",
+  "capture_system_audio": true
+}
+```
+
+`input_device` is stored by **name** (device indices change between sessions).
+
+---
+
+## Permissions (macOS)
+
+On first use macOS will prompt for permissions — grant them under
+**System Settings → Privacy & Security**:
+
+- **Microphone** — for mic recording.
+- **System Audio Recording** — for the system-audio tap. If denied (or if
+  `swiftc` is unavailable), the app automatically continues with mic-only.
+- **Accessibility** — you may see a one-time notice; not required for normal use.
+
+---
+
+## Troubleshooting
+
+- **A level bar stays empty / shows `no signal`** — that source isn't capturing.
+  For the mic, pick a real microphone with `d` (not a virtual device). For system
+  audio, make sure something is actually playing and the permission was granted.
+- **System audio is off / "system audio unavailable"** — install Xcode Command
+  Line Tools (`xcode-select --install`) so the helper can compile, and grant the
+  *System Audio Recording* permission.
+- **First transcription is slow** — the model is downloaded and loaded on first
+  use; subsequent runs reuse the cache.
+
+---
+
+## Project structure
+
+```
+meeting-transcriptor.py        # the app (TUI + recording + transcription)
+mac_audio_tap/
+  └── system_audio_tap.swift   # Core Audio process-tap helper (compiled on first run)
+run.sh                         # one-command launcher
+requirements.txt
+docs/superpowers/specs/        # design notes
+```
+
+There is also `mp4-transcriptor.py`, an unrelated helper for transcribing MP4
+files (not part of the TUI app).
+
+---
+
+## Contributing
+
+Contributions are welcome — please read [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md). For security issues, see
+[SECURITY.md](SECURITY.md).
+
+## License
+
+Released under the [MIT License](LICENSE).
+
+## Acknowledgements
+
+- [OpenAI Whisper](https://github.com/openai/whisper) and
+  [Distil-Whisper](https://github.com/huggingface/distil-whisper)
+- [`selimc/whisper-large-v3-turbo-turkish`](https://huggingface.co/selimc/whisper-large-v3-turbo-turkish)
+- [whisper.cpp](https://github.com/ggerganov/whisper.cpp) /
+  [`pywhispercpp`](https://github.com/absadiki/pywhispercpp)
+- [Rich](https://github.com/Textualize/rich), [sounddevice](https://python-sounddevice.readthedocs.io/)
