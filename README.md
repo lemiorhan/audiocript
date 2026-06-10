@@ -9,9 +9,9 @@ machine; no audio leaves your computer.
 > The interface is in English. The **transcription language** is selectable
 > (Turkish or English) and each language uses a dedicated, high-quality model.
 
-![Voice Transcriptor — home](assets/screenshot-home.png)
+![Voice Transcriptor — home](assets/tui-home.png)
 
-![Voice Transcriptor — recording with live level meters](assets/screenshot-recording.png)
+![Voice Transcriptor — recording with live level meters](assets/tui-recording.png)
 
 ---
 
@@ -105,7 +105,7 @@ never start talking before it's listening.
 
 While recording, the panel shows a live **VU meter** for each source:
 
-![Microphone picker](assets/screenshot-mic-picker.png)
+![Microphone picker](assets/tui-mic-picker.png)
 
 When you stop, the app shows a "Transcribing…" panel (the model loads on first
 use), then displays the transcript, saves it, and (optionally) opens it in your
@@ -119,7 +119,7 @@ just start typing to filter the list, press `1`–`9` to select (or `Enter` for 
 first match), or `0` to turn auto-open off. Your choice is saved. On first run the
 app defaults to **Sublime Text** if it is installed, otherwise auto-open is off.
 
-![Open transcript with — app picker](assets/screenshot-app-picker.png)
+![Open transcript with — app picker](assets/tui-open-with.png)
 
 ---
 
