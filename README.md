@@ -1,4 +1,4 @@
-# Voice Transcriptor
+# Voice Transcriptor - Terminal App Edition
 
 A full-screen terminal app for **recording audio and transcribing it locally** with
 Whisper — on macOS. Capture your **microphone and the system audio (Zoom, Meet,
