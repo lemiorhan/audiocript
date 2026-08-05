@@ -71,9 +71,14 @@ TR_HF_MODEL = "selimc/whisper-large-v3-turbo-turkish"
 EN_GGML_REPO = "distil-whisper/distil-large-v3-ggml"
 EN_GGML_FILE = "ggml-distil-large-v3.bin"
 
+# Speaker diarization (optional, opt-in). A gated Hugging Face model; needs a
+# token and the user must accept its terms once at huggingface.co.
+PYANNOTE_MODEL = "pyannote/speaker-diarization-3.1"
+
 # Cache loaded models so they are not reloaded.
 _hf_pipe = None
 _cpp_model = None
+_diar_pipe = None
 # Lock so the model is not loaded twice at once (e.g. background pre-warm + transcription).
 _MODEL_LOCK = threading.Lock()
 
@@ -265,7 +270,14 @@ def build_tap_binary():
 
 
 class DeviceRecorder:
-    """Record from one input device (microphone) at its native rate via sounddevice."""
+    """Record from one input device (microphone) at its native rate via sounddevice.
+
+    Audio is streamed straight to a raw PCM file (`raw_path`, native-rate int16) as
+    it arrives, so an interrupted recording (crash / kill) can be recovered from
+    disk. Nothing is buffered in memory."""
+
+    KIND = "mic"
+    RAW_DTYPE = "int16"          # native-endian 16-bit PCM, as written by tobytes()
 
     def __init__(self, index):
         self.index = index
@@ -273,8 +285,9 @@ class DeviceRecorder:
         info = sd.query_devices(index, 'input')
         self.rate = int(round(info['default_samplerate']))
         self.channels = max(1, min(2, int(info['max_input_channels'])))
-        self._frames = []
         self._stream = None
+        self._raw = None
+        self._raw_path = None
         self._level = 0.0  # instantaneous level for the live VU meter (0..1)
         self.meter_name = f"🎤 {self.name}"
 
@@ -285,11 +298,25 @@ class DeviceRecorder:
     def level(self):
         return self._level
 
-    def start(self):
+    def manifest(self):
+        """Describe the raw file so it can be re-read after an interruption."""
+        return {"kind": self.KIND, "file": Path(self._raw_path).name,
+                "rate": self.rate, "channels": self.channels, "dtype": self.RAW_DTYPE}
+
+    def start(self, raw_path):
+        # Unbuffered so every block reaches the kernel immediately; a killed
+        # process then loses nothing already written (only a hard power-loss would).
+        self._raw_path = str(raw_path)
+        self._raw = open(self._raw_path, "wb", buffering=0)
+
         def callback(indata, n, t, status):
             if status and not _QUIET:
                 console.log(f"[red]{status}[/red]")
-            self._frames.append(indata.copy())
+            if self._raw is not None:
+                try:
+                    self._raw.write(indata.tobytes())
+                except Exception:
+                    pass
             if indata.size:
                 peak = float(np.max(np.abs(indata))) / 32768.0
                 # peak-hold + decay: the VU bar reacts to sound and falls smoothly.
@@ -310,11 +337,15 @@ class DeviceRecorder:
             except Exception:
                 pass
             self._stream = None
+        if self._raw is not None:
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+            self._raw = None
 
     def result(self):
-        if not self._frames:
-            return None, self.rate
-        return np.concatenate(self._frames, axis=0), self.rate
+        return _read_raw_pcm(self._raw_path, self.RAW_DTYPE, self.channels), self.rate
 
 
 class TapRecorder:
@@ -324,6 +355,9 @@ class TapRecorder:
     PLAYING (unmuted), and no BlackHole / rerouting is needed.
     """
 
+    KIND = "system"
+    RAW_DTYPE = "<f4"           # 32-bit little-endian float, as sent by the helper
+
     def __init__(self):
         self.label = "Sistem sesi (Core Audio tap)"
         self.meter_name = "🔊 Sistem sesi"
@@ -332,7 +366,8 @@ class TapRecorder:
         self._proc = None
         self._reader = None
         self._stderr_reader = None
-        self._chunks = []
+        self._raw = None
+        self._raw_path = None
         self._stderr = []
         self._ready = threading.Event()
         self._error = None
@@ -341,7 +376,15 @@ class TapRecorder:
     def level(self):
         return self._level
 
-    def start(self):
+    def manifest(self):
+        """Describe the raw file so it can be re-read after an interruption."""
+        return {"kind": self.KIND, "file": Path(self._raw_path).name,
+                "rate": self.rate, "channels": self.channels, "dtype": self.RAW_DTYPE}
+
+    def start(self, raw_path):
+        # Stream the tap's PCM straight to disk, unbuffered (see DeviceRecorder).
+        self._raw_path = str(raw_path)
+        self._raw = open(self._raw_path, "wb", buffering=0)
         binpath = build_tap_binary()  # compiles if needed; raises on failure
         self._proc = subprocess.Popen(
             [str(binpath)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
@@ -389,12 +432,16 @@ class TapRecorder:
             self._ready.set()
             return
         self._ready.set()
-        # 2) Collect the remaining data (float32 PCM) and update the live level.
+        # 2) Stream the remaining data (float32 PCM) to disk and update the level.
         while True:
             data = f.read(8192)
             if not data:
                 break
-            self._chunks.append(data)
+            if self._raw is not None:
+                try:
+                    self._raw.write(data)
+                except Exception:
+                    pass
             arr = np.frombuffer(data, dtype="<f4")
             if arr.size:
                 peak = float(np.max(np.abs(arr)))
@@ -411,16 +458,18 @@ class TapRecorder:
             self._reader.join(timeout=2)
         if self._stderr_reader is not None:
             self._stderr_reader.join(timeout=1)
+        # Close the raw file only after the reader thread has stopped writing.
+        if self._raw is not None:
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+            self._raw = None
 
     def result(self):
-        if not self._chunks or not self.rate:
+        if not self.rate:
             return None, self.rate or 16000
-        raw = b"".join(self._chunks)
-        arr = np.frombuffer(raw[:len(raw) // 4 * 4], dtype="<f4")
-        ch = self.channels or 1
-        if ch > 1:
-            arr = arr[:len(arr) // ch * ch].reshape(-1, ch)
-        return arr, self.rate
+        return _read_raw_pcm(self._raw_path, self.RAW_DTYPE, self.channels), self.rate
 
 
 @contextlib.contextmanager
@@ -471,19 +520,103 @@ def _read_key(timeout=0.1):
         return None
 
 
-def _finalize_to_wav(started, audio_path, target_fs=16000):
-    """Stop already-stopped sources' data: resample each to 16k mono, mix, write
-    a mono WAV. Returns the number of samples written (0 if nothing captured)."""
-    resampled = [resample_to_target(*src.result(), target_fs) for src in started]
-    mixed = mix_to_mono(resampled)
-    if mixed is None or len(mixed) == 0:
-        return 0
-    with wave.open(str(audio_path), 'wb') as wf:
+def _write_mono_wav(path, samples, target_fs=16000):
+    """Write a mono int16 numpy array as a 16-bit WAV at target_fs."""
+    with wave.open(str(path), 'wb') as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)            # 16-bit
         wf.setframerate(target_fs)    # Whisper expects 16 kHz mono
-        wf.writeframes(mixed.tobytes())
+        wf.writeframes(samples.tobytes())
+
+
+def _read_raw_pcm(raw_path, dtype, channels):
+    """Read a raw PCM capture file back into a numpy array (None if empty/missing).
+
+    `dtype` is a numpy dtype string ('int16', '<f4'); `channels` reshapes the flat
+    stream into interleaved frames. Shared by the live and recovery finalize paths."""
+    if not raw_path or not Path(raw_path).exists():
+        return None
+    try:
+        data = Path(raw_path).read_bytes()
+    except Exception:
+        return None
+    if not data:
+        return None
+    arr = np.frombuffer(data, dtype=dtype)
+    ch = int(channels) if channels else 1
+    if ch > 1:
+        arr = arr[:len(arr) // ch * ch].reshape(-1, ch)
+    return arr
+
+
+def _mix_write(pairs, audio_path, target_fs=16000, save_channels=False):
+    """Resample each (kind, array, rate) source to 16k mono, mix, and write a mono
+    WAV. Returns the number of samples written (0 if nothing captured).
+
+    When `save_channels` is set, also write the per-source channels next to
+    audio_path — `mic.wav` (mic) and `system.wav` (system) — so the speaker-labeling
+    path can transcribe and diarize them separately."""
+    resampled, mic_arr, sys_arr = [], None, None
+    for kind, arr, rate in pairs:
+        r = resample_to_target(arr, rate, target_fs)
+        resampled.append(r)
+        if kind == "system":
+            sys_arr = r
+        elif kind == "mic":
+            mic_arr = r
+    mixed = mix_to_mono(resampled)
+    if mixed is None or len(mixed) == 0:
+        return 0
+    _write_mono_wav(audio_path, mixed, target_fs)
+    if save_channels:
+        d = Path(audio_path).parent
+        if mic_arr is not None and len(mic_arr) > 0:
+            _write_mono_wav(d / "mic.wav", mic_arr, target_fs)
+        if sys_arr is not None and len(sys_arr) > 0:
+            _write_mono_wav(d / "system.wav", sys_arr, target_fs)
     return len(mixed)
+
+
+def _finalize_to_wav(started, audio_path, target_fs=16000, save_channels=False):
+    """Finalize the live recorders (already stopped) into a mono WAV from their raw
+    capture files. Returns the number of samples written (0 if nothing captured)."""
+    pairs = []
+    for src in started:
+        arr, rate = src.result()
+        pairs.append((getattr(src, "KIND", "mic"), arr, rate))
+    return _mix_write(pairs, audio_path, target_fs, save_channels)
+
+
+def _finalize_from_manifest(project_dir, sources, target_fs=16000):
+    """Rebuild audio.wav from raw capture files described by a meta `capture`
+    manifest (recovery of an interrupted recording). Writes per-source channel WAVs
+    when more than one source is present, so a later diarized transcript is possible.
+    Returns the number of samples written (0 if nothing recoverable)."""
+    pairs = []
+    for s in sources:
+        arr = _read_raw_pcm(Path(project_dir) / s.get("file", ""),
+                            s.get("dtype", "int16"), s.get("channels", 1))
+        if arr is None:
+            continue
+        pairs.append((s.get("kind", "mic"), arr, int(s.get("rate", 16000))))
+    save_channels = len({kind for kind, _, _ in pairs}) > 1
+    return _mix_write(pairs, Path(project_dir) / "audio.wav", target_fs, save_channels)
+
+
+def _clear_capture(project_dir):
+    """Mark a recording as finalized: delete its raw capture files and clear the
+    `capture.in_progress` flag in meta.json."""
+    meta = _read_meta(project_dir)
+    cap = meta.get("capture")
+    if not isinstance(cap, dict):
+        return
+    for s in cap.get("sources", []):
+        try:
+            (Path(project_dir) / s.get("file", "")).unlink()
+        except Exception:
+            pass
+    cap["in_progress"] = False
+    _write_meta(project_dir, capture=cap)
 
 
 def list_installed_apps():
@@ -673,6 +806,188 @@ def transcribe_audio(filepath, language_code, on_progress=None, duration=None):
     return result.get("text", "")
 
 
+def transcribe_segments(filepath, language_code, on_progress=None, duration=None):
+    """
+    Like transcribe_audio, but return timestamped segments:
+        [{"start": seconds, "end": seconds, "text": str}, …]
+    Empty-text segments are dropped. Used by the speaker-labeling path, which needs
+    timestamps to align transcript text with diarization turns.
+    """
+    _ensure_model(language_code)
+    if language_code == "en":
+        cb = None
+        if on_progress and duration:
+            def cb(seg):
+                t1 = getattr(seg, "t1", None)            # centiseconds (10 ms units)
+                if t1 is not None:
+                    try:
+                        on_progress(min(1.0, (t1 / 100.0) / duration))
+                    except Exception:
+                        pass
+        segments = _cpp_model.transcribe(str(filepath), language="en",
+                                         new_segment_callback=cb)
+        out = []
+        for s in segments:
+            text = (s.text or "").strip()
+            if not text:
+                continue
+            t0 = getattr(s, "t0", None)                  # centiseconds
+            t1 = getattr(s, "t1", None)
+            start = (t0 / 100.0) if t0 is not None else 0.0
+            end = (t1 / 100.0) if t1 is not None else start
+            out.append({"start": start, "end": end, "text": text})
+        return out
+    result = _hf_pipe(
+        str(filepath),
+        return_timestamps=True,
+        generate_kwargs={"language": "turkish", "task": "transcribe"},
+    )
+    out = []
+    for ch in result.get("chunks", []):
+        text = (ch.get("text") or "").strip()
+        if not text:
+            continue
+        ts = ch.get("timestamp") or (None, None)
+        start = float(ts[0]) if ts[0] is not None else 0.0
+        end = float(ts[1]) if ts[1] is not None else start
+        out.append({"start": start, "end": end, "text": text})
+    return out
+
+
+# =========================== Speaker diarization (optional) ===========================
+
+def _hf_token(cfg=None):
+    """Hugging Face token from config ('hf_token') or the HF_TOKEN/HUGGINGFACE_TOKEN
+    env vars. None if unset."""
+    return ((cfg or {}).get("hf_token")
+            or os.environ.get("HF_TOKEN")
+            or os.environ.get("HUGGINGFACE_TOKEN"))
+
+
+def _ensure_diarizer(cfg=None):
+    """
+    Load and cache the pyannote diarization pipeline. Thread-safe (locked). Raises
+    RuntimeError with an actionable message if pyannote, the token, or the gated
+    model are unavailable — callers fail soft on that.
+    """
+    global _diar_pipe
+    if _diar_pipe is not None:
+        return _diar_pipe
+    with _MODEL_LOCK:
+        if _diar_pipe is not None:
+            return _diar_pipe
+        _silence_ml_logging()
+        try:
+            from pyannote.audio import Pipeline
+        except Exception as e:
+            raise RuntimeError("pyannote.audio not installed "
+                               "(pip install pyannote.audio)") from e
+        import torch
+        token = _hf_token(cfg)
+        if not _QUIET:
+            console.print(f"[dim]Preparing speaker diarization ({PYANNOTE_MODEL})…[/dim]")
+        pipe = Pipeline.from_pretrained(PYANNOTE_MODEL, use_auth_token=token)
+        if pipe is None:
+            raise RuntimeError(
+                "could not load the diarization model — set a Hugging Face token "
+                "(config 'hf_token' or HF_TOKEN env) and accept the terms at "
+                f"huggingface.co/{PYANNOTE_MODEL}")
+        try:
+            pipe.to(torch.device(pick_device()))
+        except Exception:
+            pass                                  # CPU fallback is fine
+        _diar_pipe = pipe
+    return _diar_pipe
+
+
+def diarize(wav_path, cfg=None):
+    """Return speaker turns [(start, end, raw_label), …] for a mono WAV, sorted by
+    start time. Raises on failure; the caller decides the fallback."""
+    pipe = _ensure_diarizer(cfg)
+    annotation = pipe(str(wav_path))
+    turns = [(float(seg.start), float(seg.end), str(spk))
+             for seg, _, spk in annotation.itertracks(yield_label=True)]
+    turns.sort(key=lambda t: t[0])
+    return turns
+
+
+def _overlap(a0, a1, b0, b1):
+    """Length of the overlap between intervals [a0,a1] and [b0,b1] (0 if disjoint)."""
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def assign_speakers(segments, turns, default=None):
+    """Tag each transcript segment with the diarization turn it overlaps most.
+    Returns new segments with an added 'speaker' (raw label, or `default`)."""
+    out = []
+    for seg in segments:
+        best, best_ov = default, 0.0
+        for (t0, t1, spk) in turns:
+            ov = _overlap(seg["start"], seg["end"], t0, t1)
+            if ov > best_ov:
+                best, best_ov = spk, ov
+        s = dict(seg)
+        s["speaker"] = best
+        out.append(s)
+    return out
+
+
+def _friendly_speaker_map(segments):
+    """Map raw diarization labels to 'Speaker 1 / Speaker 2 / …' in first-appearance
+    order (by start time)."""
+    mapping, n = {}, 0
+    for seg in sorted(segments, key=lambda s: s["start"]):
+        raw = seg.get("speaker")
+        if raw is None or raw in mapping:
+            continue
+        n += 1
+        mapping[raw] = f"Speaker {n}"
+    return mapping
+
+
+def build_labeled_recording(mic_segments, system_segments, system_turns):
+    """Combine mic segments (labeled 'Me') with diarized system segments
+    (labeled 'Speaker N'), ordered by start time. Returns (labeled_segments,
+    speaker_map) where each segment has a 'label'."""
+    labeled = [dict(s, label="Me") for s in mic_segments]
+    assigned = assign_speakers(system_segments, system_turns)
+    smap = _friendly_speaker_map(assigned)
+    for s in assigned:
+        labeled.append(dict(s, label=smap.get(s.get("speaker"), "Speaker ?")))
+    labeled.sort(key=lambda s: s["start"])
+    return labeled, smap
+
+
+def build_labeled_diarized(segments, turns):
+    """Label a single diarized file's segments as 'Speaker N' (no 'Me'). Used for
+    imports. Returns (labeled_segments, speaker_map)."""
+    assigned = assign_speakers(segments, turns)
+    smap = _friendly_speaker_map(assigned)
+    labeled = [dict(s, label=smap.get(s.get("speaker"), "Speaker ?")) for s in assigned]
+    labeled.sort(key=lambda s: s["start"])
+    return labeled, smap
+
+
+def render_labeled_transcript(labeled):
+    """Render labeled segments to text with [Label] prefixes, merging consecutive
+    same-label segments into one paragraph separated by blank lines."""
+    blocks, cur_label, parts = [], None, []
+    for s in labeled:
+        text = s["text"].strip()
+        if not text:
+            continue
+        label = s.get("label", "")
+        if label != cur_label:
+            if parts:
+                blocks.append((cur_label, " ".join(parts)))
+            cur_label, parts = label, [text]
+        else:
+            parts.append(text)
+    if parts:
+        blocks.append((cur_label, " ".join(parts)))
+    return "\n\n".join(f"[{lbl}] {txt}" for lbl, txt in blocks)
+
+
 # =========================== Recordings (metadata + listing) ===========================
 
 def _read_meta(project_dir):
@@ -729,6 +1044,38 @@ def list_recordings(base_path):
     return recs
 
 
+def _recover_interrupted(base_path):
+    """Rebuild audio.wav for recordings that were killed mid-capture (their meta
+    still has capture.in_progress). Returns the number recovered. Folders with no
+    usable raw data are removed. Run once at startup."""
+    recovered = 0
+    try:
+        entries = [d for d in Path(base_path).iterdir() if d.is_dir()]
+    except Exception:
+        return 0
+    for d in entries:
+        cap = _read_meta(d).get("capture")
+        if not isinstance(cap, dict) or not cap.get("in_progress"):
+            continue
+        if (d / "audio.wav").exists():
+            _clear_capture(d)                 # finalized but flag never cleared
+            continue
+        sources = cap.get("sources", [])
+        if not any((d / s.get("file", "")).exists() for s in sources):
+            shutil.rmtree(d, ignore_errors=True)   # nothing captured before the kill
+            continue
+        try:
+            n = _finalize_from_manifest(d, sources)
+        except Exception:
+            n = 0
+        if n:
+            _clear_capture(d)
+            recovered += 1
+        else:
+            shutil.rmtree(d, ignore_errors=True)
+    return recovered
+
+
 def _rec_display_name(rec):
     return rec["name"] or "Untitled"
 
@@ -755,6 +1102,7 @@ class _TuiState:
         self.language = cfg.get("language") or "tr"
         self.mic_index = _resolve_mic_index(cfg)
         self.capture_system = bool(cfg.get("capture_system_audio", False))
+        self.diarize = bool(cfg.get("diarize", False))
         # modes: menu | recording | preparing | transcribing | importing |
         #        viewer | name_input | rename | mic_picker | app_picker | path_edit
         self.mode = "menu"
@@ -925,6 +1273,10 @@ def _import_panel(state):
             lines.append(f"  Step 2/2  Transcribe     {_spinner(elapsed)}  {elapsed:4.0f}s  [dim](model loads on first use)[/dim]")
         else:
             lines.append(f"  Step 2/2  Transcribe     {_progress_bar(state.import_pct)} {int(state.import_pct * 100):3d}%  {elapsed:4.0f}s")
+    elif state.import_phase == "diarize":
+        lines.append("  [green]Step 1  Extract audio   ✓ done[/green]")
+        lines.append("  [green]Step 2  Transcribe      ✓ done[/green]")
+        lines.append(f"  Step 3  Label speakers   {_spinner(elapsed)}  {elapsed:4.0f}s")
     else:
         lines.append(f"  Preparing…  {_spinner(elapsed)}")
     return Panel(Text.from_markup("\n".join(lines)), title="Import", border_style="yellow")
@@ -945,8 +1297,10 @@ def _tui_header(state):
     clock = datetime.now().strftime("%H:%M:%S")
     mic = device_name(state.mic_index) if state.mic_index is not None else "—"
     sysv = "[green]on[/green]" if state.capture_system else "[dim]off[/dim]"
+    diar = "[green]on[/green]" if state.diarize else "[dim]off[/dim]"
     line1 = (f"[bold]Language[/bold] {state.language.upper()}     "
              f"[bold]Mic[/bold] {mic}     [bold]System audio[/bold] {sysv}     "
+             f"[bold]Speakers[/bold] {diar}     "
              f"[bold]Model[/bold] {_model_label(state)}")
     open_with = state.open_app or "[dim]off[/dim]"
     line2 = f"[dim]Folder[/dim] {state.base_path}     [dim]Open with[/dim] {open_with}"
@@ -979,6 +1333,7 @@ def _menu_items(state):
             {"kind": "setting", "setting": "language", "label": f"      Language: {state.language.upper()}"},
             {"kind": "setting", "setting": "mic", "label": f"      Microphone: {mic}"},
             {"kind": "setting", "setting": "system", "label": f"      System audio: {'on' if state.capture_system else 'off'}"},
+            {"kind": "setting", "setting": "diarize", "label": f"      Speaker labels: {'on' if state.diarize else 'off'}"},
             {"kind": "setting", "setting": "openwith", "label": f"      Open with: {state.open_app or 'off'}"},
             {"kind": "setting", "setting": "folder", "label": f"      Folder: {state.base_path}"},
         ]
@@ -1126,7 +1481,7 @@ def _tui_footer(state):
         "importing": "importing… please wait",
         "recording": "[q] Stop & transcribe",
         "transcribing": "working…",
-        "viewer": "↑/↓ scroll   PgUp/PgDn page   Enter open in app   p play/stop   r rename   d delete   Esc back",
+        "viewer": "↑/↓ scroll   PgUp/PgDn page   Enter open in app   p play/stop   t transcribe   r rename   d delete   Esc back",
         "name_input": "[Enter] Start   [Esc] Cancel",
         "rename": "[Enter] Save   [Backspace] Delete   [Esc] Cancel",
         "confirm_delete": "[y] Delete   any other key: Cancel",
@@ -1138,7 +1493,8 @@ def _tui_footer(state):
         items = _menu_items(state)
         sel = items[state.menu_index] if 0 <= state.menu_index < len(items) else None
         if sel and sel["kind"] == "recording":
-            keystr = "↑/↓ move   Enter view   p play/stop   r rename   d delete   q quit"
+            tx = "" if sel["rec"]["has_transcript"] else "t transcribe   "
+            keystr = f"↑/↓ move   Enter view   p play/stop   {tx}r rename   d delete   q quit"
         else:
             keystr = "↑/↓ move   Enter open/expand   →/← expand/collapse   q quit"
     else:
@@ -1194,7 +1550,7 @@ def _start_recording(state, live):
         announce(f"Opening microphone ({device_name(state.mic_index)})…")
         try:
             mic = DeviceRecorder(state.mic_index)
-            mic.start()
+            mic.start(project_dir / "mic.raw")
             started.append(mic)
         except Exception as e:
             for r in started:
@@ -1215,7 +1571,7 @@ def _start_recording(state, live):
         announce("Starting system audio… (first run may compile a helper or ask for permission)")
         try:
             tap = TapRecorder()
-            tap.start()
+            tap.start(project_dir / "system.raw")
             started.append(tap)
         except Exception as e:
             sys_failed = True
@@ -1229,6 +1585,13 @@ def _start_recording(state, live):
         except Exception:
             pass
         return
+
+    # Record how the raw files can be re-read if this recording is interrupted
+    # (crash / kill) before it is finalized. Recovered on the next launch.
+    _write_meta(project_dir, capture={
+        "in_progress": True,
+        "sources": [r.manifest() for r in started],
+    })
 
     state.recorders = started
     state.project_dir = project_dir
@@ -1245,22 +1608,26 @@ def _stop_and_transcribe(state, live):
         except Exception:
             pass
     audio_path = state.project_dir / "audio.wav"
-    n = _finalize_to_wav(state.recorders, audio_path)
+    has_system = any(isinstance(r, TapRecorder) for r in state.recorders)
+    n = _finalize_to_wav(state.recorders, audio_path, save_channels=state.diarize)
     state.recorders = []
     if not n:
         state.status = "No audio captured; recording discarded."
-        try:
-            state.project_dir.rmdir()
-        except Exception:
-            pass
+        shutil.rmtree(state.project_dir, ignore_errors=True)
         state.mode = "menu"
         return
-    _transcribe_and_save(state, live, state.project_dir, audio_path)
+    # audio.wav is safely on disk now — drop the larger raw files and clear the flag.
+    _clear_capture(state.project_dir)
+    _transcribe_and_save(state, live, state.project_dir, audio_path,
+                         diarize_system=state.diarize and has_system)
 
 
-def _save_and_open(state, project_dir, text):
+def _save_and_open(state, project_dir, text, speaker_map=None):
     """Write transcription.txt + meta, refresh the recordings list, and open the
-    transcript in the chosen app. Sets state.status; does not change state.mode."""
+    transcript in the chosen app. Sets state.status; does not change state.mode.
+
+    `speaker_map` (raw label -> 'Speaker N'), when present, is the diarization
+    result; its friendly names are stored in meta.json for possible later renaming."""
     transcript_path = project_dir / "transcription.txt"
     try:
         with open(transcript_path, "w", encoding="utf-8") as f:
@@ -1268,7 +1635,9 @@ def _save_and_open(state, project_dir, text):
     except Exception as e:
         state.status = f"Save error: {e}"
         return
-    _write_meta(project_dir, name=state.pending_name, language=state.language)
+    speakers = sorted(speaker_map.values()) if speaker_map else None
+    _write_meta(project_dir, name=state.pending_name, language=state.language,
+                speakers=speakers)
     state.recordings = list_recordings(state.base_path)
     label = state.pending_name or project_dir.name
     state.status = f"Saved “{label}”"
@@ -1278,19 +1647,70 @@ def _save_and_open(state, project_dir, text):
                         if err else f"Saved “{label}” & opened in {state.open_app}")
 
 
-def _transcribe_and_save(state, live, project_dir, audio_path):
-    """Transcribe `audio_path` (recording flow, main thread), save, and open."""
+def _transcribe_and_save(state, live, project_dir, audio_path, diarize_system=False):
+    """Transcribe `audio_path` (recording flow, main thread), save, and open.
+
+    When `diarize_system` is set, transcribe the mic channel as 'Me' and diarize +
+    transcribe the system channel into 'Speaker N', producing a labeled transcript.
+    Falls back to the plain single-file transcription if diarization is unavailable
+    or the channel files are missing."""
     state.mode = "transcribing"
     state.status = "Transcribing…"
     live.update(_tui_render(state))
     try:
-        text = transcribe_audio(audio_path, state.language)
+        if diarize_system:
+            text, speaker_map = _labeled_recording_text(state, project_dir)
+        else:
+            text, speaker_map = transcribe_audio(audio_path, state.language), None
     except Exception as e:
         state.status = f"Transcription error: {e}"
         state.mode = "menu"
         return
-    _save_and_open(state, project_dir, text)
+    _save_and_open(state, project_dir, text, speaker_map=speaker_map)
     state.mode = "menu"
+
+
+def _transcribe_existing(state, live, rec):
+    """Transcribe an already-recorded audio.wav that has no transcript yet (e.g. a
+    recording recovered after an interrupted capture). Uses the recording's own
+    saved language/name, and diarizes if speaker labels are on and channel files
+    are present."""
+    project_dir = rec["dir"]
+    audio_path = project_dir / "audio.wav"
+    if not audio_path.exists():
+        state.status = "No audio to transcribe"
+        return
+    has_system = (project_dir / "system.wav").exists()
+    # _transcribe_and_save/_save_and_open read language + pending_name off state;
+    # borrow them for this recording, then restore.
+    prev_lang, prev_name = state.language, state.pending_name
+    state.language = rec.get("language") or state.language
+    state.pending_name = rec.get("name") or ""
+    try:
+        _transcribe_and_save(state, live, project_dir, audio_path,
+                             diarize_system=state.diarize and has_system)
+    finally:
+        state.language, state.pending_name = prev_lang, prev_name
+    state.recordings = list_recordings(state.base_path)
+
+
+def _labeled_recording_text(state, project_dir):
+    """Build the labeled transcript for a recording: mic → 'Me', system → diarized
+    'Speaker N'. Returns (text, speaker_map). Falls back to a plain transcript of
+    audio.wav (no labels) if diarization fails or the channel files are absent."""
+    mic_wav = project_dir / "mic.wav"
+    sys_wav = project_dir / "system.wav"
+    if not sys_wav.exists():
+        return transcribe_audio(project_dir / "audio.wav", state.language), None
+    try:
+        turns = diarize(sys_wav, state.cfg)
+    except Exception as e:
+        state.status = f"Speaker labels off (diarization unavailable: {e})"
+        return transcribe_audio(project_dir / "audio.wav", state.language), None
+    sys_segments = transcribe_segments(sys_wav, state.language)
+    mic_segments = transcribe_segments(mic_wav, state.language) if mic_wav.exists() else []
+    labeled, smap = build_labeled_recording(mic_segments, sys_segments, turns)
+    return render_labeled_transcript(labeled), smap
 
 
 def _import_worker(state, src, project_dir):
@@ -1321,18 +1741,43 @@ def _import_worker(state, src, project_dir):
     state.import_pct = 0.0 if (state.language == "en" and tdur) else None
     state.import_phase_start = time.monotonic()
     try:
-        text = transcribe_audio(
-            audio_path, state.language,
-            on_progress=(lambda p: setattr(state, "import_pct", p)),
-            duration=tdur,
-        )
+        if state.diarize:
+            text, speaker_map = _labeled_import_text(state, audio_path, tdur)
+        else:
+            text = transcribe_audio(
+                audio_path, state.language,
+                on_progress=(lambda p: setattr(state, "import_pct", p)),
+                duration=tdur,
+            )
+            speaker_map = None
     except Exception as e:
         state.status = f"Transcription error: {e}"
         state.mode = "menu"
         return
 
-    _save_and_open(state, project_dir, text)
+    _save_and_open(state, project_dir, text, speaker_map=speaker_map)
     state.mode = "menu"
+
+
+def _labeled_import_text(state, audio_path, tdur):
+    """Labeled transcript for an imported file: diarize the whole mixed file into
+    'Speaker N' (no 'Me', since there is no separate mic channel). Returns
+    (text, speaker_map). Falls back to a plain transcript if diarization fails."""
+    segments = transcribe_segments(
+        audio_path, state.language,
+        on_progress=(lambda p: setattr(state, "import_pct", p)),
+        duration=tdur,
+    )
+    state.import_phase = "diarize"
+    state.import_pct = None
+    state.import_phase_start = time.monotonic()
+    try:
+        turns = diarize(audio_path, state.cfg)
+    except Exception as e:
+        state.status = f"Speaker labels off (diarization unavailable: {e})"
+        return " ".join(s["text"] for s in segments), None
+    labeled, smap = build_labeled_diarized(segments, turns)
+    return render_labeled_transcript(labeled), smap
 
 
 def _import_file(state, live):
@@ -1404,6 +1849,12 @@ def _activate_setting(state, live, setting):
         state.cfg["capture_system_audio"] = state.capture_system
         save_config(state.cfg)
         state.status = f"System audio {'on' if state.capture_system else 'off'}"
+    elif setting == "diarize":
+        state.diarize = not state.diarize
+        state.cfg["diarize"] = state.diarize
+        save_config(state.cfg)
+        state.status = ("Speaker labels on (needs a Hugging Face token; see README)"
+                        if state.diarize else "Speaker labels off")
     elif setting == "mic":
         state.devices = list_input_devices()
         state.mode = "mic_picker"
@@ -1472,6 +1923,9 @@ def _tui_handle_key(key, state, live):
                 _start_rename(state, cur["rec"], "menu")
             elif key in ("p", "P"):
                 _toggle_play(state, cur["rec"])
+            elif key in ("t", "T"):
+                if not cur["rec"]["has_transcript"]:
+                    _transcribe_existing(state, live, cur["rec"])
             elif key in ("d", "D"):
                 state.delete_target = cur["rec"]["dir"]
                 state.delete_name = _rec_display_name(cur["rec"])
@@ -1524,6 +1978,9 @@ def _tui_handle_key(key, state, live):
                     state.status = f"Open error: {e}"
         elif key in ("p", "P"):
             _toggle_play(state, state.viewer_rec)
+        elif key in ("t", "T"):
+            if state.viewer_rec and not state.viewer_rec.get("has_transcript"):
+                _transcribe_existing(state, live, state.viewer_rec)
         elif key in ("d", "D"):
             state.delete_target = state.viewer_rec["dir"]
             state.delete_name = _rec_display_name(state.viewer_rec)
@@ -1632,6 +2089,17 @@ def main():
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         console.print("Audiocript needs an interactive terminal.")
         return
+
+    # Rebuild audio.wav for any recording killed mid-capture last time, so it is
+    # never lost — it reappears in the list ready to transcribe with [t].
+    try:
+        recovered = _recover_interrupted(state.base_path)
+        if recovered:
+            state.recordings = list_recordings(state.base_path)
+            state.status = (f"Recovered {recovered} interrupted "
+                            f"recording{'s' if recovered > 1 else ''}")
+    except Exception:
+        pass
 
     _QUIET = True  # keep library/app prints off the full-screen UI
     # Pre-warm the current language's model in the background so the first

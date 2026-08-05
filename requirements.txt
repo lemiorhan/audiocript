@@ -8,3 +8,4 @@ rich
 torch
 torchvision
 torchaudio
+pyannote.audio  # optional: speaker labels (needs a Hugging Face token; see README)

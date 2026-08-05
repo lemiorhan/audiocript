@@ -44,6 +44,9 @@ meters, and get a saved transcript. Everything runs on your machine.
   open the transcript in your preferred external app.
 - **Import existing media** — transcribe an `mp4`, `mov`, `wav`, `mp3` or `m4a`
   file with a live progress bar.
+- **Speaker labels (optional)** — tag who's talking: your mic becomes **`[Me]`**
+  and remote people on the call become **`[Speaker 1]`, `[Speaker 2]`, …** See
+  [below](#speaker-labels-who-is-talking).
 - **Per-language models** for quality (Turkish & English — see [below](#models-per-language)).
 - **Runs on the best device automatically** — CUDA → Apple Silicon (MPS/Metal) → CPU.
 - **Background model pre-warming** so your first transcript is fast.
@@ -112,8 +115,8 @@ The menu groups everything:
   you can **view** the transcript (`Enter`), **play/stop** its audio (`p`),
   **rename** it (`r`), or **delete** it (`d`, with confirmation). Inside the viewer
   the transcript scrolls and `Enter` opens it in your external app.
-- **Settings** — language (TR/EN), microphone, system-audio capture, the
-  "open with" app, and the recordings folder.
+- **Settings** — language (TR/EN), microphone, system-audio capture, **speaker
+  labels**, the "open with" app, and the recordings folder.
 
 `Ctrl-C` exits cleanly at any time.
 
@@ -159,18 +162,65 @@ one mono `audio.wav` — exactly what Whisper expects.
 | Turkish (`tr`) | [`selimc/whisper-large-v3-turbo-turkish`](https://huggingface.co/selimc/whisper-large-v3-turbo-turkish) | Transformers |
 | English (`en`) | [`ggml-distil-large-v3`](https://huggingface.co/distil-whisper/distil-large-v3-ggml) | whisper.cpp (`pywhispercpp`) |
 
+### Speaker labels (who is talking)
+
+Off by default. Turn it on in **Settings → Speaker labels**. When on, transcripts
+are tagged by speaker:
+
+```
+[Me] Can you walk me through the rollout plan?
+
+[Speaker 1] Sure — we ship to 10% on Friday, then ramp.
+
+[Speaker 2] And the rollback path is the feature flag.
+```
+
+How it works: Whisper transcribes *what* was said, not *who* said it, so labels
+come from two sources combined:
+
+- **Your mic is always `[Me]`** — it's a separate channel, so no guessing.
+- **Remote people (system audio)** are told apart by acoustic **diarization**
+  ([`pyannote.audio`](https://github.com/pyannote/pyannote-audio)): the system
+  channel is split into `Speaker 1`, `Speaker 2`, … and each line is matched to a
+  speaker by timestamp overlap.
+
+To enable it (one-time):
+
+1. `pip install pyannote.audio` (already in `requirements.txt`).
+2. Create a free [Hugging Face token](https://huggingface.co/settings/tokens) and
+   **accept the terms** of the gated model at
+   [`pyannote/speaker-diarization-3.1`](https://huggingface.co/pyannote/speaker-diarization-3.1).
+3. Make the token available as `HF_TOKEN` (env var) or `"hf_token"` in
+   `config.json`.
+
+Notes & limits:
+
+- Diarization adds a processing pass and is **slower**; the model downloads once,
+  then runs **fully offline**. If the package or token is missing, Audiocript
+  **falls back** to a normal unlabeled transcript and tells you why.
+- It's **acoustic clustering**, so the remote speaker count can occasionally be off
+  and names are generic (`Speaker 1`) until you rename them.
+- **Imported files** have no separate mic channel, so the whole file is diarized
+  into `Speaker 1/2/…` with no `[Me]`.
+- **Punctuation & casing** are produced by the Whisper models themselves and are
+  always present, regardless of this setting.
+
 ### Output & configuration
 
 ```
 <recordings folder>/
 └── 2026-06-10_14-30-15/
     ├── audio.wav          # 16 kHz mono mix
-    ├── transcription.txt  # transcript
-    └── meta.json          # { "name": "Daily standup", "language": "tr" }
+    ├── mic.wav            # mic-only channel    (only when speaker labels are on)
+    ├── system.wav         # system-only channel (only when speaker labels are on)
+    ├── transcription.txt  # transcript (labeled by speaker when enabled)
+    └── meta.json          # { "name": "Daily standup", "language": "tr",
+                           #   "speakers": ["Speaker 1", "Speaker 2"] }
 ```
 
 Preferences are saved in `config.json` (language, microphone by name, system-audio
-toggle, recordings folder, and the "open with" app).
+toggle, speaker-labels toggle + optional `hf_token`, recordings folder, and the
+"open with" app).
 
 ---
 
