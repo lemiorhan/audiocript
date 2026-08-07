@@ -31,14 +31,36 @@ func fail(_ msg: String) -> Never {
 var tapID = AudioObjectID(kAudioObjectUnknown)
 var aggID = AudioObjectID(kAudioObjectUnknown)
 var ioProcID: AudioDeviceIOProcID?
+var writeFailed = false
+
+// Idempotent: a signal, a failed stdout write and the start-up error paths can all
+// reach this, and each object must be destroyed exactly once.
+let cleanupLock = NSLock()
+var cleanedUp = false
 
 func cleanup() {
+    cleanupLock.lock()
+    defer { cleanupLock.unlock() }
+    if cleanedUp { return }
+    cleanedUp = true
     if let p = ioProcID, aggID != kAudioObjectUnknown {
         AudioDeviceStop(aggID, p)
         AudioDeviceDestroyIOProcID(aggID, p)
+        ioProcID = nil
     }
-    if aggID != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(aggID) }
-    if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID) }
+    if aggID != kAudioObjectUnknown {
+        AudioHardwareDestroyAggregateDevice(aggID)
+        aggID = AudioObjectID(kAudioObjectUnknown)
+    }
+    if tapID != kAudioObjectUnknown {
+        AudioHardwareDestroyProcessTap(tapID)
+        tapID = AudioObjectID(kAudioObjectUnknown)
+    }
+}
+
+func teardownAndExit() -> Never {
+    cleanup()
+    exit(0)
 }
 
 // 1) Create the tap: global mix of all processes, left audible (unmuted).
@@ -108,11 +130,21 @@ let ioQueue = DispatchQueue(label: "tap.io")
 let out = FileHandle.standardOutput
 st = AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggID, ioQueue) {
     (_, inInputData, _, _, _) in
+    if writeFailed { return }
     let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
     guard abl.count > 0 else { return }
     let buf = abl[0]
     guard let mData = buf.mData, buf.mDataByteSize > 0 else { return }
-    out.write(Data(bytes: mData, count: Int(buf.mDataByteSize)))
+    do {
+        try out.write(contentsOf: Data(bytes: mData, count: Int(buf.mDataByteSize)))
+    } catch {
+        // The reader is gone (EPIPE). SIGPIPE is ignored so we land here instead of
+        // being killed signal-style, and can still tear the tap down. Never do that
+        // from inside the IOProc — AudioDeviceStop waits for this block to return —
+        // so hand it to the main queue.
+        writeFailed = true
+        DispatchQueue.main.async { teardownAndExit() }
+    }
 }
 if st != noErr || ioProcID == nil { cleanup(); fail("create IOProc failed: \(st)") }
 
@@ -120,14 +152,20 @@ st = AudioDeviceStart(aggID, ioProcID)
 if st != noErr { cleanup(); fail("AudioDeviceStart failed: \(st)") }
 
 // 6) Run until terminated; clean up on signal so the private aggregate/tap go away.
-signal(SIGTERM, SIG_IGN)
-signal(SIGINT, SIG_IGN)
-let onSignal: () -> Void = { cleanup(); exit(0) }
-let sigTerm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-let sigInt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-sigTerm.setEventHandler(handler: onSignal)
-sigInt.setEventHandler(handler: onSignal)
-sigTerm.resume()
-sigInt.resume()
+//    Every signal that can realistically reach us is handled, because the default
+//    action for all of them is to terminate the process outright — which would leave
+//    the process tap and the aggregate device behind for coreaudiod to reap:
+//      SIGTERM  the app stopping the recording      SIGINT  Ctrl-C
+//      SIGHUP   the terminal window being closed    SIGPIPE the reader going away
+signal(SIGPIPE, SIG_IGN)          // surfaces as a write error instead (see IOProc)
+let handledSignals: [Int32] = [SIGTERM, SIGINT, SIGHUP]
+for sig in handledSignals { signal(sig, SIG_IGN) }
+let signalSources: [DispatchSourceSignal] = handledSignals.map { sig in
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    src.setEventHandler { teardownAndExit() }
+    src.resume()
+    return src
+}
+_ = signalSources                 // keep the sources alive for the process lifetime
 FileHandle.standardError.write("tap streaming: rate=\(rate) channels=\(channels)\n".data(using: .utf8)!)
 dispatchMain()

@@ -357,10 +357,11 @@ class TapRecorder:
 
     KIND = "system"
     RAW_DTYPE = "<f4"           # 32-bit little-endian float, as sent by the helper
+    STOP_TIMEOUT = 10.0         # generous: a drained helper tears down in ~0.15s
 
     def __init__(self):
-        self.label = "Sistem sesi (Core Audio tap)"
-        self.meter_name = "🔊 Sistem sesi"
+        self.label = "System audio (Core Audio tap)"
+        self.meter_name = "🔊 System audio"
         self.rate = None
         self.channels = None
         self._proc = None
@@ -433,27 +434,70 @@ class TapRecorder:
             return
         self._ready.set()
         # 2) Stream the remaining data (float32 PCM) to disk and update the level.
+        #    This loop MUST NOT die. The helper's Core Audio teardown blocks until its
+        #    IOProc returns, and that IOProc is blocked writing to this pipe — so a
+        #    reader that stops draining means the helper can never shut down and its
+        #    process tap / aggregate device are left behind. Hence the blanket guard.
         while True:
-            data = f.read(8192)
+            try:
+                data = f.read(8192)
+            except Exception:
+                break            # pipe gone: nothing left to drain, leave quietly
             if not data:
                 break
-            if self._raw is not None:
-                try:
+            try:
+                if self._raw is not None:
                     self._raw.write(data)
-                except Exception:
-                    pass
-            arr = np.frombuffer(data, dtype="<f4")
-            if arr.size:
-                peak = float(np.max(np.abs(arr)))
-                self._level = max(peak, self._level * 0.85)
+                # A pipe read can split a frame, so meter only whole float32 samples
+                # (every byte is already on disk regardless).
+                count = len(data) // 4
+                if count:
+                    peak = float(np.max(np.abs(np.frombuffer(data, dtype="<f4",
+                                                             count=count))))
+                    self._level = max(peak, self._level * 0.85)
+            except Exception:
+                pass
+
+    def _drain_chunk(self):
+        """Read one chunk off the helper's stdout so its IOProc never blocks. Used
+        during shutdown if the reader thread is gone. Returns False at EOF/error."""
+        try:
+            data = self._proc.stdout.read(8192)
+        except Exception:
+            return False
+        if not data:
+            return False
+        if self._raw is not None:
+            try:
+                self._raw.write(data)
+            except Exception:
+                pass
+        return True
 
     def stop(self):
         if self._proc is not None and self._proc.poll() is None:
             self._proc.terminate()
-            try:
-                self._proc.wait(timeout=2)
-            except Exception:
+            # The helper destroys its process tap and aggregate device only once its
+            # IOProc returns, and that IOProc is blocked writing to this pipe — so
+            # stdout must keep being drained until the helper exits. Killing it early
+            # skips that teardown and leaves the tap for coreaudiod to reap.
+            deadline = time.monotonic() + self.STOP_TIMEOUT
+            while self._proc.poll() is None and time.monotonic() < deadline:
+                if self._reader is not None and self._reader.is_alive():
+                    self._reader.join(timeout=0.05)      # the reader drains for us
+                elif not self._drain_chunk():
+                    # stdout is closed: the helper is on its way out, just wait.
+                    try:
+                        self._proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+                    except Exception:
+                        pass
+                    break
+            if self._proc.poll() is None:                # last resort only
                 self._proc.kill()
+            try:
+                self._proc.wait(timeout=2)               # reap; never leave a zombie
+            except Exception:
+                pass
         if self._reader is not None:
             self._reader.join(timeout=2)
         if self._stderr_reader is not None:

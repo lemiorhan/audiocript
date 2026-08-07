@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Fixed
+- **The system-audio tap is now always torn down cleanly.** The Swift helper
+  finishes its Core Audio teardown (destroying the process tap and the private
+  aggregate device) only once its IOProc returns — and that IOProc is blocked
+  writing to stdout. If the reader thread stopped draining that pipe, `SIGTERM`
+  could never complete and the app `SIGKILL`ed the helper after 2 s, skipping the
+  teardown entirely. Two causes, both fixed:
+  - The reader's streaming loop was unguarded, and `np.frombuffer(data, "<f4")`
+    raises on any pipe read whose length is not a multiple of 4 — silently killing
+    the drain thread. The loop now meters only whole float32 samples and can no
+    longer die on a bad chunk.
+  - `stop()` now keeps stdout drained while the helper exits (draining itself if
+    the reader thread is gone) instead of blindly killing it after 2 s, and always
+    reaps the process. Measured: clean exit with status 0 in ~0.1 s, where it
+    previously took 2 s and ended in `SIGKILL`.
+
+- **The tap helper now cleans up on every signal that can reach it.** It only
+  handled `SIGTERM` and `SIGINT`, so closing the terminal window (`SIGHUP`) or the
+  reader going away (`SIGPIPE`) killed it outright and the process tap and
+  aggregate device were left behind. Both now run the teardown and exit 0, and
+  `cleanup()` is idempotent so the signal, write-error and start-up failure paths
+  can no longer destroy an object twice.
+
 - **Pressing `q` now shows that transcription has started.** Stopping a recording
   used to freeze the UI on the last recording frame — mixing the capture into
   `audio.wav` and transcribing it both ran on the main loop — so nothing on screen
@@ -20,7 +42,9 @@ All notable changes to this project are documented here. The format is based on
   in-app **Import file** feature).
 
 ### Changed
-- **All UI text, prompts, logs, comments and docstrings are in English.**
+- **All UI text, prompts, logs, comments and docstrings are in English** — including
+  the system-audio source's labels (`System audio (Core Audio tap)`), the last
+  Turkish strings left in the interface.
 - **Renamed the app to Audiocript** (logo, header banner, all UI text and the
   main script `audiocript.py`).
 - Default recordings folder is now `~/Audiocript/recordings` (was inside the repo
