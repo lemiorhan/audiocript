@@ -529,6 +529,17 @@ def _write_mono_wav(path, samples, target_fs=16000):
         wf.writeframes(samples.tobytes())
 
 
+def _wav_duration(path):
+    """Duration of a WAV file in seconds (None if it cannot be read). Used to turn
+    transcription progress into a real percentage without shelling out to ffprobe."""
+    try:
+        with wave.open(str(path), "rb") as wf:
+            rate = wf.getframerate()
+            return (wf.getnframes() / float(rate)) if rate else None
+    except Exception:
+        return None
+
+
 def _read_raw_pcm(raw_path, dtype, channels):
     """Read a raw PCM capture file back into a numpy array (None if empty/missing).
 
@@ -1131,6 +1142,14 @@ class _TuiState:
         self.import_phase = ""        # "extract" | "transcribe"
         self.import_pct = None        # 0..1, or None for indeterminate
         self.import_phase_start = 0.0
+        # background transcription job progress (record → [q], and [t] on a
+        # recording without a transcript); rendered by _transcribe_panel
+        self.tx_name = ""
+        self.tx_language = self.language
+        self.tx_steps = []            # ordered subset of _TX_LABELS' keys
+        self.tx_phase = ""            # the step currently running
+        self.tx_pct = None            # 0..1, or None for indeterminate
+        self.tx_phase_start = 0.0
         try:
             self.base_path.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -1255,6 +1274,22 @@ def _progress_bar(pct, width=30):
     return f"[cyan]{'█' * filled}[/cyan][dim]{'░' * (width - filled)}[/dim]"
 
 
+_MODEL_NOTE = "  [dim](model loads on first use)[/dim]"
+
+
+def _step_line(label, status, pct=None, elapsed=0.0, note=""):
+    """One row of a step list: "done", "pending" (not started), or "active" — a
+    progress bar when `pct` is known, a spinner with the elapsed seconds when it is
+    not. Shared by the import and transcription progress panels."""
+    if status == "done":
+        return f"  [green]{label:<26}✓ done[/green]"
+    if status == "pending":
+        return f"  [dim]{label}[/dim]"
+    meter = (f"{_spinner(elapsed)}  {elapsed:4.0f}s" if pct is None
+             else f"{_progress_bar(pct)} {int(pct * 100):3d}%  {elapsed:4.0f}s")
+    return f"  {label:<26}{meter}{note}"
+
+
 def _import_panel(state):
     """Two-phase import progress: extract (real %), then transcribe (real % for
     English, spinner+elapsed otherwise)."""
@@ -1262,24 +1297,55 @@ def _import_panel(state):
     elapsed = time.monotonic() - state.import_phase_start if state.import_phase_start else 0.0
 
     if state.import_phase == "extract":
-        if state.import_pct is None:
-            lines.append(f"  Step 1/2  Extract audio   {_spinner(elapsed)}  {elapsed:4.0f}s")
-        else:
-            lines.append(f"  Step 1/2  Extract audio   {_progress_bar(state.import_pct)} {int(state.import_pct * 100):3d}%")
-        lines.append("  [dim]Step 2/2  Transcribe[/dim]")
+        lines.append(_step_line("Step 1/2  Extract audio", "active", state.import_pct, elapsed))
+        lines.append(_step_line("Step 2/2  Transcribe", "pending"))
     elif state.import_phase == "transcribe":
-        lines.append("  [green]Step 1/2  Extract audio   ✓ done[/green]")
-        if state.import_pct is None:
-            lines.append(f"  Step 2/2  Transcribe     {_spinner(elapsed)}  {elapsed:4.0f}s  [dim](model loads on first use)[/dim]")
-        else:
-            lines.append(f"  Step 2/2  Transcribe     {_progress_bar(state.import_pct)} {int(state.import_pct * 100):3d}%  {elapsed:4.0f}s")
+        lines.append(_step_line("Step 1/2  Extract audio", "done"))
+        lines.append(_step_line("Step 2/2  Transcribe", "active", state.import_pct, elapsed,
+                                _MODEL_NOTE if state.import_pct is None else ""))
     elif state.import_phase == "diarize":
-        lines.append("  [green]Step 1  Extract audio   ✓ done[/green]")
-        lines.append("  [green]Step 2  Transcribe      ✓ done[/green]")
-        lines.append(f"  Step 3  Label speakers   {_spinner(elapsed)}  {elapsed:4.0f}s")
+        lines.append(_step_line("Step 1  Extract audio", "done"))
+        lines.append(_step_line("Step 2  Transcribe", "done"))
+        lines.append(_step_line("Step 3  Label speakers", "active", None, elapsed))
     else:
         lines.append(f"  Preparing…  {_spinner(elapsed)}")
     return Panel(Text.from_markup("\n".join(lines)), title="Import", border_style="yellow")
+
+
+_TX_LABELS = {"finalize": "Save audio", "diarize": "Label speakers",
+              "transcribe": "Transcribe"}
+
+
+def _tx_begin(state, phase, pct=None, steps=None):
+    """Enter a step of the background transcription job, restarting its clock.
+    Pass `steps` (the full ordered key list) when the plan is set or changes."""
+    if steps is not None:
+        state.tx_steps = steps
+    state.tx_phase = phase
+    state.tx_pct = pct
+    state.tx_phase_start = time.monotonic()
+
+
+def _transcribe_panel(state):
+    """Live progress for the transcription job — which step is running, for how
+    long, and (English) how far in. The work happens on a worker thread, so this
+    keeps animating: pressing [q] switches to it on the very next frame."""
+    elapsed = time.monotonic() - state.tx_phase_start if state.tx_phase_start else 0.0
+    steps = state.tx_steps or ["transcribe"]
+    active = steps.index(state.tx_phase) if state.tx_phase in steps else 0
+    lines = [f"[bold]Transcribing[/bold] “{state.tx_name or 'recording'}”"
+             f"     [dim]Language[/dim] {(state.tx_language or '').upper()}", ""]
+    for i, key in enumerate(steps):
+        label = f"Step {i + 1}/{len(steps)}  {_TX_LABELS.get(key, key)}"
+        if i < active:
+            lines.append(_step_line(label, "done"))
+        elif i > active:
+            lines.append(_step_line(label, "pending"))
+        else:
+            note = _MODEL_NOTE if key == "transcribe" and state.tx_pct is None else ""
+            lines.append(_step_line(label, "active", state.tx_pct, elapsed, note))
+    return Panel(Text.from_markup("\n".join(lines)),
+                 title="Please wait", border_style="yellow")
 
 
 def _model_label(state):
@@ -1419,9 +1485,7 @@ def _tui_body(state):
                f"load a model; this can take a moment.[/dim]")
         return Panel(Text.from_markup(msg), title="Please wait", border_style="yellow")
     if state.mode == "transcribing":
-        msg = ("[bold yellow]Transcribing…[/bold yellow]\n\n"
-               "[dim]The model loads on first use — this can take a moment.[/dim]")
-        return Panel(Text.from_markup(msg), title="Please wait", border_style="yellow")
+        return _transcribe_panel(state)
     if state.mode == "mic_picker":
         lines = []
         for i, (idx, name) in enumerate(state.devices, start=1):
@@ -1480,7 +1544,7 @@ def _tui_footer(state):
         "preparing": "please wait…",
         "importing": "importing… please wait",
         "recording": "[q] Stop & transcribe",
-        "transcribing": "working…",
+        "transcribing": "transcribing… please wait",
         "viewer": "↑/↓ scroll   PgUp/PgDn page   Enter open in app   p play/stop   t transcribe   r rename   d delete   Esc back",
         "name_input": "[Enter] Start   [Esc] Cancel",
         "rename": "[Enter] Save   [Backspace] Delete   [Esc] Cancel",
@@ -1602,32 +1666,61 @@ def _start_recording(state, live):
 
 
 def _stop_and_transcribe(state, live):
+    """Handle [q] during a recording. Switches to the transcription progress screen
+    right away and hands the slow part — mixing the raw capture into audio.wav, then
+    transcribing it — to a worker thread, so the UI keeps animating instead of
+    freezing on the last recording frame with no sign that anything started."""
+    diarize_system = state.diarize and any(isinstance(r, TapRecorder)
+                                           for r in state.recorders)
+    project_dir, language = state.project_dir, state.language
+    name, save_channels = state.pending_name, state.diarize
+    state.tx_name = name or project_dir.name
+    state.tx_language = language
+    _tx_begin(state, "finalize",
+              steps=["finalize"] + (["diarize"] if diarize_system else []) + ["transcribe"])
+    state.status = "Stopping the recording…"
+    state.mode = "transcribing"
+    live.update(_tui_render(state))       # visible feedback on the keypress itself
+    threading.Thread(
+        target=_stop_worker,
+        args=(state, project_dir, language, name, save_channels, diarize_system),
+        daemon=True).start()
+
+
+def _stop_worker(state, project_dir, language, name, save_channels, diarize_system):
+    """Background half of [q]: stop the recorders, mix their raw capture files into
+    audio.wav, then transcribe and save. Reports progress through state.tx_*."""
     for r in state.recorders:
         try:
             r.stop()
         except Exception:
             pass
-    audio_path = state.project_dir / "audio.wav"
-    has_system = any(isinstance(r, TapRecorder) for r in state.recorders)
-    n = _finalize_to_wav(state.recorders, audio_path, save_channels=state.diarize)
+    audio_path = project_dir / "audio.wav"
+    n = _finalize_to_wav(state.recorders, audio_path, save_channels=save_channels)
     state.recorders = []
     if not n:
         state.status = "No audio captured; recording discarded."
-        shutil.rmtree(state.project_dir, ignore_errors=True)
+        shutil.rmtree(project_dir, ignore_errors=True)
         state.mode = "menu"
         return
     # audio.wav is safely on disk now — drop the larger raw files and clear the flag.
-    _clear_capture(state.project_dir)
-    _transcribe_and_save(state, live, state.project_dir, audio_path,
-                         diarize_system=state.diarize and has_system)
+    _clear_capture(project_dir)
+    _transcribe_and_save(state, project_dir, audio_path, language, name,
+                         diarize_system=diarize_system)
 
 
-def _save_and_open(state, project_dir, text, speaker_map=None):
+def _save_and_open(state, project_dir, text, name=None, language=None, speaker_map=None):
     """Write transcription.txt + meta, refresh the recordings list, and open the
     transcript in the chosen app. Sets state.status; does not change state.mode.
 
+    `name`/`language` default to the pending ones on state (the import flow); the
+    transcription jobs pass the recording's own, since they run in the background
+    and must not depend on settings the user may change meanwhile.
+
     `speaker_map` (raw label -> 'Speaker N'), when present, is the diarization
     result; its friendly names are stored in meta.json for possible later renaming."""
+    name = state.pending_name if name is None else name
+    language = state.language if language is None else language
     transcript_path = project_dir / "transcription.txt"
     try:
         with open(transcript_path, "w", encoding="utf-8") as f:
@@ -1636,10 +1729,9 @@ def _save_and_open(state, project_dir, text, speaker_map=None):
         state.status = f"Save error: {e}"
         return
     speakers = sorted(speaker_map.values()) if speaker_map else None
-    _write_meta(project_dir, name=state.pending_name, language=state.language,
-                speakers=speakers)
+    _write_meta(project_dir, name=name, language=language, speakers=speakers)
     state.recordings = list_recordings(state.base_path)
-    label = state.pending_name or project_dir.name
+    label = name or project_dir.name
     state.status = f"Saved “{label}”"
     if state.open_app:
         err = _open_in_app(state.open_app, transcript_path)
@@ -1647,68 +1739,98 @@ def _save_and_open(state, project_dir, text, speaker_map=None):
                         if err else f"Saved “{label}” & opened in {state.open_app}")
 
 
-def _transcribe_and_save(state, live, project_dir, audio_path, diarize_system=False):
-    """Transcribe `audio_path` (recording flow, main thread), save, and open.
+def _transcribe_and_save(state, project_dir, audio_path, language, name,
+                         diarize_system=False):
+    """Transcribe `audio_path`, save, and open. Runs on a worker thread and reports
+    its step/percentage through state.tx_* for _transcribe_panel to render.
 
     When `diarize_system` is set, transcribe the mic channel as 'Me' and diarize +
     transcribe the system channel into 'Speaker N', producing a labeled transcript.
     Falls back to the plain single-file transcription if diarization is unavailable
     or the channel files are missing."""
-    state.mode = "transcribing"
-    state.status = "Transcribing…"
-    live.update(_tui_render(state))
     try:
         if diarize_system:
-            text, speaker_map = _labeled_recording_text(state, project_dir)
+            text, speaker_map = _labeled_recording_text(state, project_dir, language)
         else:
-            text, speaker_map = transcribe_audio(audio_path, state.language), None
+            text, speaker_map = _plain_transcript(state, audio_path, language), None
     except Exception as e:
         state.status = f"Transcription error: {e}"
         state.mode = "menu"
         return
-    _save_and_open(state, project_dir, text, speaker_map=speaker_map)
+    _save_and_open(state, project_dir, text, name=name, language=language,
+                   speaker_map=speaker_map)
     state.mode = "menu"
+
+
+def _plain_transcript(state, audio_path, language):
+    """Transcribe a single WAV, driving the panel's Transcribe step (a real
+    percentage for English, a spinner for Turkish — see transcribe_audio)."""
+    dur = _wav_duration(audio_path)
+    _tx_begin(state, "transcribe", pct=0.0 if (language == "en" and dur) else None)
+    return transcribe_audio(audio_path, language, duration=dur,
+                            on_progress=lambda p: setattr(state, "tx_pct", p))
 
 
 def _transcribe_existing(state, live, rec):
     """Transcribe an already-recorded audio.wav that has no transcript yet (e.g. a
     recording recovered after an interrupted capture). Uses the recording's own
     saved language/name, and diarizes if speaker labels are on and channel files
-    are present."""
+    are present. Runs in a worker thread so the progress screen stays live."""
     project_dir = rec["dir"]
     audio_path = project_dir / "audio.wav"
     if not audio_path.exists():
         state.status = "No audio to transcribe"
         return
-    has_system = (project_dir / "system.wav").exists()
-    # _transcribe_and_save/_save_and_open read language + pending_name off state;
-    # borrow them for this recording, then restore.
-    prev_lang, prev_name = state.language, state.pending_name
-    state.language = rec.get("language") or state.language
-    state.pending_name = rec.get("name") or ""
-    try:
-        _transcribe_and_save(state, live, project_dir, audio_path,
-                             diarize_system=state.diarize and has_system)
-    finally:
-        state.language, state.pending_name = prev_lang, prev_name
-    state.recordings = list_recordings(state.base_path)
+    language = rec.get("language") or state.language
+    name = rec.get("name") or ""
+    diarize_system = state.diarize and (project_dir / "system.wav").exists()
+    state.tx_name = name or project_dir.name
+    state.tx_language = language
+    _tx_begin(state, "diarize" if diarize_system else "transcribe",
+              steps=(["diarize"] if diarize_system else []) + ["transcribe"])
+    state.status = "Starting transcription…"
+    state.mode = "transcribing"
+    live.update(_tui_render(state))
+    threading.Thread(
+        target=_transcribe_and_save,
+        args=(state, project_dir, audio_path, language, name),
+        kwargs={"diarize_system": diarize_system}, daemon=True).start()
 
 
-def _labeled_recording_text(state, project_dir):
+def _labeled_recording_text(state, project_dir, language):
     """Build the labeled transcript for a recording: mic → 'Me', system → diarized
     'Speaker N'. Returns (text, speaker_map). Falls back to a plain transcript of
     audio.wav (no labels) if diarization fails or the channel files are absent."""
     mic_wav = project_dir / "mic.wav"
     sys_wav = project_dir / "system.wav"
+
+    def plain():
+        # No speaker labels after all — drop that step so the panel stops showing it.
+        state.tx_steps = [s for s in state.tx_steps if s != "diarize"]
+        return _plain_transcript(state, project_dir / "audio.wav", language), None
+
     if not sys_wav.exists():
-        return transcribe_audio(project_dir / "audio.wav", state.language), None
+        return plain()
+    _tx_begin(state, "diarize")
     try:
         turns = diarize(sys_wav, state.cfg)
     except Exception as e:
         state.status = f"Speaker labels off (diarization unavailable: {e})"
-        return transcribe_audio(project_dir / "audio.wav", state.language), None
-    sys_segments = transcribe_segments(sys_wav, state.language)
-    mic_segments = transcribe_segments(mic_wav, state.language) if mic_wav.exists() else []
+        return plain()
+    # Both channels come from the same take, so each is half of the Transcribe step.
+    has_mic = mic_wav.exists()
+    dur = _wav_duration(sys_wav)
+    _tx_begin(state, "transcribe", pct=0.0 if (language == "en" and dur) else None)
+    span = 0.5 if has_mic else 1.0
+    sys_segments = transcribe_segments(
+        sys_wav, language, duration=dur,
+        on_progress=lambda p: setattr(state, "tx_pct", p * span))
+    mic_segments = []
+    if has_mic:
+        state.tx_pct = span if state.tx_pct is not None else None
+        mic_segments = transcribe_segments(
+            mic_wav, language, duration=_wav_duration(mic_wav),
+            on_progress=lambda p: setattr(state, "tx_pct", span + p * span))
     labeled, smap = build_labeled_recording(mic_segments, sys_segments, turns)
     return render_labeled_transcript(labeled), smap
 

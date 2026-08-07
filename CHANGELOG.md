@@ -5,6 +5,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- **Pressing `q` now shows that transcription has started.** Stopping a recording
+  used to freeze the UI on the last recording frame — mixing the capture into
+  `audio.wav` and transcribing it both ran on the main loop — so nothing on screen
+  changed until the finished transcript appeared. That work now runs on a worker
+  thread and the screen switches immediately to a live progress panel showing the
+  step (Save audio → Label speakers → Transcribe), a spinner or a real percentage,
+  and the elapsed time. The same panel is used by `t` (transcribe an existing
+  recording), which had the same problem.
+
 ### Removed
 - Deleted the unused legacy `mp4-transcriptor.py` (Turkish-only, superseded by the
   in-app **Import file** feature).
