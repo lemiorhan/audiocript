@@ -6,6 +6,42 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Fixed
+- **The app no longer hangs on startup after an interrupted recording.** Crash
+  recovery resampled the whole capture in one `torchaudio.resample` call. At
+  48 kHz → 16 kHz that reduces to a 411-tap, stride-3 single-channel `conv1d`, and
+  PyTorch's CPU path materialises an im2col buffer of ~550 bytes per input sample —
+  so a 48-minute capture asked for ~76 GB and the process thrashed instead of
+  finishing. Because recovery ran before the UI existed, the terminal stayed blank
+  and the app looked dead on every launch. Resampling is now done in blocks with
+  the overlap the filter needs, so the output is unchanged: 5 minutes of audio went
+  from 5.46 s / 6.75 GB to 0.63 s / 0.07 GB, and the 48-minute recording that
+  triggered this rebuilt in 12 s.
+
+- **Recovery now runs behind the UI and reports progress.** It used to block
+  `main()` before `Live` started, so rebuilding a long recording meant seconds of
+  blank terminal. It now runs on a worker thread once the UI is up, showing
+  `Recovering "name"…  43%` on the status line, and the menu — including starting a
+  new recording — stays usable throughout. Measured with a 10-minute interrupted
+  capture: the first frame lands at 0.73 s while recovery finishes at 5.77 s.
+  Recovery borrows the status line only while it runs, so it never overwrites the
+  user's own messages.
+
+- **Finalizing a recording no longer loads it into memory.** Both the `q` path and
+  recovery read each raw capture with `Path.read_bytes()` and inflated it again via
+  `astype(float32)`, peaking at 5.4 GB for a 48-minute two-source capture. Raw
+  captures are now read block by block straight off disk and resampled, mixed and
+  written as streams: a 30-minute two-source finalize now peaks at effectively no
+  extra memory. Audio output is byte-identical, peak normalisation included.
+
+- **An interrupted finalize can no longer destroy a recording.** Output was written
+  directly to `audio.wav`, so a process killed mid-write left a truncated file while
+  `capture.in_progress` was still set — and the next launch took that file as proof
+  the recording had finished and deleted the raw capture. Everything is now written
+  to `.part` files and renamed once complete, with `audio.wav` renamed last, so an
+  interrupted finalize leaves the raw files untouched and simply runs again. A
+  recovery that fails now keeps its folder too; only a folder with nothing to
+  recover is removed.
+
 - **The system-audio tap is now always torn down cleanly.** The Swift helper
   finishes its Core Audio teardown (destroying the process tap and the private
   aggregate device) only once its IOProc returns — and that IOProc is blocked

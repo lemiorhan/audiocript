@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import math
 import time
 import shutil
 import tty
@@ -171,25 +172,128 @@ def device_name(index):
         return str(index)
 
 
-def mix_to_mono(arrays):
-    """
-    Mix one or more mono int16 signals into a single int16 signal. Trims streams
-    to the shortest length (device clocks drift slightly), sums them, and scales
-    down by the peak if needed to avoid clipping.
-    """
-    arrays = [a for a in arrays if a is not None and len(a) > 0]
-    if not arrays:
-        return None
-    if len(arrays) == 1:
-        return arrays[0].astype(np.int16)
-    n = min(len(a) for a in arrays)
-    acc = np.zeros(n, dtype=np.int32)
-    for a in arrays:
-        acc += a[:n].astype(np.int32)
-    peak = int(np.max(np.abs(acc))) if n else 0
-    if peak > 32767:
-        acc = (acc * (32767.0 / peak)).astype(np.int32)
-    return acc.astype(np.int16)
+# Anti-aliasing parameters for resampling. torchaudio's defaults don't suppress
+# tones above the 8 kHz Nyquist enough; this Kaiser window provides a narrow
+# transition band (close to soxr-VHQ).
+_RESAMPLE_KW = dict(lowpass_filter_width=64, rolloff=0.945,
+                    resampling_method="sinc_interp_kaiser",
+                    beta=14.769656459379492)
+
+# Input samples per resample block (~5.5 s at 48 kHz). torchaudio implements
+# `resample` as a strided conv1d, and the CPU conv1d path materialises an im2col
+# buffer of hundreds of bytes per input sample (~550 B at 48 kHz → 16 kHz). Passing
+# a whole recording in one call therefore needs tens of GB — a 48-minute capture
+# asks for ~76 GB, so the process thrashes instead of finishing. Blocks keep that
+# scratch space bounded; the cost is a few thousand overlap samples per block.
+_RESAMPLE_BLOCK = 1 << 18
+
+
+def _to_int16(f):
+    """Scale, round and clip float samples in [-1, 1] to int16."""
+    return np.clip(np.round(f * 32768.0), -32768, 32767).astype(np.int16)
+
+
+class _RawPcmReader:
+    """Random-access view of a raw PCM capture file as mono float32 samples.
+
+    Only the requested slice is read off disk, so finalizing a recording never holds
+    more than one block in memory — a 48-minute capture used to need gigabytes just to
+    get its samples into an array."""
+
+    def __init__(self, path, dtype, channels):
+        self.path = str(path)
+        self.dtype = np.dtype(dtype)
+        self.channels = max(int(channels or 1), 1)
+        self.frame_bytes = self.dtype.itemsize * self.channels
+        try:
+            self.frames = os.path.getsize(self.path) // self.frame_bytes
+        except OSError:
+            self.frames = 0
+        self._fh = None
+
+    def __len__(self):
+        return self.frames
+
+    def __enter__(self):
+        if self.frames:
+            self._fh = open(self.path, "rb")
+        return self
+
+    def __exit__(self, *exc):
+        if self._fh:
+            self._fh.close()
+            self._fh = None
+
+    def read(self, start, stop):
+        """Mono float32 samples for frames [start, stop), clamped to the file. The
+        int16 -> float and channel-averaging order matches resample_to_target, so the
+        streamed result is bit-identical to the in-memory one."""
+        start, stop = max(int(start), 0), min(int(stop), self.frames)
+        if self._fh is None or stop <= start:
+            return np.zeros(0, dtype=np.float32)
+        self._fh.seek(start * self.frame_bytes)
+        arr = np.frombuffer(self._fh.read((stop - start) * self.frame_bytes), dtype=self.dtype)
+        if self.channels > 1:
+            arr = arr[:len(arr) // self.channels * self.channels].reshape(-1, self.channels)
+        f = arr.astype(np.float32)
+        if not np.issubdtype(self.dtype, np.floating):
+            f = f / 32768.0
+        return f.mean(axis=1) if f.ndim == 2 else f
+
+
+def _resample_support(orig, new):
+    """Half-width, in input samples, of the resample filter for the already reduced
+    ratio `orig`/`new` — mirrors torchaudio's _get_sinc_resample_kernel so blocks
+    overlap by at least as much as the filter reaches."""
+    base = min(orig, new) * _RESAMPLE_KW["rolloff"]
+    return math.ceil(_RESAMPLE_KW["lowpass_filter_width"] * orig / base)
+
+
+def _resample_stream(read, total, src_fs, target_fs, emit, on_progress=None):
+    """Resample `total` mono float32 samples, fetched through `read(start, stop)`, and
+    hand each finished int16 block to `emit`. Returns the number of samples emitted.
+
+    Each block is extended on both sides by the filter's reach and the extension is
+    trimmed off the result, so every output sample sees exactly the input support it
+    would in a single call — the output is identical, just built in slices. Because
+    the caller supplies `read`, the samples can come from an array or straight off
+    disk without duplicating this logic.
+
+    `on_progress` receives the input frames each block consumed."""
+    import torch
+    import torchaudio.functional as AF
+
+    if src_fs == target_fs:                        # nothing to resample, just convert
+        done = 0
+        for start in range(0, total, _RESAMPLE_BLOCK):
+            block = read(start, min(start + _RESAMPLE_BLOCK, total))
+            emit(_to_int16(block))
+            done += len(block)
+            if on_progress:
+                on_progress(len(block))
+        return done
+
+    g = math.gcd(int(src_fs), int(target_fs))
+    orig, new = int(src_fs) // g, int(target_fs) // g   # e.g. 48k→16k = 3/1
+    # Keep block and overlap whole multiples of `orig`, so a block boundary always
+    # lands on an exact output sample (every `orig` inputs yield `new` outputs).
+    pad = math.ceil((_resample_support(orig, new) + orig) / orig) * orig
+    block = max(_RESAMPLE_BLOCK // orig, 1) * orig
+    target_len = -(-new * total // orig)                # ceil, as torchaudio does
+    done = 0
+    for start in range(0, total, block):
+        stop = min(start + block, total)
+        lo, hi = start - pad, stop + pad
+        # Zero-extend past the ends, which is what the single-call edge padding does.
+        chunk = np.pad(read(lo, hi), (max(0, -lo), max(0, hi - total)))
+        res = AF.resample(torch.from_numpy(np.ascontiguousarray(chunk)),
+                          orig_freq=src_fs, new_freq=target_fs, **_RESAMPLE_KW).numpy()
+        want = (target_len - done) if stop >= total else (stop - start) // orig * new
+        emit(_to_int16(res[pad // orig * new:][:want]))
+        done += want
+        if on_progress:
+            on_progress(stop - start)
+    return done
 
 
 def resample_to_target(arr, src_fs, target_fs=16000):
@@ -207,21 +311,12 @@ def resample_to_target(arr, src_fs, target_fs=16000):
         f = arr.astype(np.float32) / 32768.0  # int16 -> [-1, 1]
     if f.ndim == 2:                       # (N, kanal) -> ortalama ile mono
         f = f.mean(axis=1)
-    if src_fs != target_fs:
-        import torch
-        import torchaudio.functional as AF
-        w = torch.from_numpy(np.ascontiguousarray(f))
-        # High-quality anti-aliased resampling (close to soxr-VHQ). The default
-        # parameters don't suppress tones above the 8 kHz Nyquist enough; the
-        # Kaiser window provides a narrow transition band.
-        f = AF.resample(
-            w, orig_freq=src_fs, new_freq=target_fs,
-            lowpass_filter_width=64, rolloff=0.945,
-            resampling_method="sinc_interp_kaiser", beta=14.769656459379492,
-        ).numpy()
-    # float -> int16: scale, round, and clip to avoid overflow.
-    i16 = np.clip(np.round(f * 32768.0), -32768, 32767).astype(np.int16)
-    return i16
+    # High-quality anti-aliased resampling (close to soxr-VHQ), streamed in blocks so
+    # memory stays flat no matter how long the recording is.
+    out = []
+    _resample_stream(lambda a, b: f[max(a, 0):max(b, 0)], len(f),
+                     src_fs, target_fs, out.append)
+    return np.concatenate(out) if out else None
 
 
 def _coreaudio_extra_settings():
@@ -343,9 +438,6 @@ class DeviceRecorder:
             except Exception:
                 pass
             self._raw = None
-
-    def result(self):
-        return _read_raw_pcm(self._raw_path, self.RAW_DTYPE, self.channels), self.rate
 
 
 class TapRecorder:
@@ -510,11 +602,6 @@ class TapRecorder:
                 pass
             self._raw = None
 
-    def result(self):
-        if not self.rate:
-            return None, self.rate or 16000
-        return _read_raw_pcm(self._raw_path, self.RAW_DTYPE, self.channels), self.rate
-
 
 @contextlib.contextmanager
 def _cbreak_mode():
@@ -564,15 +651,6 @@ def _read_key(timeout=0.1):
         return None
 
 
-def _write_mono_wav(path, samples, target_fs=16000):
-    """Write a mono int16 numpy array as a 16-bit WAV at target_fs."""
-    with wave.open(str(path), 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)            # 16-bit
-        wf.setframerate(target_fs)    # Whisper expects 16 kHz mono
-        wf.writeframes(samples.tobytes())
-
-
 def _wav_duration(path):
     """Duration of a WAV file in seconds (None if it cannot be read). Used to turn
     transcription progress into a real percentage without shelling out to ffprobe."""
@@ -584,78 +662,180 @@ def _wav_duration(path):
         return None
 
 
-def _read_raw_pcm(raw_path, dtype, channels):
-    """Read a raw PCM capture file back into a numpy array (None if empty/missing).
-
-    `dtype` is a numpy dtype string ('int16', '<f4'); `channels` reshapes the flat
-    stream into interleaved frames. Shared by the live and recovery finalize paths."""
-    if not raw_path or not Path(raw_path).exists():
-        return None
+def _wav_frame_count(path):
+    """Number of frames in a WAV file (0 if it cannot be read)."""
     try:
-        data = Path(raw_path).read_bytes()
+        with wave.open(str(path), "rb") as wf:
+            return wf.getnframes()
     except Exception:
-        return None
-    if not data:
-        return None
-    arr = np.frombuffer(data, dtype=dtype)
-    ch = int(channels) if channels else 1
-    if ch > 1:
-        arr = arr[:len(arr) // ch * ch].reshape(-1, ch)
-    return arr
-
-
-def _mix_write(pairs, audio_path, target_fs=16000, save_channels=False):
-    """Resample each (kind, array, rate) source to 16k mono, mix, and write a mono
-    WAV. Returns the number of samples written (0 if nothing captured).
-
-    When `save_channels` is set, also write the per-source channels next to
-    audio_path — `mic.wav` (mic) and `system.wav` (system) — so the speaker-labeling
-    path can transcribe and diarize them separately."""
-    resampled, mic_arr, sys_arr = [], None, None
-    for kind, arr, rate in pairs:
-        r = resample_to_target(arr, rate, target_fs)
-        resampled.append(r)
-        if kind == "system":
-            sys_arr = r
-        elif kind == "mic":
-            mic_arr = r
-    mixed = mix_to_mono(resampled)
-    if mixed is None or len(mixed) == 0:
         return 0
-    _write_mono_wav(audio_path, mixed, target_fs)
-    if save_channels:
-        d = Path(audio_path).parent
-        if mic_arr is not None and len(mic_arr) > 0:
-            _write_mono_wav(d / "mic.wav", mic_arr, target_fs)
-        if sys_arr is not None and len(sys_arr) > 0:
-            _write_mono_wav(d / "system.wav", sys_arr, target_fs)
-    return len(mixed)
 
 
-def _finalize_to_wav(started, audio_path, target_fs=16000, save_channels=False):
-    """Finalize the live recorders (already stopped) into a mono WAV from their raw
-    capture files. Returns the number of samples written (0 if nothing captured)."""
-    pairs = []
-    for src in started:
-        arr, rate = src.result()
-        pairs.append((getattr(src, "KIND", "mic"), arr, rate))
-    return _mix_write(pairs, audio_path, target_fs, save_channels)
+_MIX_CHUNK = 1 << 20          # frames per chunk when scanning/mixing 16 kHz WAVs
 
 
-def _finalize_from_manifest(project_dir, sources, target_fs=16000):
-    """Rebuild audio.wav from raw capture files described by a meta `capture`
-    manifest (recovery of an interrupted recording). Writes per-source channel WAVs
-    when more than one source is present, so a later diarized transcript is possible.
-    Returns the number of samples written (0 if nothing recoverable)."""
-    pairs = []
+def _stream_source_to_wav(reader, rate, out_path, target_fs=16000, on_progress=None):
+    """Resample one raw capture straight from disk into a 16 kHz mono WAV, a block at
+    a time. Returns the number of samples written."""
+    written = 0
+
+    with wave.open(str(out_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(target_fs)
+
+        def emit(block):
+            nonlocal written
+            if len(block):
+                wf.writeframes(block.tobytes())
+                written += len(block)
+
+        _resample_stream(reader.read, len(reader), rate, target_fs, emit, on_progress)
+    return written
+
+
+def _summed_chunks(paths, n, on_progress=None, chunk=_MIX_CHUNK):
+    """Yield int32 chunk sums of the given mono 16-bit WAVs over their first n frames."""
+    handles = [wave.open(str(p), "rb") for p in paths]
+    try:
+        pos = 0
+        while pos < n:
+            take = min(chunk, n - pos)
+            acc = np.zeros(take, dtype=np.int32)
+            for wf in handles:
+                a = np.frombuffer(wf.readframes(take), dtype=np.int16)
+                acc[:len(a)] += a.astype(np.int32)
+            yield acc
+            pos += take
+            if on_progress:
+                on_progress(take)
+    finally:
+        for wf in handles:
+            wf.close()
+
+
+def _mix_wavs_to_wav(paths, out_path, target_fs=16000, on_progress=None):
+    """Sum 16 kHz mono WAVs into one, scaling the result down if the sum would clip.
+
+    Two streaming passes: the first finds the peak of the summed signal, the second
+    writes it. Same arithmetic as the in-memory mix — truncate to the shortest source,
+    sum as int32, and scale the whole file by 32767/peak when it overflows — so a
+    single loud moment quietens the mix instead of clipping it."""
+    lengths = []
+    for p in paths:
+        with wave.open(str(p), "rb") as wf:
+            lengths.append(wf.getnframes())
+    n = min(lengths) if lengths else 0
+    if not n:
+        return 0
+    peak = 0
+    for acc in _summed_chunks(paths, n, on_progress):
+        peak = max(peak, int(np.max(np.abs(acc))))
+    gain = (32767.0 / peak) if peak > 32767 else None
+    with wave.open(str(out_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(target_fs)
+        for acc in _summed_chunks(paths, n, on_progress):
+            if gain is not None:
+                acc = (acc * gain).astype(np.int32)
+            wf.writeframes(acc.astype(np.int16).tobytes())
+    return n
+
+
+def _finalize_sources(project_dir, sources, save_channels=False, target_fs=16000,
+                      on_progress=None):
+    """Build audio.wav from raw capture files, streaming so memory stays flat.
+
+    `sources` is a capture manifest — the same list meta.json stores and the recorders
+    return from manifest() — so the live [q] path and the crash-recovery path share
+    one implementation.
+
+    Everything is written to `.part` files and renamed once complete, with audio.wav
+    renamed last. A finalize that dies halfway therefore leaves no audio.wav, which
+    matters because recovery treats an existing audio.wav as proof the recording
+    finished and drops the raw files on that basis.
+
+    When `save_channels` is set the per-source WAVs are kept next to audio.wav —
+    `mic.wav` and `system.wav` — so the speaker-labeling path can transcribe and
+    diarize them separately.
+
+    `on_progress` is called with a fraction in [0, 1]. Returns the number of samples
+    written (0 if nothing was captured)."""
+    d = Path(project_dir)
+    for stale in d.glob("*.part"):
+        stale.unlink(missing_ok=True)
+
+    readers = []
     for s in sources:
-        arr = _read_raw_pcm(Path(project_dir) / s.get("file", ""),
-                            s.get("dtype", "int16"), s.get("channels", 1))
-        if arr is None:
-            continue
-        pairs.append((s.get("kind", "mic"), arr, int(s.get("rate", 16000))))
-    save_channels = len({kind for kind, _, _ in pairs}) > 1
-    return _mix_write(pairs, Path(project_dir) / "audio.wav", target_fs, save_channels)
+        r = _RawPcmReader(d / s.get("file", ""), s.get("dtype", "int16"),
+                          s.get("channels", 1))
+        if len(r):
+            readers.append((s, r))
+    if not readers:
+        return 0
+
+    # Resampling dominates; leave the last tenth for the two mixing passes.
+    stage1_total = sum(len(r) for _, r in readers) or 1
+    stage1_weight = 0.9 if len(readers) > 1 else 1.0
+    done = [0, 0]
+
+    def report(stage, units):
+        done[stage] += units
+        if not on_progress:
+            return
+        if done[1]:
+            mix_total = max(2 * _rate_scaled(readers, target_fs), 1)
+            frac = stage1_weight + (1.0 - stage1_weight) * done[1] / mix_total
+        else:
+            frac = stage1_weight * done[0] / stage1_total
+        on_progress(min(frac, 1.0))
+
+    parts, n = [], 0
+    try:
+        for s, r in readers:
+            part = d / f"{s.get('kind', 'mic')}.wav.part"
+            with r:
+                written = _stream_source_to_wav(r, int(s.get("rate", target_fs)), part,
+                                                target_fs, lambda u: report(0, u))
+            if written:
+                parts.append(part)
+            else:
+                part.unlink(missing_ok=True)
+        if not parts:
+            return 0
+
+        audio_part = d / "audio.wav.part"
+        if len(parts) == 1:
+            n = _wav_frame_count(parts[0])
+            if save_channels:
+                shutil.copyfile(parts[0], audio_part)
+            else:
+                parts[0].replace(audio_part)
+                parts = []
+        else:
+            n = _mix_wavs_to_wav(parts, audio_part, target_fs, lambda u: report(1, u))
+
+        for p in parts:                       # mic.wav.part -> mic.wav
+            if save_channels:
+                p.replace(p.with_suffix(""))
+            else:
+                p.unlink(missing_ok=True)
+        audio_part.replace(d / "audio.wav")   # last: its presence means "finished"
+    except BaseException:
+        for p in d.glob("*.part"):
+            p.unlink(missing_ok=True)
+        raise
+    if on_progress:
+        on_progress(1.0)
+    return n
+
+
+def _rate_scaled(readers, target_fs):
+    """Frames the shortest source will have once resampled to target_fs — the length
+    the two mixing passes each walk through."""
+    return min(int(len(r) * target_fs / max(int(s.get("rate", target_fs)), 1))
+               for s, r in readers)
 
 
 def _clear_capture(project_dir):
@@ -1099,36 +1279,76 @@ def list_recordings(base_path):
     return recs
 
 
-def _recover_interrupted(base_path):
-    """Rebuild audio.wav for recordings that were killed mid-capture (their meta
-    still has capture.in_progress). Returns the number recovered. Folders with no
-    usable raw data are removed. Run once at startup."""
-    recovered = 0
+def _interrupted_dirs(base_path):
+    """Recording folders whose capture never finished (meta still says in_progress)."""
     try:
-        entries = [d for d in Path(base_path).iterdir() if d.is_dir()]
+        entries = sorted(d for d in Path(base_path).iterdir() if d.is_dir())
     except Exception:
-        return 0
+        return []
+    out = []
     for d in entries:
         cap = _read_meta(d).get("capture")
-        if not isinstance(cap, dict) or not cap.get("in_progress"):
-            continue
-        if (d / "audio.wav").exists():
-            _clear_capture(d)                 # finalized but flag never cleared
-            continue
-        sources = cap.get("sources", [])
-        if not any((d / s.get("file", "")).exists() for s in sources):
-            shutil.rmtree(d, ignore_errors=True)   # nothing captured before the kill
-            continue
-        try:
-            n = _finalize_from_manifest(d, sources)
-        except Exception:
-            n = 0
-        if n:
-            _clear_capture(d)
-            recovered += 1
-        else:
-            shutil.rmtree(d, ignore_errors=True)
-    return recovered
+        if isinstance(cap, dict) and cap.get("in_progress"):
+            out.append(d)
+    return out
+
+
+def _recover_one(project_dir, on_progress=None):
+    """Rebuild audio.wav for one recording that was killed mid-capture. Returns True
+    when it now has audio. Folders with nothing usable are removed; anything that
+    raises keeps its folder and raw files so the next launch can try again."""
+    d = Path(project_dir)
+    cap = _read_meta(d).get("capture") or {}
+    if (d / "audio.wav").exists():
+        _clear_capture(d)                       # finalized but the flag never cleared
+        return False
+    sources = cap.get("sources", [])
+    if not any((d / s.get("file", "")).exists() for s in sources):
+        shutil.rmtree(d, ignore_errors=True)    # nothing captured before the kill
+        return False
+    save_channels = len({s.get("kind", "mic") for s in sources}) > 1
+    if not _finalize_sources(d, sources, save_channels, on_progress=on_progress):
+        shutil.rmtree(d, ignore_errors=True)
+        return False
+    _clear_capture(d)
+    return True
+
+
+def _recover_async(state):
+    """Rebuild interrupted recordings in the background, once the UI is up.
+
+    This used to run before Live started, so a long interrupted capture meant many
+    seconds of blank terminal that was indistinguishable from a hang. Progress goes to
+    state.recover_msg, which the footer prefers over state.status while it is set — so
+    recovery owns the status line without destroying the user's own messages."""
+    def run():
+        dirs = _interrupted_dirs(state.base_path)
+        if not dirs:
+            return
+        recovered = 0
+        for i, d in enumerate(dirs, 1):
+            label = _read_meta(d).get("name") or d.name
+            counter = f" ({i}/{len(dirs)})" if len(dirs) > 1 else ""
+
+            def show(frac, label=label, counter=counter):
+                state.recover_msg = (f"Recovering “{label}”…{counter}  "
+                                     f"{int(frac * 100):3d}%")
+
+            show(0.0)
+            try:
+                if _recover_one(d, show):
+                    recovered += 1
+                    state.recordings = list_recordings(state.base_path)
+            except Exception as e:
+                state.recover_msg = None
+                state.status = f"Recovery failed for “{label}”: {e}"
+        state.recover_msg = None
+        if recovered:
+            state.recordings = list_recordings(state.base_path)
+            state.status = (f"Recovered {recovered} interrupted "
+                            f"recording{'s' if recovered > 1 else ''}")
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def _rec_display_name(rec):
@@ -1194,6 +1414,8 @@ class _TuiState:
         self.tx_phase = ""            # the step currently running
         self.tx_pct = None            # 0..1, or None for indeterminate
         self.tx_phase_start = 0.0
+        # crash recovery running in the background; shown in place of status
+        self.recover_msg = None
         try:
             self.base_path.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -1611,7 +1833,9 @@ def _tui_footer(state):
     if _player_active(state):
         status = Text(f"▶ playing “{state.player_name}”  ·  p to stop", style="green")
     else:
-        status = Text(state.status or "", style="dim")
+        # A background recovery borrows this line while it runs; the user's own last
+        # message comes back untouched when it finishes.
+        status = Text(state.recover_msg or state.status or "", style="dim")
     return Panel(Group(keys, status), border_style="blue")
 
 
@@ -1740,7 +1964,8 @@ def _stop_worker(state, project_dir, language, name, save_channels, diarize_syst
         except Exception:
             pass
     audio_path = project_dir / "audio.wav"
-    n = _finalize_to_wav(state.recorders, audio_path, save_channels=save_channels)
+    n = _finalize_sources(project_dir, [r.manifest() for r in state.recorders],
+                          save_channels=save_channels)
     state.recorders = []
     if not n:
         state.status = "No audio captured; recording discarded."
@@ -2256,17 +2481,6 @@ def main():
         console.print("Audiocript needs an interactive terminal.")
         return
 
-    # Rebuild audio.wav for any recording killed mid-capture last time, so it is
-    # never lost — it reappears in the list ready to transcribe with [t].
-    try:
-        recovered = _recover_interrupted(state.base_path)
-        if recovered:
-            state.recordings = list_recordings(state.base_path)
-            state.status = (f"Recovered {recovered} interrupted "
-                            f"recording{'s' if recovered > 1 else ''}")
-    except Exception:
-        pass
-
     _QUIET = True  # keep library/app prints off the full-screen UI
     # Pre-warm the current language's model in the background so the first
     # transcript is fast (header shows Model: loading… → ready).
@@ -2274,6 +2488,10 @@ def main():
     try:
         with _cbreak_mode(), Live(_tui_render(state), screen=True, console=console,
                                   refresh_per_second=15) as live:
+            # Rebuild any recording killed mid-capture last time, so it is never lost —
+            # it reappears in the list ready to transcribe with [t]. Runs behind the UI:
+            # a long one takes seconds, and doing it first left the screen blank.
+            _recover_async(state)
             running = True
             while running:
                 live.update(_tui_render(state))
