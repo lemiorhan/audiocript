@@ -101,7 +101,7 @@ Audiocript is a full-screen app you drive with the **arrow keys**.
 | Context | Keys |
 |---------|------|
 | **Menu** | `↑`/`↓` move · `Enter` open/expand · `→`/`←` expand/collapse · `q` quit |
-| **Menu — on a recording** | `Enter` view transcript · `p` play/stop audio · `r` rename · `d` delete |
+| **Menu — on a recording** | `Enter` view transcript · `p` play/stop audio · `t` transcribe (if it has none) · `u` publish · `r` rename · `d` delete |
 | **Transcript viewer** | `↑`/`↓` scroll · `PgUp`/`PgDn` page · `Enter` open in external app · `p` play/stop · `r` rename · `d` delete · `Esc` back |
 | **Text fields** (name / rename / folder / app filter) | type · `Enter` confirm · `Esc` cancel |
 | **Microphone / app pickers** | `1`–`9` select · `Esc` cancel |
@@ -236,7 +236,9 @@ OPENAI_API_KEY=…
 ```
 
 Any of these can be an exported environment variable instead, which takes precedence
-over the file — so an `OPENAI_API_KEY` you already have in your shell just works.
+over the file — so an `OPENAI_API_KEY` you already have in your shell just works. The
+repository can be given as `owner/repo`, as the address from your browser, or as an
+SSH remote; they all mean the same thing.
 
 Any transcript longer than `TRANSCRIPT_MIN_CHARS` (2000 characters by default) is then
 sent through `prompts/transcript_prompt.md`, which cleans up the speech without
@@ -258,6 +260,14 @@ so a failed push costs nothing but the retry. Progress shows on the status line 
 the menu stays usable. Two optional settings: `OPENAI_MODEL` (default `gpt-4.1` — it
 needs a large output budget, since the response is as long as the transcript) and
 `TRANSCRIPT_MIN_CHARS`.
+
+This runs on its own only when a transcript is first saved. Press **`u`** on a
+recording to publish one that was not — because it failed, because the app was closed
+while it was working, or because you set the keys up afterwards. Anything already
+generated is reused rather than paid for again, and `u` tells you why it declined
+(too short, already published, not configured) instead of doing nothing quietly.
+A failure is also written to `meta.json` as `publish_error`, so it is still there
+after the status line has moved on.
 
 Leave any of the three required values out and nothing happens: this is off unless you
 configure it. Never commit `.env` — it is gitignored for that reason.

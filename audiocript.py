@@ -1826,8 +1826,10 @@ def _tui_footer(state):
         items = _menu_items(state)
         sel = items[state.menu_index] if 0 <= state.menu_index < len(items) else None
         if sel and sel["kind"] == "recording":
-            tx = "" if sel["rec"]["has_transcript"] else "t transcribe   "
-            keystr = f"↑/↓ move   Enter view   p play/stop   {tx}r rename   d delete   q quit"
+            # [t] and [u] are mutually exclusive: you transcribe first, publish after.
+            act = ("u publish   " if sel["rec"]["has_transcript"] else "t transcribe   ")
+            keystr = (f"↑/↓ move   Enter view   p play/stop   {act}"
+                      "r rename   d delete   q quit")
         else:
             keystr = "↑/↓ move   Enter open/expand   →/← expand/collapse   q quit"
     else:
@@ -1986,25 +1988,43 @@ _PUBLISH_STEPS = {"edit": "Editing transcript “{label}”…",
                   "publish": "Publishing to {repo}…"}
 
 
-def _publish_async(state, project_dir, text, name):
+def _publish_gate(project_dir, text):
+    """(config, reason) for this transcript — `reason` is None when it should publish.
+
+    The automatic pass stays quiet about every reason, since someone who never set up
+    a key must not be told off after each recording. [u] shows them instead, because a
+    keypress that does nothing and says nothing reads as a broken app."""
+    try:
+        cfg = publish.config()
+    except Exception as e:
+        return None, f"Could not read .env: {e}"
+    if cfg is None:
+        return None, ("Publishing is not configured — set GITHUB_REPO_FOR_TRANSCRIPTS, "
+                      "GITHUB_TOKEN and OPENAI_API_KEY in .env")
+    if len(text) < cfg["min_chars"]:
+        return cfg, f"Transcript is shorter than {cfg['min_chars']} characters"
+    published = _read_meta(project_dir).get("published")
+    if published:
+        return cfg, f"Already published → {published.get('url', '')}"
+    return cfg, None
+
+
+def _publish_async(state, project_dir, text, name, announce=False):
     """Send a long transcript through OpenAI and file the results on GitHub.
 
     Runs behind the menu, on the status line: what the user was waiting for — the
     transcript — is already saved and opened by now, and the two model calls take
-    minutes.
+    minutes. Returns the worker thread, or None when the gate says no (reported on the
+    status line only when `announce` is set).
 
-    Returns the worker thread, or None when this transcript is not a candidate: the
-    feature is unconfigured, the transcript is too short to be worth the tokens, or it
-    has already been published. None of those is an error, so none of them says
-    anything — someone who never set up a key must not be told off after a recording.
-    """
-    try:
-        cfg = publish.config()
-    except Exception:
-        return None
-    if cfg is None or len(text) < cfg["min_chars"]:
-        return None
-    if _read_meta(project_dir).get("published"):
+    A failure is recorded in meta.json as well as shown. The status line is volatile —
+    it is gone as soon as anything else happens, and the thread is a daemon, so
+    quitting the app kills the job mid-flight — which once left a failed publish with
+    nothing anywhere to say what had gone wrong."""
+    cfg, reason = _publish_gate(project_dir, text)
+    if reason:
+        if announce:
+            state.status = reason
         return None
     label = name or Path(project_dir).name
 
@@ -2014,16 +2034,45 @@ def _publish_async(state, project_dir, text, name):
                 cfg, project_dir, text, name,
                 on_step=lambda s: setattr(state, "bg_msg", _PUBLISH_STEPS[s].format(
                     label=label, repo=cfg["repo"])))
-            _write_meta(project_dir, published={
+            _write_meta(project_dir, publish_error="", published={
                 "url": url, "at": datetime.now().isoformat(timespec="seconds")})
             state.bg_msg = None
             state.status = f"Published “{label}” → {url}"
         except Exception as e:
+            _write_meta(project_dir, publish_error=str(e))
             state.bg_msg = None
             state.status = f"Publish failed: {e}"
+        state.recordings = list_recordings(state.base_path)
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
+    return thread
+
+
+def _publish_existing(state, rec):
+    """[u] on a recording: publish a transcript that is already saved.
+
+    The automatic pass only fires when a transcript is first written, so a publish that
+    failed — or that was cut short by quitting the app — otherwise has no way back, and
+    the recording could never be published again. Stages that already produced output
+    are reused rather than paid for twice."""
+    project_dir = Path(rec["dir"])
+    transcript = project_dir / "transcription.txt"
+    if not transcript.exists():
+        state.status = "No transcript to publish"
+        return None
+    if state.bg_msg:
+        state.status = "Another background job is already running"
+        return None
+    try:
+        text = transcript.read_text(encoding="utf-8")
+    except Exception as e:
+        state.status = f"Could not read the transcript: {e}"
+        return None
+    thread = _publish_async(state, project_dir, text, rec.get("name") or "",
+                            announce=True)
+    if thread:
+        state.status = "Publishing…"
     return thread
 
 
@@ -2367,6 +2416,9 @@ def _tui_handle_key(key, state, live):
             elif key in ("t", "T"):
                 if not cur["rec"]["has_transcript"]:
                     _transcribe_existing(state, live, cur["rec"])
+            elif key in ("u", "U"):
+                if cur["rec"]["has_transcript"]:
+                    _publish_existing(state, cur["rec"])
             elif key in ("d", "D"):
                 state.delete_target = cur["rec"]["dir"]
                 state.delete_name = _rec_display_name(cur["rec"])

@@ -19,6 +19,24 @@ All notable changes to this project are documented here. The format is based on
   the feature is simply off. Uses no new dependencies.
 
 ### Fixed
+- **A pasted repository URL now works.** `GITHUB_REPO_FOR_TRANSCRIPTS` was dropped
+  into the API path verbatim, so anything but a bare `owner/repo` produced
+  `/repos/https://github.com/owner/repo` and could never publish — while the natural
+  thing to configure is the address from the browser. Browser URLs, SSH remotes and
+  `owner/repo` are all accepted now.
+
+- **A publish can be retried.** Publishing only ever ran when a transcript was first
+  saved, so one that failed — or that was killed by quitting the app mid-run, which
+  takes minutes — left a recording that nothing could ever publish again. Press `u` on
+  a recording to run it, and stages that already produced output are reused instead of
+  being paid for a second time. `u` also says why it declined (too short, already
+  published, not configured), where the automatic pass is deliberately silent.
+
+- **A failed publish leaves a trace.** The only report was the status line, which is
+  volatile and is lost entirely when the app closes — so the first real failure left
+  nothing anywhere to say what had happened. The error is now written to `meta.json`
+  as `publish_error`.
+
 - **The app no longer hangs on startup after an interrupted recording.** Crash
   recovery resampled the whole capture in one `torchaudio.resample` call. At
   48 kHz → 16 kHz that reduces to a 411-tap, stride-3 single-channel `conv1d`, and

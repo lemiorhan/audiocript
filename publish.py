@@ -51,6 +51,24 @@ def env_value(key, default=None):
     return os.environ.get(key) or _dotenv().get(key) or default
 
 
+_REPO_URL = re.compile(
+    r"(?:https?://|git@)[^/:]+[/:]+(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?$")
+
+
+def normalize_repo(value):
+    """Reduce whatever was configured to `owner/repo`.
+
+    The README asks for `owner/repo`, but the natural thing is to paste the address
+    out of the browser — and a full URL used to go straight into the API path, giving
+    /repos/https://github.com/owner/repo, which can never work. Browser URLs, SSH
+    remotes and a bare owner/repo all land in the same place now."""
+    value = (value or "").strip().rstrip("/")
+    match = _REPO_URL.match(value)
+    if match:
+        return f"{match['owner']}/{match['name']}"
+    return value.removesuffix(".git")
+
+
 def config():
     """Everything the publish job needs, or None when it is not set up.
 
@@ -66,7 +84,7 @@ def config():
     except ValueError:
         min_chars = DEFAULT_MIN_CHARS
     return {
-        "repo": repo.strip("/"),
+        "repo": normalize_repo(repo),
         "github_token": github_token,
         "openai_token": openai_token,
         "model": env_value("OPENAI_MODEL", DEFAULT_MODEL),
@@ -251,23 +269,37 @@ def run(cfg, project_dir, text, title, on_step=None):
     """Edit the transcript, write it up, and file all three forms in one commit.
     Returns the commit's URL.
 
-    Each stage is written into the recording folder before the next one starts: if the
-    push fails, the model output — and what it cost — is still on disk, and the
-    recording can be published again by clearing `published` from meta.json."""
+    Each stage is written into the recording folder before the next one starts, and a
+    stage whose output is already there is reused rather than run again. That matters
+    on a retry: these responses take minutes and cost real money, so a run that died
+    at the documentation stage — or was cut short by quitting the app — must not pay
+    for the edit a second time."""
     d = Path(project_dir)
 
     def step(name):
         if on_step:
             on_step(name)
 
-    step("edit")
-    edited = openai_complete(render_prompt(PROMPTS / "transcript_prompt.md", text), cfg)
-    (d / EDITED_NAME).write_text(edited, encoding="utf-8")
+    def finished(path):
+        """The output of a stage that already completed, or None."""
+        try:
+            return path.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
 
-    step("document")
-    document = openai_complete(
-        render_prompt(PROMPTS / "documentation_prompt.md", edited), cfg)
-    (d / DOC_NAME).write_text(document, encoding="utf-8")
+    edited = finished(d / EDITED_NAME)
+    if edited is None:
+        step("edit")
+        edited = openai_complete(
+            render_prompt(PROMPTS / "transcript_prompt.md", text), cfg)
+        (d / EDITED_NAME).write_text(edited, encoding="utf-8")
+
+    document = finished(d / DOC_NAME)
+    if document is None:
+        step("document")
+        document = openai_complete(
+            render_prompt(PROMPTS / "documentation_prompt.md", edited), cfg)
+        (d / DOC_NAME).write_text(document, encoding="utf-8")
 
     step("publish")
     folder = folder_name(d.name, title)

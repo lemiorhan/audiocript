@@ -460,6 +460,114 @@ def test_a_failure_is_reported_on_the_status_line():
         api.close()
 
 
+def test_repo_accepts_what_people_actually_paste():
+    """The README says owner/repo, but the natural thing is to paste the browser URL —
+    which used to be dropped into the API path verbatim and could never work."""
+    cases = {
+        "lemiorhan/meeting_transcripts": "lemiorhan/meeting_transcripts",
+        "https://github.com/lemiorhan/meeting_transcripts":
+            "lemiorhan/meeting_transcripts",
+        "https://github.com/lemiorhan/meeting_transcripts/":
+            "lemiorhan/meeting_transcripts",
+        "https://github.com/lemiorhan/meeting_transcripts.git":
+            "lemiorhan/meeting_transcripts",
+        "git@github.com:lemiorhan/meeting_transcripts.git":
+            "lemiorhan/meeting_transcripts",
+    }
+    for given, want in cases.items():
+        with workdir("repo") as d, isolated(d):
+            (d / ".env").write_text(f"GITHUB_REPO_FOR_TRANSCRIPTS={given}\n"
+                                    "GITHUB_TOKEN=g\nOPENAI_API_KEY=o\n")
+            got = publish.config()["repo"]
+            assert got == want, f"{given!r} -> {got!r}, wanted {want!r}"
+    print(f"  {len(cases)} forms all normalise to owner/repo")
+
+
+def test_run_reuses_stages_that_already_finished():
+    """A retry must not pay for output that is already on disk."""
+    api = FakeAPI(pipeline_routes())
+    try:
+        with workdir("reuse") as base:
+            d = recording(base / "2026-08-08_00-08-15", "x" * 100)
+            (d / "transcript.edited.md").write_text("ALREADY EDITED", encoding="utf-8")
+            publish.run(configured(api), d, "x" * 100, "demo")
+            calls = [r for r in api.requests if "chat/completions" in r["path"]]
+            print(f"  {len(calls)} OpenAI call(s) after a completed stage 1")
+            assert len(calls) == 1, f"re-ran a finished stage ({len(calls)} calls)"
+            assert "ALREADY EDITED" in calls[0]["body"]["messages"][0]["content"], \
+                "the documentation stage was not fed the existing edit"
+            assert (d / "transcript.edited.md").read_text() == "ALREADY EDITED", \
+                "overwrote the earlier output"
+    finally:
+        api.close()
+
+
+def test_failure_is_recorded_in_meta():
+    """A background job whose only report is the status line leaves nothing behind
+    when the app is closed — which is exactly how the first real failure was lost."""
+    routes = pipeline_routes()
+    routes[("POST", "/v1/chat/completions")] = [(401, {"error": {"message": "bad key"}})]
+    api = FakeAPI(routes)
+    try:
+        with workdir("trace") as base, configured_env(api):
+            d = recording(base / "2026-08-08_01-00-00", "x" * 100)
+            A._publish_async(fake_state(base), d, "x" * 100, "demo").join(60)
+            meta = json.loads((d / "meta.json").read_text())
+            print(f"  publish_error={meta.get('publish_error')!r}")
+            assert "bad key" in (meta.get("publish_error") or ""), \
+                "the failure left no trace on disk"
+            assert "published" not in meta
+    finally:
+        api.close()
+
+
+def test_manual_publish_says_why_it_did_nothing():
+    """[u] must explain itself. The automatic pass is silent by design, but a keypress
+    that does nothing and says nothing reads as a broken app."""
+    api = FakeAPI(pipeline_routes())
+    try:
+        with workdir("manual") as base, configured_env(api):
+            state = fake_state(base)
+
+            short = recording(base / "2026-08-08_02-00-00", "tiny", name="s")
+            A._publish_existing(state, {"dir": short, "name": "s"})
+            print(f"  short: {state.status!r}")
+            assert "shorter" in state.status.lower(), state.status
+
+            done = recording(base / "2026-08-08_03-00-00", "x" * 100, name="d",
+                             published={"url": "https://example/commit/abc", "at": "t"})
+            A._publish_existing(state, {"dir": done, "name": "d"})
+            print(f"  published: {state.status!r}")
+            assert "already published" in state.status.lower(), state.status
+
+            missing = base / "2026-08-08_04-00-00"
+            missing.mkdir()
+            A._publish_existing(state, {"dir": missing, "name": "m"})
+            print(f"  no transcript: {state.status!r}")
+            assert "no transcript" in state.status.lower(), state.status
+
+            assert api.requests == [], "a skipped publish still called out"
+    finally:
+        api.close()
+
+
+def test_manual_publish_runs_the_pipeline():
+    api = FakeAPI(pipeline_routes())
+    try:
+        with workdir("manualrun") as base, configured_env(api):
+            d = recording(base / "2026-08-08_05-00-00", "x" * 100, name="stand-up")
+            state = fake_state(base)
+            thread = A._publish_existing(state, {"dir": d, "name": "stand-up"})
+            assert thread is not None, "[u] refused a publishable recording"
+            thread.join(60)
+            meta = json.loads((d / "meta.json").read_text())
+            print(f"  status={state.status!r}")
+            assert "Published" in state.status
+            assert meta["published"]["url"].endswith("/commit/new-sha")
+    finally:
+        api.close()
+
+
 TESTS = ["test_config_is_none_without_keys", "test_config_reads_dotenv",
          "test_exported_variable_beats_dotenv", "test_bad_min_chars_falls_back",
          "test_render_prompt_substitutes_the_placeholder",
@@ -474,7 +582,12 @@ TESTS = ["test_config_is_none_without_keys", "test_config_reads_dotenv",
          "test_gate_skips_short_transcripts_and_republishing",
          "test_gate_is_silent_without_configuration",
          "test_end_to_end_updates_status_and_meta",
-         "test_a_failure_is_reported_on_the_status_line"]
+         "test_a_failure_is_reported_on_the_status_line",
+         "test_repo_accepts_what_people_actually_paste",
+         "test_run_reuses_stages_that_already_finished",
+         "test_failure_is_recorded_in_meta",
+         "test_manual_publish_says_why_it_did_nothing",
+         "test_manual_publish_runs_the_pipeline"]
 
 if __name__ == "__main__":
     run(TESTS, globals())
