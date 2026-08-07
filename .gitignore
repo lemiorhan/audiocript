@@ -73,3 +73,6 @@ mac_audio_tap/system_audio_tap
 mac_audio_tap/*.o
 
 docs/superpowers/
+
+# Ortam değişkenleri (OpenAI / GitHub anahtarları) — asla commit'lenmemeli
+.env

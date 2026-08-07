@@ -5,6 +5,19 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **Long transcripts can publish themselves.** With `GITHUB_REPO_FOR_TRANSCRIPTS`,
+  `GITHUB_TOKEN` and `OPENAI_API_KEY` set in `.env`, a transcript longer than
+  `TRANSCRIPT_MIN_CHARS` (2000 by default) is rewritten with
+  `prompts/transcript_prompt.md`, turned into a document with
+  `prompts/documentation_prompt.md`, and committed to that repository — raw, edited
+  and documented, in a single commit named after the recording. It runs behind the
+  menu on the status line, because the transcript itself is already saved and opened
+  by then. Both model outputs are written next to the recording before anything is
+  pushed, so a failed push costs only the retry, and a response the model had to cut
+  short fails the step rather than filing half a document. Without those three keys
+  the feature is simply off. Uses no new dependencies.
+
 ### Fixed
 - **The app no longer hangs on startup after an interrupted recording.** Crash
   recovery resampled the whole capture in one `torchaudio.resample` call. At

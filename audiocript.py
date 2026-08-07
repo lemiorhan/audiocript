@@ -23,6 +23,8 @@ from rich.live import Live
 from rich.text import Text
 from rich.layout import Layout
 
+import publish  # optional OpenAI + GitHub publishing; inert without a configured .env
+
 # Suppress warnings (FutureWarning, DeprecationWarning, UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -1319,7 +1321,7 @@ def _recover_async(state):
 
     This used to run before Live started, so a long interrupted capture meant many
     seconds of blank terminal that was indistinguishable from a hang. Progress goes to
-    state.recover_msg, which the footer prefers over state.status while it is set — so
+    state.bg_msg, which the footer prefers over state.status while it is set — so
     recovery owns the status line without destroying the user's own messages."""
     def run():
         dirs = _interrupted_dirs(state.base_path)
@@ -1331,7 +1333,7 @@ def _recover_async(state):
             counter = f" ({i}/{len(dirs)})" if len(dirs) > 1 else ""
 
             def show(frac, label=label, counter=counter):
-                state.recover_msg = (f"Recovering “{label}”…{counter}  "
+                state.bg_msg = (f"Recovering “{label}”…{counter}  "
                                      f"{int(frac * 100):3d}%")
 
             show(0.0)
@@ -1340,9 +1342,9 @@ def _recover_async(state):
                     recovered += 1
                     state.recordings = list_recordings(state.base_path)
             except Exception as e:
-                state.recover_msg = None
+                state.bg_msg = None
                 state.status = f"Recovery failed for “{label}”: {e}"
-        state.recover_msg = None
+        state.bg_msg = None
         if recovered:
             state.recordings = list_recordings(state.base_path)
             state.status = (f"Recovered {recovered} interrupted "
@@ -1414,8 +1416,9 @@ class _TuiState:
         self.tx_phase = ""            # the step currently running
         self.tx_pct = None            # 0..1, or None for indeterminate
         self.tx_phase_start = 0.0
-        # crash recovery running in the background; shown in place of status
-        self.recover_msg = None
+        # a background job's progress (crash recovery, publishing); while it is set
+        # the footer shows it in place of status
+        self.bg_msg = None
         try:
             self.base_path.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -1833,9 +1836,9 @@ def _tui_footer(state):
     if _player_active(state):
         status = Text(f"▶ playing “{state.player_name}”  ·  p to stop", style="green")
     else:
-        # A background recovery borrows this line while it runs; the user's own last
+        # A background job borrows this line while it runs; the user's own last
         # message comes back untouched when it finishes.
-        status = Text(state.recover_msg or state.status or "", style="dim")
+        status = Text(state.bg_msg or state.status or "", style="dim")
     return Panel(Group(keys, status), border_style="blue")
 
 
@@ -1978,6 +1981,52 @@ def _stop_worker(state, project_dir, language, name, save_channels, diarize_syst
                          diarize_system=diarize_system)
 
 
+_PUBLISH_STEPS = {"edit": "Editing transcript “{label}”…",
+                  "document": "Writing documentation…",
+                  "publish": "Publishing to {repo}…"}
+
+
+def _publish_async(state, project_dir, text, name):
+    """Send a long transcript through OpenAI and file the results on GitHub.
+
+    Runs behind the menu, on the status line: what the user was waiting for — the
+    transcript — is already saved and opened by now, and the two model calls take
+    minutes.
+
+    Returns the worker thread, or None when this transcript is not a candidate: the
+    feature is unconfigured, the transcript is too short to be worth the tokens, or it
+    has already been published. None of those is an error, so none of them says
+    anything — someone who never set up a key must not be told off after a recording.
+    """
+    try:
+        cfg = publish.config()
+    except Exception:
+        return None
+    if cfg is None or len(text) < cfg["min_chars"]:
+        return None
+    if _read_meta(project_dir).get("published"):
+        return None
+    label = name or Path(project_dir).name
+
+    def worker():
+        try:
+            url = publish.run(
+                cfg, project_dir, text, name,
+                on_step=lambda s: setattr(state, "bg_msg", _PUBLISH_STEPS[s].format(
+                    label=label, repo=cfg["repo"])))
+            _write_meta(project_dir, published={
+                "url": url, "at": datetime.now().isoformat(timespec="seconds")})
+            state.bg_msg = None
+            state.status = f"Published “{label}” → {url}"
+        except Exception as e:
+            state.bg_msg = None
+            state.status = f"Publish failed: {e}"
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return thread
+
+
 def _save_and_open(state, project_dir, text, name=None, language=None, speaker_map=None):
     """Write transcription.txt + meta, refresh the recordings list, and open the
     transcript in the chosen app. Sets state.status; does not change state.mode.
@@ -2006,6 +2055,7 @@ def _save_and_open(state, project_dir, text, name=None, language=None, speaker_m
         err = _open_in_app(state.open_app, transcript_path)
         state.status = (f"Saved — could not open in {state.open_app}"
                         if err else f"Saved “{label}” & opened in {state.open_app}")
+    _publish_async(state, project_dir, text, name)
 
 
 def _transcribe_and_save(state, project_dir, audio_path, language, name,

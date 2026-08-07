@@ -222,6 +222,46 @@ Preferences are saved in `config.json` (language, microphone by name, system-aud
 toggle, speaker-labels toggle + optional `hf_token`, recordings folder, and the
 "open with" app).
 
+### Publishing transcripts (optional, off by default)
+
+Audiocript can turn a long transcript into two more useful forms and file all three in
+a GitHub repository, on its own, right after the transcript is saved.
+
+Create a `.env` next to `audiocript.py` with three values:
+
+```
+GITHUB_REPO_FOR_TRANSCRIPTS=owner/repo
+GITHUB_TOKEN=…               # needs contents:write on that repository
+OPENAI_API_KEY=…
+```
+
+Any of these can be an exported environment variable instead, which takes precedence
+over the file — so an `OPENAI_API_KEY` you already have in your shell just works.
+
+Any transcript longer than `TRANSCRIPT_MIN_CHARS` (2000 characters by default) is then
+sent through `prompts/transcript_prompt.md`, which cleans up the speech without
+flattening who said what or how sure they were, and that result through
+`prompts/documentation_prompt.md`, which reorganises it into a document by topic. Both
+prompts are written to lose nothing, so expect output about as long as the input.
+
+The repository gets one commit per recording, named after it:
+
+```
+2026-06-10_14-30-15-daily-standup/
+├── transcript.raw.md      # exactly what Whisper produced
+├── transcript.edited.md   # first pass
+└── documentation.md       # second pass
+```
+
+Both model outputs are also written next to the recording, before anything is pushed,
+so a failed push costs nothing but the retry. Progress shows on the status line while
+the menu stays usable. Two optional settings: `OPENAI_MODEL` (default `gpt-4.1` — it
+needs a large output budget, since the response is as long as the transcript) and
+`TRANSCRIPT_MIN_CHARS`.
+
+Leave any of the three required values out and nothing happens: this is off unless you
+configure it. Never commit `.env` — it is gitignored for that reason.
+
 ---
 
 ## Permissions (macOS)
@@ -250,12 +290,14 @@ On first use, grant these under **System Settings → Privacy & Security**:
 
 ```
 audiocript.py                  # the app (TUI + recording + transcription)
+publish.py                     # optional: OpenAI passes + the GitHub commit
+prompts/                       # the two prompts publishing runs a transcript through
 mac_audio_tap/
   └── system_audio_tap.swift   # Core Audio process-tap helper (compiled on first run)
+tests/                         # plain scripts; see tests/run_all.py
 run.sh                         # one-command launcher
 requirements.txt
 assets/                        # logo, header, screenshots
-docs/superpowers/specs/        # design notes
 ```
 
 ---
