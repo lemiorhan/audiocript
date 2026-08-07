@@ -18,6 +18,24 @@ cd audiocript
 Requirements: macOS 14.4+, Python 3.10+, and Xcode Command Line Tools (`swiftc`)
 for the optional system-audio capture.
 
+## Running the tests
+
+There is no test framework — each file under `tests/` is a plain script that runs its
+checks and exits non-zero if any fail.
+
+```bash
+.venv/bin/python tests/run_all.py        # everything (a few minutes)
+.venv/bin/python tests/test_finalize.py  # just one area
+```
+
+They cover the audio pipeline: that resampling and mixing produce the same samples
+they always have, that finalizing a recording streams instead of loading it, and that
+a recording survives being interrupted mid-finalize. Fixtures are synthetic and go to
+a temporary directory — a 30-minute capture is about 1 GB, so expect the disk churn.
+
+`tests/test_recovery_startup.py` launches the real app on a pty against a throwaway
+`HOME`, so it takes the longest.
+
 ## Ways to contribute
 
 - **Bug reports** — open an issue using the *Bug report* template. Include your
