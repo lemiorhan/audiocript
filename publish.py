@@ -5,11 +5,13 @@ Kept out of audiocript.py because none of it touches the UI: it is configuration
 OpenAI calls and the GitHub Git Data API, which makes the whole pipeline testable on
 its own against a local server.
 """
+import base64
 import json
 import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -211,29 +213,47 @@ def _ok(status, obj, what):
     return obj
 
 
-def publish_files(cfg, folder, files, message):
-    """Commit `files` ({name: text}) under `folder` in a single commit; return its URL.
+def _publish_via_contents(cfg, folder, files, message, branch):
+    """Create each file with the Contents API, one commit apiece; return the last URL.
 
-    The Contents API would be shorter but makes one commit per file, and the commit is
-    meant to name the recording once. This walks the Git Data API instead, which also
-    means nothing has to be cloned."""
+    The Git Data API cannot touch a repository with no commits: every blob, tree and
+    commit call answers 409 "Git Repository is empty." The Contents API can, and its
+    first PUT initialises the repository, so a brand-new transcripts repo is filled
+    this way. Once it has a HEAD, every later publish takes the single-commit Git Data
+    path instead. Turkish letters and the like are percent-encoded for the URL path."""
+    repo, last = cfg["repo"], None
+    for name, text in files.items():
+        path = urllib.parse.quote(f"{folder}/{name}")
+        content = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        last = _ok(*_gh("PUT", f"/repos/{repo}/contents/{path}", cfg,
+                        {"message": message, "content": content, "branch": branch}),
+                   f"the file {name}")
+    commit = (last or {}).get("commit") or {}
+    return commit.get("html_url") or \
+        f"https://github.com/{repo}/commit/{commit.get('sha', '')}"
+
+
+def publish_files(cfg, folder, files, message):
+    """Commit `files` ({name: text}) under `folder` and return the commit's URL.
+
+    On a repository that already has commits this walks the Git Data API, so every file
+    lands in one commit named after the recording and nothing has to be cloned. A
+    repository with no commits yet cannot be reached that way — GitHub answers the
+    branch ref with a plain 404, or with 409 "Git Repository is empty." — so its first
+    files go through the Contents API instead (see `_publish_via_contents`)."""
     repo = cfg["repo"]
     info = _ok(*_gh("GET", f"/repos/{repo}", cfg), f"repo {repo}")
     branch = info.get("default_branch") or "main"
 
     status, ref = _gh("GET", f"/repos/{repo}/git/ref/heads/{branch}", cfg)
-    # A repository with no commits yet: GitHub answers the branch ref with 409 "Git
-    # Repository is empty." — not the 404 a missing ref otherwise gives — so both mean
-    # there is no HEAD to build on and the first commit has to create the branch.
-    empty = status in (404, 409)
-    parents, base_tree = [], None
-    if not empty:
-        _ok(status, ref, f"branch {branch}")
-        head = ref["object"]["sha"]
-        parents = [head]
-        commit = _ok(*_gh("GET", f"/repos/{repo}/git/commits/{head}", cfg),
-                     "the current commit")
-        base_tree = commit["tree"]["sha"]
+    if status in (404, 409):
+        return _publish_via_contents(cfg, folder, files, message, branch)
+    _ok(status, ref, f"branch {branch}")
+
+    head = ref["object"]["sha"]
+    commit = _ok(*_gh("GET", f"/repos/{repo}/git/commits/{head}", cfg),
+                 "the current commit")
+    base_tree = commit["tree"]["sha"]
 
     entries = []
     for name, text in files.items():
@@ -242,22 +262,15 @@ def publish_files(cfg, folder, files, message):
         entries.append({"path": f"{folder}/{name}", "mode": "100644",
                         "type": "blob", "sha": blob["sha"]})
 
-    tree_payload = {"tree": entries}
-    if base_tree:
-        tree_payload["base_tree"] = base_tree
-    tree = _ok(*_gh("POST", f"/repos/{repo}/git/trees", cfg, tree_payload), "the tree")
+    tree = _ok(*_gh("POST", f"/repos/{repo}/git/trees", cfg,
+                    {"tree": entries, "base_tree": base_tree}), "the tree")
 
     commit = _ok(*_gh("POST", f"/repos/{repo}/git/commits", cfg,
-                      {"message": message, "tree": tree["sha"], "parents": parents}),
+                      {"message": message, "tree": tree["sha"], "parents": [head]}),
                  "the commit")
 
-    if empty:
-        _ok(*_gh("POST", f"/repos/{repo}/git/refs", cfg,
-                 {"ref": f"refs/heads/{branch}", "sha": commit["sha"]}),
-            f"creating {branch}")
-    else:
-        _ok(*_gh("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", cfg,
-                 {"sha": commit["sha"]}), f"moving {branch}")
+    _ok(*_gh("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", cfg,
+             {"sha": commit["sha"]}), f"moving {branch}")
     return commit.get("html_url") or f"https://github.com/{repo}/commit/{commit['sha']}"
 
 

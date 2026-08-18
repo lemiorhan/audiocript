@@ -5,6 +5,7 @@ pointed at the local fake server, or goes through `isolated` — which clears th
 publishing variables and points publish.ROOT at an empty directory, so a developer's
 real .env can never be picked up and spent.
 """
+import base64
 import contextlib
 import json
 import os
@@ -115,7 +116,7 @@ class FakeAPI:
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
-            do_GET = do_POST = do_PATCH = _reply
+            do_GET = do_POST = do_PATCH = do_PUT = _reply
 
         self.server = HTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
@@ -227,6 +228,19 @@ def github_routes(ref_status=200, tree_status=201):
     }
 
 
+def empty_repo_routes(ref_status):
+    """A repo with no commits: the branch ref lookup answers 404 or 409, the Git Data
+    API is unavailable, and files are created one at a time with the Contents API."""
+    return {  # specific prefixes first: "/repos/owner/repo" is a prefix of them all
+        ("GET", "/repos/owner/repo/git/ref/"): [(ref_status, {})],
+        ("PUT", "/repos/owner/repo/contents/"): [
+            (201, {"commit": {
+                "sha": "seed-sha",
+                "html_url": "https://github.com/owner/repo/commit/seed-sha"}})],
+        ("GET", "/repos/owner/repo"): [(200, {"default_branch": "trunk"})],
+    }
+
+
 def test_folder_name():
     assert publish.folder_name("2026-08-07_13-47-05", "fatih11-1") == \
         "2026-08-07_13-47-05-fatih11-1"
@@ -263,44 +277,39 @@ def test_publish_makes_one_commit_with_every_file():
         api.close()
 
 
-def test_publish_into_an_empty_repository():
-    """A repo made for this feature has no commits and no ref until the first push."""
-    api = FakeAPI(github_routes(ref_status=404))
+def _assert_contents_bootstrap(ref_status):
+    """A repo whose branch ref answers `ref_status` has no commits: the Git Data API is
+    unreachable, so each file is written with the Contents API, one commit apiece."""
+    api = FakeAPI(empty_repo_routes(ref_status))
     try:
-        publish.publish_files(configured(api), "f", {"a.md": "A"}, "msg")
-        commit = next(r for r in api.requests
-                      if r["method"] == "POST" and r["path"].endswith("/git/commits"))
-        tree = next(r for r in api.requests if r["path"].endswith("/git/trees"))
-        created = [r for r in api.requests
-                   if r["method"] == "POST" and r["path"].endswith("/git/refs")]
-        print(f"  parents={commit['body']['parents']}, refs created={len(created)}")
-        assert commit["body"]["parents"] == [], "a parent-less commit was expected"
-        assert "base_tree" not in tree["body"], "there is no base tree to build on"
-        assert len(created) == 1, "the branch ref should be created, not patched"
-        assert not any(r["method"] == "PATCH" for r in api.requests)
+        url = publish.publish_files(configured(api), "f",
+                                    {"a.md": "A", "b.md": "BB"}, "msg")
+        puts = [r for r in api.requests if r["method"] == "PUT"]
+        print(f"  ref {ref_status} -> {len(puts)} Contents PUT(s), url {url}")
+        assert len(puts) == 2, f"one Contents PUT per file, got {len(puts)}"
+        assert not any(p.endswith(("/git/blobs", "/git/trees", "/git/commits",
+                                   "/git/refs")) for p in api.paths()), \
+            "the Git Data API must not be touched on an empty repository"
+        assert base64.b64decode(puts[0]["body"]["content"]).decode() == "A", \
+            "the file content is sent base64-encoded"
+        assert puts[0]["path"].startswith("/repos/owner/repo/contents/f/"), \
+            "the file lands under the recording folder"
+        assert puts[0]["body"]["branch"] == "trunk", "wrote to the default branch"
+        assert url.endswith("/commit/seed-sha")
     finally:
         api.close()
+
+
+def test_publish_into_an_empty_repository():
+    """A repo whose branch ref is a plain 404 has no commit to build on."""
+    _assert_contents_bootstrap(ref_status=404)
 
 
 def test_publish_into_a_never_committed_repository():
     """GitHub answers a repo that has no commits at all with 409 'Git Repository is
-    empty.' on the branch ref — not 404 — so that status has to take the first-commit
-    path too, or a brand-new transcripts repo can never receive its first push."""
-    api = FakeAPI(github_routes(ref_status=409))
-    try:
-        publish.publish_files(configured(api), "f", {"a.md": "A"}, "msg")
-        commit = next(r for r in api.requests
-                      if r["method"] == "POST" and r["path"].endswith("/git/commits"))
-        tree = next(r for r in api.requests if r["path"].endswith("/git/trees"))
-        created = [r for r in api.requests
-                   if r["method"] == "POST" and r["path"].endswith("/git/refs")]
-        print(f"  parents={commit['body']['parents']}, refs created={len(created)}")
-        assert commit["body"]["parents"] == [], "a parent-less commit was expected"
-        assert "base_tree" not in tree["body"], "there is no base tree to build on"
-        assert len(created) == 1, "the branch ref should be created, not patched"
-        assert not any(r["method"] == "PATCH" for r in api.requests)
-    finally:
-        api.close()
+    empty.' on the branch ref — not 404. Both take the Contents-API path, or a
+    brand-new transcripts repo could never receive its first files."""
+    _assert_contents_bootstrap(ref_status=409)
 
 
 def test_publish_reports_a_failed_step():
