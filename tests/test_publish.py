@@ -282,6 +282,27 @@ def test_publish_into_an_empty_repository():
         api.close()
 
 
+def test_publish_into_a_never_committed_repository():
+    """GitHub answers a repo that has no commits at all with 409 'Git Repository is
+    empty.' on the branch ref — not 404 — so that status has to take the first-commit
+    path too, or a brand-new transcripts repo can never receive its first push."""
+    api = FakeAPI(github_routes(ref_status=409))
+    try:
+        publish.publish_files(configured(api), "f", {"a.md": "A"}, "msg")
+        commit = next(r for r in api.requests
+                      if r["method"] == "POST" and r["path"].endswith("/git/commits"))
+        tree = next(r for r in api.requests if r["path"].endswith("/git/trees"))
+        created = [r for r in api.requests
+                   if r["method"] == "POST" and r["path"].endswith("/git/refs")]
+        print(f"  parents={commit['body']['parents']}, refs created={len(created)}")
+        assert commit["body"]["parents"] == [], "a parent-less commit was expected"
+        assert "base_tree" not in tree["body"], "there is no base tree to build on"
+        assert len(created) == 1, "the branch ref should be created, not patched"
+        assert not any(r["method"] == "PATCH" for r in api.requests)
+    finally:
+        api.close()
+
+
 def test_publish_reports_a_failed_step():
     api = FakeAPI(github_routes(tree_status=422))
     try:
@@ -575,7 +596,9 @@ TESTS = ["test_config_is_none_without_keys", "test_config_reads_dotenv",
          "test_openai_returns_the_message_content", "test_openai_truncation_raises",
          "test_openai_error_status_raises", "test_server_errors_are_retried",
          "test_folder_name", "test_publish_makes_one_commit_with_every_file",
-         "test_publish_into_an_empty_repository", "test_publish_reports_a_failed_step",
+         "test_publish_into_an_empty_repository",
+         "test_publish_into_a_never_committed_repository",
+         "test_publish_reports_a_failed_step",
          "test_run_writes_both_files_and_publishes",
          "test_truncation_writes_nothing_and_publishes_nothing",
          "test_push_failure_keeps_the_model_output",

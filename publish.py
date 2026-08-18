@@ -222,7 +222,10 @@ def publish_files(cfg, folder, files, message):
     branch = info.get("default_branch") or "main"
 
     status, ref = _gh("GET", f"/repos/{repo}/git/ref/heads/{branch}", cfg)
-    empty = status == 404                     # a repository with no commits yet
+    # A repository with no commits yet: GitHub answers the branch ref with 409 "Git
+    # Repository is empty." — not the 404 a missing ref otherwise gives — so both mean
+    # there is no HEAD to build on and the first commit has to create the branch.
+    empty = status in (404, 409)
     parents, base_tree = [], None
     if not empty:
         _ok(status, ref, f"branch {branch}")
