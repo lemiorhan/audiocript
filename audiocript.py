@@ -1506,9 +1506,9 @@ class _TuiState:
         self.mic_index = _resolve_mic_index(cfg)
         self.capture_system = bool(cfg.get("capture_system_audio", False))
         self.diarize = bool(cfg.get("diarize", False))
-        # modes: menu | recording | preparing | transcribing | importing |
-        #        viewer | name_input | start_failed | rename | mic_picker |
-        #        app_picker | path_edit
+        # modes: menu | recording | confirm_stop | preparing | transcribing |
+        #        importing | viewer | name_input | start_failed | rename |
+        #        mic_picker | app_picker | path_edit
         self.mode = "menu"
         self.status = "Ready."
         self.last_transcript = ""
@@ -1867,15 +1867,39 @@ def _render_viewer(state):
                  title=title, title_align="left", border_style="green")
 
 
+def _recording_panel(state):
+    """The live capture view: elapsed time in the title, one level meter per source.
+
+    The stop confirmation is this same panel with a question added, so [q] can never
+    read as “already stopped” — the clock keeps climbing and the meters keep moving
+    while the user decides, which is the honest answer to “am I still recording?”."""
+    elapsed = time.monotonic() - state.rec_start
+    mm, ss = divmod(int(elapsed), 60)
+    title = f"[blink bold red]●[/] [bold]REC[/] {mm:02d}:{ss:02d}"
+    meters = Text.from_markup(_meters_markup(state.recorders))
+    if state.mode != "confirm_stop":
+        return Panel(meters, title=title, title_align="left", border_style="red")
+    title += "  [dim](still recording)[/dim]"
+    label = state.pending_name or (state.project_dir.name if state.project_dir
+                                   else "this recording")
+    question = Text("Stop “")           # plain Text: a name may contain brackets
+    question.append(label, style="bold")
+    question.append("” and transcribe?")
+    body = Group(
+        meters,
+        Text(""),
+        question,
+        Text.from_markup("[dim]Still recording — press [/dim][bold]y[/bold][dim] to "
+                         "stop, any other key to keep recording.[/dim]"),
+    )
+    return Panel(body, title=title, title_align="left", border_style="red")
+
+
 def _tui_body(state):
     if state.mode == "importing":
         return _import_panel(state)
-    if state.mode == "recording":
-        elapsed = time.monotonic() - state.rec_start
-        mm, ss = divmod(int(elapsed), 60)
-        title = f"[blink bold red]●[/] [bold]REC[/] {mm:02d}:{ss:02d}"
-        return Panel(Text.from_markup(_meters_markup(state.recorders)),
-                     title=title, title_align="left", border_style="red")
+    if state.mode in ("recording", "confirm_stop"):
+        return _recording_panel(state)
     if state.mode == "preparing":
         msg = (f"[bold yellow]Preparing…[/bold yellow]\n\n"
                f"[dim]{state.status}[/dim]\n\n"
@@ -1954,7 +1978,8 @@ def _tui_footer(state):
     keymap = {
         "preparing": "please wait…",
         "importing": "importing… please wait",
-        "recording": "[q] Stop & transcribe",
+        "recording": "[q] Stop & transcribe (asks first)",
+        "confirm_stop": "[y] Stop & transcribe   any other key: Keep recording",
         "transcribing": "transcribing… please wait",
         "viewer": "↑/↓ scroll   PgUp/PgDn page   Enter open in app   p play/stop   t transcribe   r rename   d delete   Esc back",
         "name_input": "[Enter] Start   [Esc] Cancel",
@@ -2085,7 +2110,7 @@ def _fail_to_start(state, reason, exc=None):
 
 
 def _stop_and_transcribe(state, live):
-    """Handle [q] during a recording. Switches to the transcription progress screen
+    """Handle a confirmed [q] during a recording. Switches to the transcription screen
     right away and hands the slow part — mixing the raw capture into audio.wav, then
     transcribing it — to a worker thread, so the UI keeps animating instead of
     freezing on the last recording frame with no sign that anything started."""
@@ -2107,8 +2132,8 @@ def _stop_and_transcribe(state, live):
 
 
 def _stop_worker(state, project_dir, language, name, save_channels, diarize_system):
-    """Background half of [q]: stop the recorders, mix their raw capture files into
-    audio.wav, then transcribe and save. Reports progress through state.tx_*."""
+    """Background half of a confirmed stop: stop the recorders, mix their raw capture
+    files into audio.wav, then transcribe and save. Reports progress via state.tx_*."""
     for r in state.recorders:
         try:
             r.stop()
@@ -2660,8 +2685,18 @@ def _tui_handle_key(key, state, live):
         else:
             state.mode = state.delete_return
     elif mode == "recording":
-        if key in ("q", "Q", "r", "R", " "):
+        # Only [q], and only to ask. Space and [r] used to stop here too, which cost
+        # a recording the first time a space bar was pressed mid-sentence: stopping
+        # is irreversible, so no keystroke reaches it without a confirmation.
+        if key in ("q", "Q"):
+            state.mode = "confirm_stop"
+    elif mode == "confirm_stop":
+        # Anything but [y] keeps recording — including a second [q], so a double tap
+        # cannot stop what the first tap only asked about.
+        if key in ("y", "Y"):
             _stop_and_transcribe(state, live)
+        else:
+            state.mode = "recording"
     elif mode == "mic_picker":
         if key in ("ESC", "q", "Q"):
             state.mode = "menu"

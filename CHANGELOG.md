@@ -19,6 +19,14 @@ All notable changes to this project are documented here. The format is based on
   the feature is simply off. Uses no new dependencies.
 
 ### Fixed
+- **A stray keystroke can no longer end a recording.** Space, `r` and `q` were all
+  wired to the same irreversible action, so a space bar pressed mid-sentence stopped
+  the capture and went straight into transcription with nothing to undo it. Only `q`
+  stops now, and it asks first: the confirmation is the recording screen with a
+  question added, so the clock keeps climbing and the meters keep moving while you
+  decide. `y` stops and transcribes; anything else — a second `q` included — keeps
+  recording. Every other key during a recording is ignored.
+
 - **A recording no longer disappears when the microphone is busy for a moment.**
   CoreAudio turns down a device that is busy or still settling, briefly and flatly,
   and a single refused open was fatal: the folder was thrown away and the user — who

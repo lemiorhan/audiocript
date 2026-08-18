@@ -105,7 +105,8 @@ Audiocript is a full-screen app you drive with the **arrow keys**.
 | **Transcript viewer** | `↑`/`↓` scroll · `PgUp`/`PgDn` page · `Enter` open in external app · `p` play/stop · `r` rename · `d` delete · `Esc` back |
 | **Text fields** (name / rename / folder / app filter) | type · `Enter` confirm · `Esc` cancel |
 | **Microphone / app pickers** | `1`–`9` select · `Esc` cancel |
-| **Delete confirmation** | `y` delete · any other key cancels |
+| **Recording** | `q` stop & transcribe (asks first) — every other key is ignored |
+| **Stop / delete confirmation** | `y` confirm · any other key cancels |
 
 The menu groups everything:
 
@@ -125,7 +126,9 @@ The menu groups everything:
 A **"Preparing…"** screen appears while the mic and system-audio tap start up
 (the first run may compile the helper or ask for a permission), then it switches
 to live **VU meters** and shows **"Recording started — speak now."** Press `q` to
-stop and transcribe.
+stop and transcribe — it asks first, and keeps recording (clock running, meters
+moving) until you answer `y`. No other key does anything while recording, so a
+stray space bar cannot end the capture.
 
 ### Importing a file
 
