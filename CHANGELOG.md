@@ -26,7 +26,7 @@ All notable changes to this project are documented here. The format is based on
   line, which the footer hands to any background job that wants it. Publishing holds
   that line for minutes after each recording, which is exactly when the next one gets
   started, so recording twice in a row could look like the app was ignoring the
-  keypress. Six named, silent folders on disk were the only trace. The microphone now
+  keypress. Eight named, silent folders on disk were the only trace. The microphone now
   gets three attempts, re-reading the device list between them (a stale device index
   is the other way this has failed), and a start that really cannot happen stops on a
   screen that says why and keeps the typed name, so Enter is a retry.

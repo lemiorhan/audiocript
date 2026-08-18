@@ -1,6 +1,6 @@
 """Starting a recording must survive a microphone that is briefly unavailable.
 
-Six folders on disk showed what the app did instead: `meta.json` plus an empty
+Eight folders on disk showed what the app did instead: `meta.json` plus an empty
 `mic.raw` and nothing else — CoreAudio refused the stream, `_start_recording`
 returned to the menu, and the reason went to a status line that a running publish
 job was covering. From the user's seat the app had simply ignored the keypress.
@@ -126,7 +126,7 @@ def test_a_transient_mic_refusal_still_starts_the_recording():
 
 
 def test_a_recording_that_never_started_leaves_nothing_on_disk():
-    """Six of these folders were sitting in the user's recordings directory: named,
+    """Eight of these folders were sitting in the recordings directories: named,
     empty, and unremovable, because meta.json was written before the mic opened."""
     with workdir("start-junk") as home:
         FlakyMic.reset(fails=99, leaves_junk=True)

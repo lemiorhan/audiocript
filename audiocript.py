@@ -1483,7 +1483,7 @@ def _discard_project(project_dir):
 
     This was an rmdir(), which could not possibly work: meta.json had already been
     written, and a refused mic open left an empty mic.raw — so every failed start
-    left a named, silent folder behind (six of them, before anyone noticed). Guarded
+    left a named, silent folder behind (eight of them, before anyone noticed). Guarded
     on there being nothing worth keeping, because it deletes a tree."""
     d = Path(project_dir)
     if (d / "audio.wav").exists() or (d / "transcription.txt").exists():
