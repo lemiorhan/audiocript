@@ -10,6 +10,7 @@ import contextlib
 import threading
 import subprocess
 import termios  # available on Unix-based systems.
+import traceback
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +63,10 @@ _QUIET = False
 
 # Config file, stored next to the script.
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+# Where failures are written down. The UI's status line is volatile — the next
+# message wipes it — so an intermittent failure used to leave nothing behind to
+# diagnose it from afterwards.
+LOG_PATH = Path(__file__).resolve().parent / "audiocript.log"
 DEFAULT_BASE_PATH = Path.home() / "Audiocript" / "recordings"
 
 # Supported languages: code -> Whisper language name
@@ -150,6 +155,30 @@ def save_config(cfg):
     """Write the config to config.json."""
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+def _log_problem(what, exc=None):
+    """Append a timestamped note about a failure — with its traceback — to LOG_PATH.
+
+    Never raises: logging a problem must not become one. The point is the failures
+    that come and go, like a microphone the system refuses for a second or two;
+    on the screen they are gone with the next status message."""
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')}  {what}\n")
+            if exc is not None:
+                f.write("".join(traceback.format_exception(
+                    type(exc), exc, exc.__traceback__)))
+    except Exception:
+        pass
+
+
+def _unlink_quietly(path):
+    """Delete a file, ignoring its absence and any refusal."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def lang_name(code):
@@ -423,8 +452,21 @@ class DeviceRecorder:
         extra = _coreaudio_extra_settings()
         if extra is not None:
             kwargs['extra_settings'] = extra
-        self._stream = sd.InputStream(**kwargs)
-        self._stream.start()
+        try:
+            self._stream = sd.InputStream(**kwargs)
+            self._stream.start()
+        except Exception:
+            # A refused open must leave nothing behind. The empty mic.raw it used to
+            # leave was what defeated the cleanup of the abandoned recording folder,
+            # and the file handle stayed open for the life of the app.
+            self._stream = None
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+            self._raw = None
+            _unlink_quietly(self._raw_path)
+            raise
 
     def stop(self):
         if self._stream is not None:
@@ -480,6 +522,17 @@ class TapRecorder:
         # Stream the tap's PCM straight to disk, unbuffered (see DeviceRecorder).
         self._raw_path = str(raw_path)
         self._raw = open(self._raw_path, "wb", buffering=0)
+        try:
+            self._begin()
+        except Exception:
+            # Tear down whatever came up, and leave no empty system.raw behind —
+            # it would keep the abandoned recording folder from being removed.
+            self.stop()
+            _unlink_quietly(self._raw_path)
+            raise
+
+    def _begin(self):
+        """Bring the helper up and wait for its header. Raises if it never starts."""
         binpath = build_tap_binary()  # compiles if needed; raises on failure
         self._proc = subprocess.Popen(
             [str(binpath)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
@@ -490,13 +543,11 @@ class TapRecorder:
         self._reader.start()
         # Wait for the header (sample rate/channels); if it never arrives, likely a permission issue.
         if not self._ready.wait(timeout=10):
-            self.stop()
             raise RuntimeError(
                 "system audio did not start (10s). 'System Audio Recording' "
                 "permission may be needed: System Settings → Privacy & Security."
             )
         if self._error:
-            self.stop()
             detail = " ".join(self._stderr).strip()
             raise RuntimeError(f"{self._error}{(': ' + detail) if detail else ''}")
 
@@ -1370,6 +1421,81 @@ def _resolve_mic_index(cfg):
     return devices[0][0] if devices else None
 
 
+def _refresh_audio_devices():
+    """Make PortAudio build its device table again.
+
+    It is built once, when the library initializes, and never revisited — so a
+    device that appeared or went away since the app started leaves us holding an
+    index that now means a different device, or none. Recordings have failed that
+    way, the open giving up before the raw file was even created."""
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception:
+        pass
+
+
+# How hard to try for the microphone before giving up on a recording. The system
+# audio tap is already given ten seconds to come up; the mic used to get one
+# attempt, and a refusal that passes in a second cost the whole recording.
+_MIC_OPEN_ATTEMPTS = 3
+_MIC_OPEN_BACKOFF = (0.5, 1.5)          # waits before the 2nd and 3rd attempt
+
+
+def _start_mic(state, raw_path, announce):
+    """Open the microphone into `raw_path`, retrying a refused open.
+
+    CoreAudio turns down a device that is busy or still settling, flatly and
+    briefly: two recordings named and lost this way left an empty mic.raw behind,
+    and both times the mic opened again a minute later. Every attempt re-reads the
+    device list and resolves the configured microphone again, since an index gone
+    stale is the other way this has failed.
+
+    Returns the started recorder, or raises the last refusal."""
+    last = None
+    for attempt in range(1, _MIC_OPEN_ATTEMPTS + 1):
+        if attempt == 1:
+            announce(f"Opening microphone ({device_name(state.mic_index)})…")
+        else:
+            # Said before the wait, so the pause reads as the app trying rather
+            # than as the app stuck.
+            announce(f"Microphone refused — retrying "
+                     f"({attempt}/{_MIC_OPEN_ATTEMPTS})…")
+            time.sleep(_MIC_OPEN_BACKOFF[min(attempt - 2, len(_MIC_OPEN_BACKOFF) - 1)])
+            _refresh_audio_devices()
+            index = _resolve_mic_index(state.cfg)
+            if index is not None:
+                state.mic_index = index
+        try:
+            mic = DeviceRecorder(state.mic_index)
+            mic.start(raw_path)
+            return mic
+        except Exception as e:
+            last = e
+            _log_problem(f"microphone open failed on attempt "
+                         f"{attempt}/{_MIC_OPEN_ATTEMPTS} "
+                         f"(device index {state.mic_index})", e)
+    raise last
+
+
+def _discard_project(project_dir):
+    """Remove the folder of a recording that never captured anything.
+
+    This was an rmdir(), which could not possibly work: meta.json had already been
+    written, and a refused mic open left an empty mic.raw — so every failed start
+    left a named, silent folder behind (six of them, before anyone noticed). Guarded
+    on there being nothing worth keeping, because it deletes a tree."""
+    d = Path(project_dir)
+    if (d / "audio.wav").exists() or (d / "transcription.txt").exists():
+        return
+    try:
+        if any(f.stat().st_size for f in d.glob("*.raw")):    # real capture: keep it
+            return
+    except Exception:
+        return
+    shutil.rmtree(d, ignore_errors=True)
+
+
 class _TuiState:
     """All UI/app state for the full-screen interface."""
 
@@ -1381,7 +1507,8 @@ class _TuiState:
         self.capture_system = bool(cfg.get("capture_system_audio", False))
         self.diarize = bool(cfg.get("diarize", False))
         # modes: menu | recording | preparing | transcribing | importing |
-        #        viewer | name_input | rename | mic_picker | app_picker | path_edit
+        #        viewer | name_input | start_failed | rename | mic_picker |
+        #        app_picker | path_edit
         self.mode = "menu"
         self.status = "Ready."
         self.last_transcript = ""
@@ -1435,6 +1562,8 @@ class _TuiState:
         self.name_buffer = ""
         self.pending_action = None              # "record" | "import"
         self.pending_name = ""
+        # why a recording refused to start, shown by the start_failed screen
+        self.start_error = ""
         self.rename_buffer = ""
         self.rename_target = None               # project dir being renamed
         self.rename_return = "menu"
@@ -1790,6 +1919,19 @@ def _tui_body(state):
             Text(state.name_buffer + "▏"),
         )
         return Panel(body, title="Name", border_style="cyan")
+    if state.mode == "start_failed":
+        kept = Text("The name “")
+        kept.append(state.pending_name or "Untitled", style="bold")
+        kept.append("” is kept — press Enter to try again.")
+        body = Group(
+            Text(state.start_error or "The recording could not be started.",
+                 style="red"),
+            Text(""),
+            kept,
+            Text(""),
+            Text(f"Details were written to {LOG_PATH}", style="dim"),
+        )
+        return Panel(body, title="Recording not started", border_style="red")
     if state.mode == "rename":
         body = Group(
             Text("New name:"),
@@ -1816,6 +1958,7 @@ def _tui_footer(state):
         "transcribing": "transcribing… please wait",
         "viewer": "↑/↓ scroll   PgUp/PgDn page   Enter open in app   p play/stop   t transcribe   r rename   d delete   Esc back",
         "name_input": "[Enter] Start   [Esc] Cancel",
+        "start_failed": "[Enter] Try again   [Esc] Back to the menu",
         "rename": "[Enter] Save   [Backspace] Delete   [Esc] Cancel",
         "confirm_delete": "[y] Delete   any other key: Cancel",
         "mic_picker": "[1-9] Select   [Esc] Cancel",
@@ -1868,39 +2011,27 @@ def _start_recording(state, live):
 
     _stop_play(state)                 # don't capture our own playback
     state.mode = "preparing"
+    state.start_error = ""
     announce("Creating project folder…")
 
     project_dir = state.base_path / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     try:
         project_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-        state.status = f"Folder error: {e}"
-        state.mode = "menu"
+        _fail_to_start(state, f"Folder error: {e}", e)
         return
-    _write_meta(project_dir, name=state.pending_name, language=state.language)
 
     started = []
     sys_failed = False
 
-    # Microphone — critical: abort the recording if it can't open.
+    # Microphone — critical: abort the recording if it can't open, but not before
+    # having really tried (see _start_mic).
     if state.mic_index is not None:
-        announce(f"Opening microphone ({device_name(state.mic_index)})…")
         try:
-            mic = DeviceRecorder(state.mic_index)
-            mic.start(project_dir / "mic.raw")
-            started.append(mic)
+            started.append(_start_mic(state, project_dir / "mic.raw", announce))
         except Exception as e:
-            for r in started:
-                try:
-                    r.stop()
-                except Exception:
-                    pass
-            state.status = f"Microphone error: {e}"
-            state.mode = "menu"
-            try:
-                project_dir.rmdir()
-            except Exception:
-                pass
+            _discard_project(project_dir)
+            _fail_to_start(state, f"Microphone error: {e}", e)
             return
 
     # System audio — best effort: continue mic-only if it can't start.
@@ -1915,20 +2046,19 @@ def _start_recording(state, live):
             announce(f"System audio unavailable ({e}); continuing mic-only")
 
     if not started:
-        state.status = "No microphone available."
-        state.mode = "menu"
-        try:
-            project_dir.rmdir()
-        except Exception:
-            pass
+        _discard_project(project_dir)
+        _fail_to_start(state, "No microphone available.")
         return
 
-    # Record how the raw files can be re-read if this recording is interrupted
-    # (crash / kill) before it is finalized. Recovered on the next launch.
-    _write_meta(project_dir, capture={
-        "in_progress": True,
-        "sources": [r.manifest() for r in started],
-    })
+    # The name and language, plus how the raw files can be re-read if this recording
+    # is interrupted (crash / kill) before it is finalized — recovered on the next
+    # launch. Written only now that audio is really arriving: a folder is otherwise
+    # left behind for a recording that never began.
+    _write_meta(project_dir, name=state.pending_name, language=state.language,
+                capture={
+                    "in_progress": True,
+                    "sources": [r.manifest() for r in started],
+                })
 
     state.recorders = started
     state.project_dir = project_dir
@@ -1936,6 +2066,22 @@ def _start_recording(state, live):
     state.mode = "recording"
     if not sys_failed:
         state.status = "Recording started — speak now."
+
+
+def _fail_to_start(state, reason, exc=None):
+    """Stop on a screen that says why the recording did not start, keeping the name
+    the user typed so that trying again is one keypress.
+
+    Going back to the menu instead left the reason on the status line — which the
+    footer hands to any background job that wants it, and publishing holds it for
+    minutes after each recording. That is exactly when the next recording gets
+    started, so what the user saw was the menu coming back and nothing else: the app
+    looked like it had swallowed the keypress."""
+    _log_problem(f"recording “{state.pending_name or 'Untitled'}” not started: "
+                 f"{reason}", exc)
+    state.start_error = reason
+    state.status = reason
+    state.mode = "start_failed"
 
 
 def _stop_and_transcribe(state, live):
@@ -2441,6 +2587,14 @@ def _tui_handle_key(key, state, live):
             state.name_buffer = state.name_buffer[:-1]
         elif key and len(key) == 1 and key.isprintable():
             state.name_buffer += key
+    elif mode == "start_failed":
+        # The name is still on state.pending_name, so Enter is a straight retry.
+        if key == "ENTER":
+            _start_recording(state, live)
+        elif key in ("ESC", "q", "Q"):
+            state.start_error = ""
+            state.status = "Recording cancelled."
+            state.mode = "menu"
     elif mode == "viewer":
         page = max(1, console.size.height - 12)
         if key in ("ESC", "LEFT", "q", "Q"):

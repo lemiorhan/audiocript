@@ -19,6 +19,29 @@ All notable changes to this project are documented here. The format is based on
   the feature is simply off. Uses no new dependencies.
 
 ### Fixed
+- **A recording no longer disappears when the microphone is busy for a moment.**
+  CoreAudio turns down a device that is busy or still settling, briefly and flatly,
+  and a single refused open was fatal: the folder was thrown away and the user — who
+  had just typed a name — was dropped back at the menu with the reason on the status
+  line, which the footer hands to any background job that wants it. Publishing holds
+  that line for minutes after each recording, which is exactly when the next one gets
+  started, so recording twice in a row could look like the app was ignoring the
+  keypress. Six named, silent folders on disk were the only trace. The microphone now
+  gets three attempts, re-reading the device list between them (a stale device index
+  is the other way this has failed), and a start that really cannot happen stops on a
+  screen that says why and keeps the typed name, so Enter is a retry.
+
+- **Failures are written to `audiocript.log`.** Next to `config.json`, with the
+  traceback. The status line is volatile — the next message wipes it — so something
+  that goes wrong from time to time used to leave nothing behind to diagnose it from.
+
+- **A recording that never started leaves nothing behind.** `meta.json` was written
+  before the microphone was opened and a refused open left an empty `mic.raw`, so the
+  `rmdir()` meant to clean up could not possibly succeed. The recorders now clean up
+  their own raw file when an open is refused (which also stops leaking the file
+  handle), the metadata is written once audio is really arriving, and the discard
+  refuses to delete a folder that holds any capture.
+
 - **A pasted repository URL now works.** `GITHUB_REPO_FOR_TRANSCRIPTS` was dropped
   into the API path verbatim, so anything but a bare `owner/repo` produced
   `/repos/https://github.com/owner/repo` and could never publish — while the natural
