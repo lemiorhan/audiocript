@@ -443,14 +443,16 @@ def test_gate_skips_short_transcripts_and_republishing():
         api.close()
 
 
-def test_gate_is_silent_without_configuration():
+def test_gate_reports_missing_configuration():
+    """Nothing publishes by itself any more, so every refusal answers a keypress and
+    has to say something — silence here reads as a broken [u]."""
     with workdir("unconfigured") as base, isolated(base):
         d = recording(base / "2026-08-07_08-00-00", "x" * 5000)
         state = fake_state(base)
         assert A._publish_async(state, d, "x" * 5000, "demo") is None
-        assert state.status == "" and state.bg_msg is None, \
-            "complained at a user who never asked for the feature"
-    print("  unconfigured -> silent")
+        print(f"  status={state.status!r}")
+        assert "not configured" in state.status, state.status
+        assert state.bg_msg is None, "left a progress message for a job never started"
 
 
 def test_end_to_end_updates_status_and_meta():
@@ -552,8 +554,8 @@ def test_failure_is_recorded_in_meta():
 
 
 def test_manual_publish_says_why_it_did_nothing():
-    """[u] must explain itself. The automatic pass is silent by design, but a keypress
-    that does nothing and says nothing reads as a broken app."""
+    """[u] must explain itself: a keypress that does nothing and says nothing reads as
+    a broken app."""
     api = FakeAPI(pipeline_routes())
     try:
         with workdir("manual") as base, configured_env(api):
@@ -598,6 +600,31 @@ def test_manual_publish_runs_the_pipeline():
         api.close()
 
 
+def test_saving_a_transcript_does_not_publish():
+    """Saving a transcript used to start a publish on its own — two paid model calls
+    nobody asked for. [u] is now the only trigger, so this call site must stay empty."""
+    api = FakeAPI(pipeline_routes())
+    calls = []
+    real = A._publish_async
+    A._publish_async = lambda *a, **kw: calls.append(a) or None
+    try:
+        with workdir("nopublish") as base, configured_env(api):
+            d = base / "2026-08-08_06-00-00"
+            d.mkdir()
+            state = types.SimpleNamespace(bg_msg=None, status="", base_path=base,
+                                          recordings=[], pending_name="stand-up",
+                                          language="tr", open_app=None)
+            A._save_and_open(state, d, "x" * 5000)
+            print(f"  status={state.status!r}, publish calls={len(calls)}")
+            assert (d / "transcription.txt").exists(), "did not even save"
+            assert calls == [], "saving a transcript started a publish"
+            assert api.requests == [], "reached the API while only saving"
+            assert "published" not in json.loads((d / "meta.json").read_text())
+    finally:
+        A._publish_async = real
+        api.close()
+
+
 TESTS = ["test_config_is_none_without_keys", "test_config_reads_dotenv",
          "test_exported_variable_beats_dotenv", "test_bad_min_chars_falls_back",
          "test_render_prompt_substitutes_the_placeholder",
@@ -612,7 +639,8 @@ TESTS = ["test_config_is_none_without_keys", "test_config_reads_dotenv",
          "test_truncation_writes_nothing_and_publishes_nothing",
          "test_push_failure_keeps_the_model_output",
          "test_gate_skips_short_transcripts_and_republishing",
-         "test_gate_is_silent_without_configuration",
+         "test_gate_reports_missing_configuration",
+         "test_saving_a_transcript_does_not_publish",
          "test_end_to_end_updates_status_and_meta",
          "test_a_failure_is_reported_on_the_status_line",
          "test_repo_accepts_what_people_actually_paste",

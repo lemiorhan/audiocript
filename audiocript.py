@@ -2168,9 +2168,8 @@ _PUBLISH_STEPS = {"edit": "Editing transcript “{label}”…",
 def _publish_gate(project_dir, text):
     """(config, reason) for this transcript — `reason` is None when it should publish.
 
-    The automatic pass stays quiet about every reason, since someone who never set up
-    a key must not be told off after each recording. [u] shows them instead, because a
-    keypress that does nothing and says nothing reads as a broken app."""
+    Every publish is asked for with [u], so every reason is worth showing: a keypress
+    that does nothing and says nothing reads as a broken app."""
     try:
         cfg = publish.config()
     except Exception as e:
@@ -2186,13 +2185,12 @@ def _publish_gate(project_dir, text):
     return cfg, None
 
 
-def _publish_async(state, project_dir, text, name, announce=False):
+def _publish_async(state, project_dir, text, name):
     """Send a long transcript through OpenAI and file the results on GitHub.
 
-    Runs behind the menu, on the status line: what the user was waiting for — the
-    transcript — is already saved and opened by now, and the two model calls take
-    minutes. Returns the worker thread, or None when the gate says no (reported on the
-    status line only when `announce` is set).
+    Runs behind the menu, on the status line: the transcript this works from is
+    already saved, and the two model calls take minutes. Returns the worker thread, or
+    None when the gate says no, with the reason on the status line.
 
     A failure is recorded in meta.json as well as shown. The status line is volatile —
     it is gone as soon as anything else happens, and the thread is a daemon, so
@@ -2200,8 +2198,7 @@ def _publish_async(state, project_dir, text, name, announce=False):
     nothing anywhere to say what had gone wrong."""
     cfg, reason = _publish_gate(project_dir, text)
     if reason:
-        if announce:
-            state.status = reason
+        state.status = reason
         return None
     label = name or Path(project_dir).name
 
@@ -2229,10 +2226,11 @@ def _publish_async(state, project_dir, text, name, announce=False):
 def _publish_existing(state, rec):
     """[u] on a recording: publish a transcript that is already saved.
 
-    The automatic pass only fires when a transcript is first written, so a publish that
-    failed — or that was cut short by quitting the app — otherwise has no way back, and
-    the recording could never be published again. Stages that already produced output
-    are reused rather than paid for twice."""
+    The only way a publish ever starts. Saving a transcript deliberately does not
+    trigger one: nothing is sent to OpenAI or GitHub, and nothing is paid for, until
+    it is asked for here. Stages that already produced output — a publish that failed
+    at the push, or one cut short by quitting the app — are reused rather than paid
+    for twice."""
     project_dir = Path(rec["dir"])
     transcript = project_dir / "transcription.txt"
     if not transcript.exists():
@@ -2246,8 +2244,7 @@ def _publish_existing(state, rec):
     except Exception as e:
         state.status = f"Could not read the transcript: {e}"
         return None
-    thread = _publish_async(state, project_dir, text, rec.get("name") or "",
-                            announce=True)
+    thread = _publish_async(state, project_dir, text, rec.get("name") or "")
     if thread:
         state.status = "Publishing…"
     return thread
@@ -2256,6 +2253,8 @@ def _publish_existing(state, rec):
 def _save_and_open(state, project_dir, text, name=None, language=None, speaker_map=None):
     """Write transcription.txt + meta, refresh the recordings list, and open the
     transcript in the chosen app. Sets state.status; does not change state.mode.
+
+    Publishing is not part of this: it starts only from [u] on a recording.
 
     `name`/`language` default to the pending ones on state (the import flow); the
     transcription jobs pass the recording's own, since they run in the background
@@ -2281,7 +2280,6 @@ def _save_and_open(state, project_dir, text, name=None, language=None, speaker_m
         err = _open_in_app(state.open_app, transcript_path)
         state.status = (f"Saved — could not open in {state.open_app}"
                         if err else f"Saved “{label}” & opened in {state.open_app}")
-    _publish_async(state, project_dir, text, name)
 
 
 def _transcribe_and_save(state, project_dir, audio_path, language, name,

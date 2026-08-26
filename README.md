@@ -8,7 +8,7 @@ meters, and get a saved transcript. Everything runs on your machine.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-22C55E.svg)](LICENSE)
 [![Platform: macOS 14.4+](https://img.shields.io/badge/platform-macOS%2014.4%2B-0EA5E9.svg)](#requirements)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](#requirements)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB.svg)](#requirements)
 [![Transcription: Whisper](https://img.shields.io/badge/transcription-Whisper-8B5CF6.svg)](#models-per-language)
 [![Runs offline](https://img.shields.io/badge/privacy-runs%20offline-14B8A6.svg)](#how-it-works)
 
@@ -57,7 +57,7 @@ meters, and get a saved transcript. Everything runs on your machine.
 ## Requirements
 
 - **macOS 14.4+** (Core Audio process taps are used for system-audio capture).
-- **Python 3.10+**.
+- **Python 3.12+** (`run.sh` refuses to go on with anything older).
 - **Xcode / Command Line Tools (`swiftc`)** — only for the optional system-audio
   capture (a tiny Swift helper is compiled on first use).
 - **ffmpeg** — only to import existing media files (`brew install ffmpeg`).
@@ -78,14 +78,14 @@ time (and only when `requirements.txt` changes), offers to install the optional
 external tools if missing, then launches the app.
 
 > Permission denied? Run `chmod +x run.sh` once, or use `bash run.sh`.
-> Pick a Python with `PYTHON=python3.11 ./run.sh`. Skip the tool check with
+> Pick a Python with `PYTHON=python3.12 ./run.sh`. Skip the tool check with
 > `SKIP_DEP_CHECK=1`.
 
 <details>
 <summary>Manual setup</summary>
 
 ```bash
-python3 -m venv .venv
+python3 -m venv .venv   # Python 3.12+
 source .venv/bin/activate
 pip install -r requirements.txt
 python audiocript.py
@@ -228,7 +228,7 @@ toggle, speaker-labels toggle + optional `hf_token`, recordings folder, and the
 ### Publishing transcripts (optional, off by default)
 
 Audiocript can turn a long transcript into two more useful forms and file all three in
-a GitHub repository, on its own, right after the transcript is saved.
+a GitHub repository — when you ask it to, by pressing **`u`** on a recording.
 
 Create a `.env` next to `audiocript.py` with three values:
 
@@ -243,7 +243,7 @@ over the file — so an `OPENAI_API_KEY` you already have in your shell just wor
 repository can be given as `owner/repo`, as the address from your browser, or as an
 SSH remote; they all mean the same thing.
 
-Any transcript longer than `TRANSCRIPT_MIN_CHARS` (2000 characters by default) is then
+A transcript longer than `TRANSCRIPT_MIN_CHARS` (2000 characters by default) is then
 sent through `prompts/transcript_prompt.md`, which cleans up the speech without
 flattening who said what or how sure they were, and that result through
 `prompts/documentation_prompt.md`, which reorganises it into a document by topic. Both
@@ -264,13 +264,13 @@ the menu stays usable. Two optional settings: `OPENAI_MODEL` (default `gpt-4.1` 
 needs a large output budget, since the response is as long as the transcript) and
 `TRANSCRIPT_MIN_CHARS`.
 
-This runs on its own only when a transcript is first saved. Press **`u`** on a
-recording to publish one that was not — because it failed, because the app was closed
-while it was working, or because you set the keys up afterwards. Anything already
-generated is reused rather than paid for again, and `u` tells you why it declined
-(too short, already published, not configured) instead of doing nothing quietly.
-A failure is also written to `meta.json` as `publish_error`, so it is still there
-after the status line has moved on.
+Nothing publishes by itself. Transcribing saves the transcript and stops there —
+two paid model calls are not something to start on your behalf — so publishing waits
+for **`u`**. Press it again after a failure, after the app was closed mid-publish, or
+after setting the keys up later: anything already generated is reused rather than paid
+for again. `u` also tells you why it declined (too short, already published, not
+configured) instead of doing nothing quietly. A failure is written to `meta.json` as
+`publish_error` as well, so it is still there after the status line has moved on.
 
 Leave any of the three required values out and nothing happens: this is off unless you
 configure it. Never commit `.env` — it is gitignored for that reason.

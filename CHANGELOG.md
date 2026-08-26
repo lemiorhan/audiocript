@@ -6,17 +6,18 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
-- **Long transcripts can publish themselves.** With `GITHUB_REPO_FOR_TRANSCRIPTS`,
-  `GITHUB_TOKEN` and `OPENAI_API_KEY` set in `.env`, a transcript longer than
-  `TRANSCRIPT_MIN_CHARS` (2000 by default) is rewritten with
-  `prompts/transcript_prompt.md`, turned into a document with
-  `prompts/documentation_prompt.md`, and committed to that repository — raw, edited
-  and documented, in a single commit named after the recording. It runs behind the
-  menu on the status line, because the transcript itself is already saved and opened
-  by then. Both model outputs are written next to the recording before anything is
-  pushed, so a failed push costs only the retry, and a response the model had to cut
-  short fails the step rather than filing half a document. Without those three keys
-  the feature is simply off. Uses no new dependencies.
+- **Long transcripts can be published with one keypress.** With
+  `GITHUB_REPO_FOR_TRANSCRIPTS`, `GITHUB_TOKEN` and `OPENAI_API_KEY` set in `.env`,
+  **`u`** on a recording sends a transcript longer than `TRANSCRIPT_MIN_CHARS` (2000
+  by default) through `prompts/transcript_prompt.md`, turns that into a document with
+  `prompts/documentation_prompt.md`, and commits both to that repository — raw, edited
+  and documented, in a single commit named after the recording. Nothing publishes
+  automatically: saving a transcript never starts two paid model calls on its own. It
+  runs behind the menu on the status line, so the app stays usable. Both model outputs
+  are written next to the recording before anything is pushed, so a failed push costs
+  only the retry, and a response the model had to cut short fails the step rather than
+  filing half a document. Without those three keys the feature is simply off. Uses no
+  new dependencies.
 
 ### Fixed
 - **A stray keystroke can no longer end a recording.** Space, `r` and `q` were all
@@ -148,6 +149,10 @@ All notable changes to this project are documented here. The format is based on
   in-app **Import file** feature).
 
 ### Changed
+- **Python 3.12 is now the minimum**, and `run.sh` checks it before doing anything
+  else — both the interpreter it is given and the one an existing `.venv` was built
+  with. An older Python used to fail much later, in the middle of a dependency
+  build, as an error about something else entirely.
 - **All UI text, prompts, logs, comments and docstrings are in English** — including
   the system-audio source's labels (`System audio (Core Audio tap)`), the last
   Turkish strings left in the interface.
