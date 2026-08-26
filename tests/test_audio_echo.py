@@ -60,8 +60,8 @@ def test_missing_timestamps_keep_both_prefixes_and_truncate_to_shorter_file():
         assert np.array_equal(wav_samples(aligned_system), system)
 
 
-def test_alignment_copies_in_bounded_chunks_and_reports_each_shared_chunk():
-    """A whole-file copy or cumulative progress callback would break this contract."""
+def test_alignment_copies_in_bounded_chunks_and_reports_cumulative_progress():
+    """A whole-file copy or per-chunk progress callback would break this contract."""
     with workdir("align-chunks") as d:
         mic = np.arange(4500, dtype=np.int16)
         system = (10000 + np.arange(4500)).astype(np.int16)
@@ -72,12 +72,12 @@ def test_alignment_copies_in_bounded_chunks_and_reports_each_shared_chunk():
                              d / "aligned-mic.wav", d / "aligned-system.wav",
                              chunk_frames=2000, on_progress=seen.append)
         assert n == 4500
-        assert seen == [2000, 2000, 500]
+        assert seen == [2000, 4000, 4500]
 
 
 if __name__ == "__main__":
     run(["test_mic_prefix_is_removed_when_mic_started_first",
          "test_system_prefix_is_removed_when_system_started_first",
          "test_missing_timestamps_keep_both_prefixes_and_truncate_to_shorter_file",
-         "test_alignment_copies_in_bounded_chunks_and_reports_each_shared_chunk"],
+         "test_alignment_copies_in_bounded_chunks_and_reports_cumulative_progress"],
         globals())

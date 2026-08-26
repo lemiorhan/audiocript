@@ -85,7 +85,7 @@ def align_wav_pair(mic_path, system_path, aligned_mic_path, aligned_system_path,
                     aligned_system.writeframes(system_chunk)
                     copied += take
                     if on_progress:
-                        on_progress(take)
+                        on_progress(copied)
 
         os.replace(mic_part, mic_out)
         os.replace(system_part, system_out)
