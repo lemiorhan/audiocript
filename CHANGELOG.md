@@ -43,6 +43,14 @@ All notable changes to this project are documented here. The format is based on
   traceback. The status line is volatile — the next message wipes it — so something
   that goes wrong from time to time used to leave nothing behind to diagnose it from.
 
+- **A model that fails to load now says why.** The header has one word for every way
+  the load can go wrong — `error` — and the message the warm-up built was kept only in
+  memory, so a missing package, a download the network refused and a full disk were
+  indistinguishable and nothing on disk could tell them apart. The reason and its
+  traceback go to `audiocript.log` now, written before the header changes, so the log
+  already has the answer by the time anyone goes looking. A load that works still
+  writes nothing, and a failure stays retryable.
+
 - **A recording that never started leaves nothing behind.** `meta.json` was written
   before the microphone was opened and a refused open left an empty `mic.raw`, so the
   `rmdir()` meant to clean up could not possibly succeed. The recorders now clean up

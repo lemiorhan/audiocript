@@ -1630,7 +1630,10 @@ def _delete_recording(state, target):
 
 def _warm_model_async(state, language):
     """Load the transcription model for `language` in the background so the first
-    transcript is fast. Updates state.model_state for the header indicator."""
+    transcript is fast. Updates state.model_state for the header indicator.
+
+    The header can only say "error" — a download that failed, a missing package
+    and a full disk all look the same there — so the traceback goes to LOG_PATH."""
     if state.model_state.get(language) in ("loading", "ready"):
         return
     state.model_state[language] = "loading"
@@ -1640,6 +1643,9 @@ def _warm_model_async(state, language):
             _ensure_model(language)
             state.model_state[language] = "ready"
         except Exception as e:
+            # Write the reason down first: the moment model_state flips, the header
+            # says "error" and someone goes looking for the log.
+            _log_problem(f"model warm-up failed for {language}", e)
             state.model_state[language] = f"error: {e}"
 
     threading.Thread(target=run, daemon=True).start()
