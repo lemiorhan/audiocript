@@ -105,9 +105,57 @@ class _Stub:
             setattr(A, k, v)
 
 
+class FakeInputStream:
+    """A sounddevice stream that becomes ready as soon as start succeeds."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class FakeSoundDevice:
+    InputStream = FakeInputStream
+
+    @staticmethod
+    def query_devices(_index, _kind):
+        return {"default_samplerate": 48000, "max_input_channels": 2}
+
+
 def recording_dirs(home):
     base = home / "recordings"
     return sorted(d.name for d in base.iterdir() if d.is_dir()) if base.exists() else []
+
+
+def test_started_recorders_publish_a_monotonic_start_estimate():
+    """A manifest must say when each source actually became available for capture."""
+    with workdir("start-estimates") as home:
+        raw_path = home / "mic.raw"
+        tap_raw_path = home / "system.raw"
+        with _Stub(sd=FakeSoundDevice, device_name=lambda _index: "Fake mic",
+                   time=type("Clock", (), {"monotonic_ns": staticmethod(lambda: 12_345)})):
+            mic = A.DeviceRecorder(7)
+            mic._raw_path = str(raw_path)  # manifest's existing filename precondition
+            assert "started_ns" not in mic.manifest()
+            mic.start(raw_path)
+            assert mic.manifest()["started_ns"] == 12_345
+            mic.stop()
+
+            tap = A.TapRecorder()
+            tap._raw_path = str(tap_raw_path)  # manifest's existing filename precondition
+            assert "started_ns" not in tap.manifest()
+            tap._begin = lambda: (setattr(tap, "rate", 48000),
+                                  setattr(tap, "channels", 2))
+            tap.start(tap_raw_path)
+            assert tap.manifest()["started_ns"] == 12_345
+            tap.stop()
 
 
 def test_a_transient_mic_refusal_still_starts_the_recording():
@@ -224,7 +272,8 @@ def test_a_refused_open_leaves_no_raw_file_and_no_open_handle():
 
 
 if __name__ == "__main__":
-    run(["test_a_transient_mic_refusal_still_starts_the_recording",
+    run(["test_started_recorders_publish_a_monotonic_start_estimate",
+         "test_a_transient_mic_refusal_still_starts_the_recording",
          "test_a_recording_that_never_started_leaves_nothing_on_disk",
          "test_the_reason_is_shown_where_a_background_job_cannot_cover_it",
          "test_the_typed_name_survives_a_failed_start",

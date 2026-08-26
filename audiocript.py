@@ -414,6 +414,7 @@ class DeviceRecorder:
         self._stream = None
         self._raw = None
         self._raw_path = None
+        self.started_ns = None
         self._level = 0.0  # instantaneous level for the live VU meter (0..1)
         self.meter_name = f"🎤 {self.name}"
 
@@ -426,8 +427,11 @@ class DeviceRecorder:
 
     def manifest(self):
         """Describe the raw file so it can be re-read after an interruption."""
-        return {"kind": self.KIND, "file": Path(self._raw_path).name,
-                "rate": self.rate, "channels": self.channels, "dtype": self.RAW_DTYPE}
+        manifest = {"kind": self.KIND, "file": Path(self._raw_path).name,
+                    "rate": self.rate, "channels": self.channels, "dtype": self.RAW_DTYPE}
+        if self.started_ns is not None:
+            manifest["started_ns"] = self.started_ns
+        return manifest
 
     def start(self, raw_path):
         # Unbuffered so every block reaches the kernel immediately; a killed
@@ -455,6 +459,7 @@ class DeviceRecorder:
         try:
             self._stream = sd.InputStream(**kwargs)
             self._stream.start()
+            self.started_ns = time.monotonic_ns()
         except Exception:
             # A refused open must leave nothing behind. The empty mic.raw it used to
             # leave was what defeated the cleanup of the abandoned recording folder,
@@ -465,6 +470,7 @@ class DeviceRecorder:
             except Exception:
                 pass
             self._raw = None
+            self.started_ns = None
             _unlink_quietly(self._raw_path)
             raise
 
@@ -505,6 +511,7 @@ class TapRecorder:
         self._stderr_reader = None
         self._raw = None
         self._raw_path = None
+        self.started_ns = None
         self._stderr = []
         self._ready = threading.Event()
         self._error = None
@@ -515,8 +522,11 @@ class TapRecorder:
 
     def manifest(self):
         """Describe the raw file so it can be re-read after an interruption."""
-        return {"kind": self.KIND, "file": Path(self._raw_path).name,
-                "rate": self.rate, "channels": self.channels, "dtype": self.RAW_DTYPE}
+        manifest = {"kind": self.KIND, "file": Path(self._raw_path).name,
+                    "rate": self.rate, "channels": self.channels, "dtype": self.RAW_DTYPE}
+        if self.started_ns is not None:
+            manifest["started_ns"] = self.started_ns
+        return manifest
 
     def start(self, raw_path):
         # Stream the tap's PCM straight to disk, unbuffered (see DeviceRecorder).
@@ -524,10 +534,12 @@ class TapRecorder:
         self._raw = open(self._raw_path, "wb", buffering=0)
         try:
             self._begin()
+            self.started_ns = time.monotonic_ns()
         except Exception:
             # Tear down whatever came up, and leave no empty system.raw behind —
             # it would keep the abandoned recording folder from being removed.
             self.stop()
+            self.started_ns = None
             _unlink_quietly(self._raw_path)
             raise
 
