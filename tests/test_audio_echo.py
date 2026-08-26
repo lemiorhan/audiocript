@@ -5,6 +5,16 @@ from support import run, wav_samples, workdir, write_wav
 import audio_echo as E
 
 
+class SubtractProcessor:
+    def __init__(self):
+        self.calls = []
+
+    def process(self, near, far):
+        self.calls.append((near.copy(), far.copy()))
+        return np.clip(near.astype(np.int32) - far.astype(np.int32),
+                       -32768, 32767).astype(np.int16)
+
+
 def test_mic_prefix_is_removed_when_mic_started_first():
     """A wrong leading-source choice would retain the mic's pre-system audio."""
     with workdir("align-mic-first") as d:
@@ -75,9 +85,198 @@ def test_alignment_copies_in_bounded_chunks_and_reports_cumulative_progress():
         assert seen == [2000, 4000, 4500]
 
 
+def test_echo_cancellation_streams_all_chunks_through_one_processor():
+    """Recreating the processor or skipping/reordering a chunk would corrupt AEC state."""
+    with workdir("cancel-echo-chunks") as d:
+        mic = np.array([32767, 1200, -1400, 600, 55, -90, 30000, -30000,
+                        7, 8], dtype=np.int16)
+        system = np.array([-100, 200, -400, 900, -55, 10, -30000, 30000,
+                           2, 10], dtype=np.int16)
+        expected = np.array([32767, 1000, -1000, -300, 110, -100, 32767,
+                             -32768, 5, -2], dtype=np.int16)
+        write_wav(d / "mic.wav", mic)
+        write_wav(d / "system.wav", system)
+        created = []
+
+        def factory(sample_rate):
+            processor = SubtractProcessor()
+            created.append((sample_rate, processor))
+            return processor
+
+        progress = []
+        output = d / "clean.wav"
+        n = E.cancel_echo(d / "mic.wav", d / "system.wav", output,
+                          processor_factory=factory, chunk_frames=3,
+                          on_progress=progress.append)
+
+        assert n == len(mic)
+        assert len(created) == 1
+        assert created[0][0] == 16000
+        calls = created[0][1].calls
+        assert [len(near) for near, _ in calls] == [3, 3, 3, 1]
+        assert all(len(near) == len(far) for near, far in calls)
+        assert np.array_equal(np.concatenate([near for near, _ in calls]), mic)
+        assert np.array_equal(np.concatenate([far for _, far in calls]), system)
+        assert np.array_equal(wav_samples(output), expected)
+        assert progress == [3, 6, 9, 10]
+
+
+def test_echo_cancellation_removes_partial_output_when_processor_fails():
+    """A processor exception on a later chunk must not publish partial audio."""
+    with workdir("cancel-echo-failure") as d:
+        samples = np.arange(8, dtype=np.int16)
+        write_wav(d / "mic.wav", samples)
+        write_wav(d / "system.wav", samples)
+        output = d / "clean.wav"
+
+        class FailingProcessor:
+            def __init__(self):
+                self.call_count = 0
+
+            def process(self, near, far):
+                self.call_count += 1
+                if self.call_count == 2:
+                    raise RuntimeError("processor failed")
+                return near.copy()
+
+        try:
+            E.cancel_echo(d / "mic.wav", d / "system.wav", output,
+                          processor_factory=lambda _: FailingProcessor(),
+                          chunk_frames=3)
+        except RuntimeError as error:
+            assert str(error) == "processor failed"
+        else:
+            raise AssertionError("processor failure was not propagated")
+
+        assert not output.exists()
+        assert not (d / "clean.wav.part").exists()
+
+
+def test_echo_cancellation_rejects_unequal_input_lengths():
+    """Ignoring extra frames would silently publish an incomplete source pair."""
+    with workdir("cancel-echo-length-mismatch") as d:
+        write_wav(d / "mic.wav", np.arange(6, dtype=np.int16))
+        write_wav(d / "system.wav", np.arange(7, dtype=np.int16))
+        output = d / "clean.wav"
+        try:
+            E.cancel_echo(d / "mic.wav", d / "system.wav", output,
+                          processor_factory=lambda _: SubtractProcessor())
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unequal WAV lengths were accepted")
+        assert not output.exists()
+        assert not (d / "clean.wav.part").exists()
+
+
+def test_echo_cancellation_rejects_malformed_processor_output():
+    """Wrong output dtype, dimensions, or length must not create malformed audio."""
+    bad_outputs = [
+        np.arange(4, dtype=np.int32),
+        np.arange(3, dtype=np.int16),
+        np.arange(4, dtype=np.int16).reshape(4, 1),
+    ]
+    for index, bad_output in enumerate(bad_outputs):
+        with workdir(f"cancel-echo-bad-output-{index}") as d:
+            samples = np.arange(4, dtype=np.int16)
+            write_wav(d / "mic.wav", samples)
+            write_wav(d / "system.wav", samples)
+            output = d / "clean.wav"
+
+            class MalformedProcessor:
+                def process(self, near, far):
+                    return bad_output
+
+            try:
+                E.cancel_echo(d / "mic.wav", d / "system.wav", output,
+                              processor_factory=lambda _: MalformedProcessor())
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    f"malformed processor output {index} was accepted")
+            assert not output.exists()
+            assert not (d / "clean.wav.part").exists()
+
+
+def test_echo_cancellation_rejects_wrong_wav_format():
+    """Passing non-16-kHz PCM to a 16-kHz processor would corrupt its timing."""
+    with workdir("cancel-echo-wav-format") as d:
+        samples = np.arange(4, dtype=np.int16)
+        write_wav(d / "mic.wav", samples, rate=8000)
+        write_wav(d / "system.wav", samples)
+        output = d / "clean.wav"
+        try:
+            E.cancel_echo(d / "mic.wav", d / "system.wav", output,
+                          processor_factory=lambda _: SubtractProcessor())
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("wrong WAV format was accepted")
+        assert not output.exists()
+        assert not (d / "clean.wav.part").exists()
+
+
+def test_native_aec_reduces_echo_and_preserves_near_end_audio():
+    """Disabling AEC or enabling destructive processing would violate its purpose."""
+    sample_rate = 16000
+    total_frames = 8 * sample_rate
+    rng = np.random.default_rng(20260826)
+    smoothing = np.ones(7, dtype=np.float64) / 7
+
+    far_float = np.convolve(rng.standard_normal(total_frames), smoothing,
+                            mode="same") * 6000
+    far = np.clip(np.rint(far_float), -32768, 32767).astype(np.int16)
+    far[6 * sample_rate:] = 0
+
+    echo = np.zeros(total_frames, dtype=np.float64)
+    direct_delay = int(0.080 * sample_rate)
+    later_delay = direct_delay + int(0.012 * sample_rate)
+    echo[direct_delay:] += 0.45 * far[:-direct_delay]
+    echo[later_delay:] += 0.15 * far[:-later_delay]
+
+    near_start = 6 * sample_rate
+    near_noise = np.convolve(rng.standard_normal(total_frames - near_start),
+                             smoothing, mode="same") * 6000
+    echo[near_start:] += near_noise
+    mic = np.clip(np.rint(echo), -32768, 32767).astype(np.int16)
+
+    with workdir("cancel-echo-native") as d:
+        write_wav(d / "mic.wav", mic)
+        write_wav(d / "system.wav", far)
+        output = d / "clean.wav"
+        n = E.cancel_echo(d / "mic.wav", d / "system.wav", output,
+                          chunk_frames=sample_rate)
+        clean = wav_samples(output)
+
+    assert n == total_frames
+    assert len(clean) == total_frames
+
+    echo_slice = slice(2 * sample_rate, 6 * sample_rate)
+    near_slice = slice(int(6.5 * sample_rate), 8 * sample_rate)
+
+    def rms(samples):
+        values = samples.astype(np.float64)
+        return np.sqrt(np.mean(values * values))
+
+    raw_echo_rms = rms(mic[echo_slice])
+    clean_echo_rms = rms(clean[echo_slice])
+    raw_near_rms = rms(mic[near_slice])
+    clean_near_rms = rms(clean[near_slice])
+
+    assert 20 * np.log10(clean_echo_rms / raw_echo_rms) <= -6.0
+    assert clean_near_rms / raw_near_rms >= 0.5
+
+
 if __name__ == "__main__":
     run(["test_mic_prefix_is_removed_when_mic_started_first",
          "test_system_prefix_is_removed_when_system_started_first",
          "test_missing_timestamps_keep_both_prefixes_and_truncate_to_shorter_file",
-         "test_alignment_copies_in_bounded_chunks_and_reports_cumulative_progress"],
+         "test_alignment_copies_in_bounded_chunks_and_reports_cumulative_progress",
+         "test_echo_cancellation_streams_all_chunks_through_one_processor",
+         "test_echo_cancellation_removes_partial_output_when_processor_fails",
+         "test_echo_cancellation_rejects_unequal_input_lengths",
+         "test_echo_cancellation_rejects_malformed_processor_output",
+         "test_echo_cancellation_rejects_wrong_wav_format",
+         "test_native_aec_reduces_echo_and_preserves_near_end_audio"],
         globals())

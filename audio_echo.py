@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import wave
 
+import numpy as np
+
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 
@@ -39,6 +41,66 @@ def _write_wav_header(wf, sample_rate):
     wf.setnchannels(1)
     wf.setsampwidth(2)
     wf.setframerate(sample_rate)
+
+
+def default_processor_factory(sample_rate):
+    """Build the configured mono WebRTC processor, importing it only on demand."""
+    from pywebrtc_audio import AudioProcessor
+    return AudioProcessor(sample_rate=sample_rate, num_channels=1,
+                          echo_cancellation=True,
+                          noise_suppression=False,
+                          auto_gain_control=False,
+                          stream_delay_ms=0)
+
+
+def cancel_echo(mic_path, system_path, output_path, sample_rate=16000,
+                processor_factory=None, chunk_frames=16000, on_progress=None):
+    """Stream equal-length microphone and system WAVs through one AEC processor."""
+    if chunk_frames <= 0:
+        raise ValueError("chunk_frames must be positive")
+
+    output = Path(output_path)
+    part = Path(f"{output}.part")
+    part.unlink(missing_ok=True)
+
+    try:
+        with _open_validated_wav(mic_path, sample_rate) as mic, \
+             _open_validated_wav(system_path, sample_rate) as system:
+            frames = mic.getnframes()
+            if system.getnframes() != frames:
+                raise ValueError("input WAVs must have equal frame counts")
+
+            factory = processor_factory or default_processor_factory
+            processor = factory(sample_rate)
+            with wave.open(str(part), "wb") as cleaned_wav:
+                _write_wav_header(cleaned_wav, sample_rate)
+                processed = 0
+                while processed < frames:
+                    take = min(chunk_frames, frames - processed)
+                    mic_bytes = mic.readframes(take)
+                    system_bytes = system.readframes(take)
+                    if len(mic_bytes) != take * 2 or len(system_bytes) != take * 2:
+                        raise ValueError("input WAV ended before its declared frame count")
+
+                    near = np.frombuffer(mic_bytes, dtype=np.int16).copy()
+                    far = np.frombuffer(system_bytes, dtype=np.int16).copy()
+                    cleaned = processor.process(near, far)
+                    if (not isinstance(cleaned, np.ndarray)
+                            or cleaned.dtype != np.int16
+                            or cleaned.ndim != 1
+                            or cleaned.shape != near.shape):
+                        raise ValueError(
+                            "processor output must be a mono int16 array matching input length")
+                    cleaned_wav.writeframes(cleaned.tobytes())
+                    processed += take
+                    if on_progress:
+                        on_progress(processed)
+
+        os.replace(part, output)
+        return frames
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
 
 
 def align_wav_pair(mic_path, system_path, aligned_mic_path, aligned_system_path,
