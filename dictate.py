@@ -1,15 +1,26 @@
-"""The parts of dictation that hold threads and state: the microphone capture and
-the state machine that drives one dictation from hotkey to clipboard.
+"""The dictation daemon: the microphone capture, the state machine that drives one
+dictation from hotkey to clipboard, the global hotkey that starts it, and the CLI
+that runs and signals the daemon.
 
-dictation.py holds everything that can be tested without either — configuration,
-the clipboard, the status sinks and the correction pipeline. Here the state is
-touched from three threads (the hotkey listener, the duration timer and the
-worker), so `toggle` is the only way in and one lock guards `state`.
+dictation.py holds everything that can be tested without threads or hardware —
+configuration, the clipboard, the status sinks and the correction pipeline. Here
+the state is touched from four threads (the hotkey, the signal, the duration timer
+and the worker), so `toggle` is the only way in and one lock guards `state`.
+
+    dictate.py             run the daemon in the foreground
+    dictate.py --toggle    start or stop a dictation in the running daemon
+    dictate.py --stop      stop the running daemon
 """
+import os
 import pathlib
+import queue
 import shutil
+import signal
+import sys
 import tempfile
 import threading
+
+from pynput import keyboard
 
 import audiocript as A
 import dictation
@@ -160,13 +171,32 @@ class Daemon:
                 self._sink.failed("still working on the previous dictation")
 
     def join_worker(self, timeout=None):
-        """Wait for the worker thread, if there is one. For the tests only — the
-        daemon never sequences its own work this way, because every call above
+        """Wait for the worker thread, if there is one. Called by the tests and by
+        the shutdown path, never by the daemon's own threads: every call above
         happens on a thread that has to return at once."""
         with self._lock:
             worker = self._worker
         if worker is not None:
             worker.join(timeout)
+
+    def abandon_recording(self):
+        """Throw away a recording that is still going, for the way out.
+
+        A recording only ends through a toggle, so a daemon shutting down mid
+        recording would otherwise leave the microphone open and its temporary
+        directory on disk. PROCESSING is deliberately left alone: there the worker
+        owns the capture and discards it in its own `finally`, and discarding it
+        here would delete the WAV out from under a transcription of something the
+        user has already spoken."""
+        with self._lock:
+            if self.state != RECORDING:
+                return
+            capture, self._capture = self._capture, None
+            self._leave_recording()
+            self.state = IDLE
+        # Outside the lock, as the worker's own cleanup is: discard() stops a
+        # recorder and removes a directory, and neither needs the state guarded.
+        capture.discard()
 
     # --------------------------- the transitions ---------------------------
     # All three run with `_lock` held, so the *transitions* serialise: no two
@@ -281,3 +311,280 @@ class Daemon:
             with self._lock:
                 self._capture = None
                 self.state = IDLE
+
+
+# ============================ The global hotkey ============================
+
+
+def _deferred(action, name):
+    """Return a callable that hands `action` to a thread of its own and returns at
+    once, and start that thread. Every press ends up on the same thread, so two of
+    them are answered in the order they arrived.
+
+    Nothing may call Daemon.toggle on the thread that delivered the event, and
+    nothing may let it raise there:
+
+    - pynput calls the hotkey callback from its CGEventTap callback (see
+      `_handler` in pynput/_util/darwin.py, and `_emitter` in _util/__init__.py),
+      and macOS switches off a tap whose callback is too slow. pynput calls
+      `CGEventTapEnable(tap, True)` exactly once, at listener startup, and holds
+      no other reference to it — so a tap the system disables is never switched
+      back on, while IS_TRUSTED stays true and the listener stays alive. `toggle`
+      can wait 2 x dictation.NOTIFY_TIMEOUT_SECONDS on the daemon's lock, because
+      a status report is made with it held.
+    - `_emitter` calls `listener.stop()` on any exception the callback lets
+      through, which ends the listener for good. Daemon._begin_recording's
+      trailing sink.recording() is outside its guard by design, so `toggle` can
+      raise on the recording path.
+    - the SIGUSR1 handler runs on the main thread and is not re-entrant: a second
+      --toggle arriving while the first one is inside `toggle` would deadlock on a
+      lock its own thread already holds. Deferring makes that impossible too.
+
+    Both failures look the same to a user — the hotkey stops working for the rest
+    of the session with nothing on screen and nothing in any log — so the guard
+    below catches BaseException rather than Exception, and the pump loop is the
+    one thing in this module that may not end.
+    """
+    requests = queue.SimpleQueue()
+
+    def pump():
+        while True:
+            requests.get()
+            try:
+                action()
+            except BaseException as e:                            # noqa: BLE001
+                A._log_problem("the dictation toggle failed", e)
+
+    # daemon: the pump is blocked on an empty queue for almost all of its life and
+    # must not keep the process alive on its way out.
+    threading.Thread(target=pump, name=name, daemon=True).start()
+
+    def submit(*_signal_arguments):
+        """Ignores its arguments so it can serve as a signal handler as well as a
+        pynput callback, which is called with none."""
+        requests.put(None)
+
+    return submit
+
+
+def build_listener(config, on_toggle, hotkeys_class=keyboard.GlobalHotKeys):
+    """Map each configured hotkey to what it does and return the listener,
+    unstarted — the caller decides when the event tap goes up.
+
+    The thread that carries `on_toggle` off the callback is running by the time
+    this returns, because the callback registered here closes over it. Wrapping
+    happens in here rather than at the call site so the guarantee cannot be lost
+    by a caller passing `daemon.toggle` straight through.
+
+    `hotkeys_class` is a parameter so the tests can watch what was registered
+    without creating a real event tap.
+    """
+    # KeyError here is a programming error worth failing loudly at startup: an
+    # action added to dictation.HOTKEY_ACTIONS and validated by resolve_config,
+    # but never wired to anything.
+    callbacks = {"toggle": _deferred(on_toggle, "dictation-hotkey")}
+    return hotkeys_class({combination: callbacks[action]
+                          for action, combination in config.hotkeys.items()})
+
+
+def check_listener(listener):
+    """None when the hotkey can work, otherwise the warning to put in front of the
+    user. Call it after start() and wait().
+
+    Two signals, because they fail differently. IS_TRUSTED is assigned from
+    AXIsProcessTrusted() at the top of the darwin backend's `_run`, so it is
+    meaningful only once wait() has returned; and a tap that fails for any other
+    reason marks the listener ready and then exits its thread, leaving IS_TRUSTED
+    true. Either way the daemon looks healthy while the hotkey does nothing, which
+    is why this is reported at startup instead of being discovered by a user
+    pressing a key and getting silence.
+    """
+    if listener.IS_TRUSTED and listener.is_alive():
+        return None
+    return ("WARNING: the dictation hotkey cannot be registered — this process is "
+            "not allowed to watch the keyboard.\n"
+            "  Grant it in System Settings → Privacy & Security → Input "
+            "Monitoring (and in Accessibility, which is the list macOS reports "
+            "through AXIsProcessTrusted) for the terminal or the Python "
+            "interpreter running this daemon, then start it again.\n"
+            "  Until then `dictate.py --toggle` starts and stops a dictation "
+            "without any permission at all, from another shell, a macOS Shortcut "
+            "or skhd.")
+
+
+# ======================= The daemon's own lifecycle =======================
+
+PID_PATH = pathlib.Path("~/.audiocript/dictate.pid").expanduser()
+
+# Which signal each CLI action sends. SIGUSR1 has no meaning of its own, and
+# SIGTERM is what the shutdown handler is installed for.
+ACTION_SIGNALS = {"toggle": signal.SIGUSR1, "stop": signal.SIGTERM}
+
+# How long the way out waits for a dictation already being transcribed. The worker
+# is a daemon thread, so without this wait a Ctrl-C during transcription loses a
+# dictation the user has already spoken; with it unbounded, a wedged provider call
+# would keep the process alive instead.
+DRAIN_SECONDS = 15
+
+USAGE = ("usage: dictate.py [--toggle | --stop]\n"
+         "  (no arguments)  run the dictation daemon in the foreground\n"
+         "  --toggle        start or stop a dictation in the running daemon\n"
+         "  --stop          stop the running daemon")
+
+
+def read_pid(path=PID_PATH):
+    """The pid of a daemon that is actually running, or None — which also covers an
+    absent file, an unreadable one, one holding something that is not a pid, and one
+    left behind by a daemon that is gone."""
+    try:
+        pid = int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if pid <= 0:
+        # os.kill(0, sig) signals every process in our own group; 0 and negatives
+        # are not pids this file may act on.
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None                 # stale: the daemon that wrote it is gone
+    except PermissionError:
+        return pid                  # running, under another user
+    except OSError:
+        return None
+    return pid
+
+
+def write_pid(path=PID_PATH):
+    """Claim `path` for this process, or raise if a daemon is already running.
+
+    A stale file is taken over rather than refused: a daemon killed with SIGKILL
+    leaves one behind, and refusing would make the feature dead until the user
+    found the file."""
+    live = read_pid(path)
+    if live is not None:
+        raise RuntimeError(f"a dictation daemon is already running (pid {live}) — "
+                           "use `dictate.py --toggle` to dictate, or "
+                           "`dictate.py --stop` to stop it")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{os.getpid()}\n")
+
+
+def signal_daemon(action, path=PID_PATH):
+    """Send the running daemon the signal for `action` and return a process exit
+    status. Non-zero with no daemon running: a Shortcuts binding or a shell alias
+    that exited zero would look as if it had worked."""
+    pid = read_pid(path)
+    if pid is None:
+        print("no dictation daemon is running (start one with ./run.sh --dictate)")
+        return 1
+    try:
+        os.kill(pid, ACTION_SIGNALS[action])
+    except OSError as e:
+        print(f"the dictation daemon (pid {pid}) could not be signalled: {e}")
+        return 1
+    return 0
+
+
+def _shutdown(listener, daemon, path=PID_PATH, drain_seconds=DRAIN_SECONDS):
+    """Take the daemon down in order: no new dictations, then the one in flight,
+    then the pid file.
+
+    The pid file is removed in a `finally` because it is the one step whose absence
+    is felt after the process is gone — a file left behind refuses the next start.
+    """
+    try:
+        if listener is not None:
+            listener.stop()
+        daemon.abandon_recording()
+        daemon.join_worker(timeout=drain_seconds)
+        if daemon.state != IDLE:
+            print(f"a dictation was still being processed after {drain_seconds}s; "
+                  "its text did not reach the clipboard")
+    except Exception as e:
+        A._log_problem("the dictation daemon did not shut down cleanly", e)
+    finally:
+        A._unlink_quietly(path)
+
+
+def _run_daemon():
+    """Run the daemon in the foreground until it is asked to stop."""
+    cfg = A.load_config()
+    try:
+        # Both are needed: the resolved config drives the daemon, and the raw dict
+        # is what MicCapture hands to audiocript._resolve_mic_index to find the
+        # configured microphone by name.
+        config = dictation.resolve_config(cfg)
+    except dictation.ConfigError as e:
+        # The message already names the offending value; nothing to add, and the
+        # config itself is never printed — it holds the API key.
+        print(f"dictation cannot start: {e}")
+        return 1
+    try:
+        write_pid()
+    except (OSError, RuntimeError) as e:
+        print(f"dictation cannot start: {e}")
+        return 1
+
+    daemon = Daemon(config, dictation.Clipboard(), dictation.NotifySink(), cfg=cfg)
+    listener = None
+    status = 0
+    try:
+        # Before the model load, not after: the default action for SIGUSR1 is to
+        # terminate the process, so a --toggle during a first-run download would
+        # otherwise kill the daemon outright. Installed here, that press waits on
+        # the pump and starts a dictation as soon as the model is ready.
+        signal.signal(signal.SIGUSR1, _deferred(daemon.toggle, "dictation-signal"))
+        print(f"Loading the local {A.lang_name(config.language)} model. The first "
+              "run downloads it, which takes a while.", flush=True)
+        A._ensure_model(config.language)
+
+        listener = build_listener(config, daemon.toggle)
+        listener.start()
+        listener.wait()
+        warning = check_listener(listener)
+        if warning:
+            print(warning)
+        else:
+            print(f"Ready: press {config.hotkeys['toggle']} to start a dictation "
+                  "and again to finish it.")
+        print("Ctrl-C stops the daemon.", flush=True)
+
+        # Installed only now, so Ctrl-C during the model load above still raises
+        # KeyboardInterrupt and interrupts it instead of being swallowed by a
+        # handler while the download carries on.
+        stopping = threading.Event()
+        for stop_signal in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(stop_signal, lambda *_: stopping.set())
+        # The main thread does nothing else on purpose: the spec reserves it for a
+        # menu bar indicator. A handler setting the event wakes this up — verified
+        # on this interpreter, both for SIGTERM and for Ctrl-C.
+        stopping.wait()
+    except KeyboardInterrupt:
+        pass                      # Ctrl-C before the handlers above were installed
+    except Exception as e:
+        A._log_problem("the dictation daemon stopped", e)
+        print(f"dictation stopped: {e}")
+        status = 1
+    finally:
+        print("\nStopping the dictation daemon…", flush=True)
+        # No new dictations from either door on the way out: a --toggle arriving
+        # now would open the microphone as the process is leaving.
+        signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+        _shutdown(listener, daemon)
+    return status
+
+
+def main(argv=None):
+    """The CLI. Returns a process exit status; the caller below is what exits."""
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if not argv:
+        return _run_daemon()
+    if len(argv) == 1 and argv[0] in ("--toggle", "--stop"):
+        return signal_daemon(argv[0].removeprefix("--"))
+    print(USAGE)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
