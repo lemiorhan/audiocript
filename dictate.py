@@ -379,9 +379,6 @@ def build_listener(config, on_toggle, hotkeys_class=keyboard.GlobalHotKeys):
     `hotkeys_class` is a parameter so the tests can watch what was registered
     without creating a real event tap.
     """
-    # KeyError here is a programming error worth failing loudly at startup: an
-    # action added to dictation.HOTKEY_ACTIONS and validated by resolve_config,
-    # but never wired to anything.
     callbacks = {"toggle": _deferred(on_toggle, "dictation-hotkey")}
     return hotkeys_class({combination: callbacks[action]
                           for action, combination in config.hotkeys.items()})
@@ -455,19 +452,65 @@ def read_pid(path=PID_PATH):
     return pid
 
 
+def _refuse(live):
+    return RuntimeError(f"a dictation daemon is already running (pid {live}) — "
+                        "use `dictate.py --toggle` to dictate, or "
+                        "`dictate.py --stop` to stop it")
+
+
 def write_pid(path=PID_PATH):
     """Claim `path` for this process, or raise if a daemon is already running.
 
     A stale file is taken over rather than refused: a daemon killed with SIGKILL
     leaves one behind, and refusing would make the feature dead until the user
-    found the file."""
-    live = read_pid(path)
-    if live is not None:
-        raise RuntimeError(f"a dictation daemon is already running (pid {live}) — "
-                           "use `dictate.py --toggle` to dictate, or "
-                           "`dictate.py --stop` to stop it")
+    found the file.
+
+    The claim is atomic rather than a read followed by a write, so of two daemons
+    started in the same instant exactly one wins. Read-then-write let both pass the
+    liveness check before either wrote, and both then believed they owned the file
+    — at which point the loser's own `_shutdown` unlinks the *winner's* pid file on
+    the way out, leaving a daemon running that `--toggle` and `--stop` can no
+    longer find.
+
+    Two things have to be atomic, and the second is easy to miss. This is why the
+    pid goes into a temporary file first and `os.link` is what publishes it:
+
+    - **The claim.** `link` fails with FileExistsError if the name is taken, so
+      only one caller can create it.
+    - **Its contents.** An `O_CREAT|O_EXCL` create is exclusive but leaves the file
+      *empty* until the write lands, and in that window a rival's `read_pid` gets
+      an unparseable file, reads it as stale, and unlinks the winner's claim. The
+      linked file already holds the pid the instant it is visible. Measured: with
+      the empty window, four simultaneous starts produced two winners.
+
+    Taking a stale file over renames it aside instead of unlinking it in place.
+    `rename` is atomic too, so the process that succeeds is the only one that
+    removes that file, and a daemon which claimed the name in the meantime is
+    never the thing dropped."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{os.getpid()}\n")
+    tmp = path.parent / f".{path.name}.{os.getpid()}"
+    tmp.write_text(f"{os.getpid()}\n")
+    try:
+        for _ in range(3):
+            try:
+                os.link(tmp, path)
+                return
+            except FileExistsError:
+                pass
+            live = read_pid(path)
+            if live is not None:
+                raise _refuse(live) from None
+            aside = path.parent / f".{path.name}.stale.{os.getpid()}"
+            try:
+                os.rename(path, aside)
+            except OSError:
+                continue          # someone moved it first; look again
+            A._unlink_quietly(aside)
+        # Three rounds of losing a race we then found nobody had won. Refusing is
+        # the safe answer: starting anyway is what leaves two daemons behind.
+        raise RuntimeError(f"{path} kept changing hands; no daemon was started")
+    finally:
+        A._unlink_quietly(tmp)
 
 
 def signal_daemon(action, path=PID_PATH):
@@ -532,8 +575,14 @@ def _run_daemon():
     try:
         # Before the model load, not after: the default action for SIGUSR1 is to
         # terminate the process, so a --toggle during a first-run download would
-        # otherwise kill the daemon outright. Installed here, that press waits on
-        # the pump and starts a dictation as soon as the model is ready.
+        # otherwise kill the daemon outright.
+        #
+        # Note what it does *not* buy. The pump thread is live the moment
+        # _deferred builds it, so a press arriving here opens the microphone at
+        # once, next to the load running on this thread — it does not wait for
+        # the model. That is safe rather than intended: A.transcribe_audio calls
+        # A._ensure_model itself and _ensure_model holds A._MODEL_LOCK, so it is
+        # the worker's transcription that waits, not the recording.
         signal.signal(signal.SIGUSR1, _deferred(daemon.toggle, "dictation-signal"))
         print(f"Loading the local {A.lang_name(config.language)} model. The first "
               "run downloads it, which takes a while.", flush=True)

@@ -11,6 +11,8 @@ import contextlib
 import os
 import pathlib
 import signal
+import subprocess
+import sys
 import threading
 import time
 import wave
@@ -512,6 +514,69 @@ def test_a_live_pid_file_blocks_a_second_daemon():
         raise AssertionError("a second daemon wrote over a live pid file")
 
 
+def test_only_one_of_several_daemons_started_at_once_claims_the_pid_file():
+    """Read-then-write let every daemon started in the same instant pass the
+    liveness check before any of them wrote, so all of them believed they owned
+    the file. The damage is not the duplicate: it is that the loser's own
+    `_shutdown` unlinks the *winner's* pid file on the way out, after which a
+    daemon is still running and `--toggle` and `--stop` can no longer find it.
+
+    Real processes, because real pids are the whole point — threads would share
+    ours and read as live, and every child stays alive to the end, so a loser
+    probing the winner always finds a live owner.
+
+    Several rounds, not one: the window the old code loses is a few microseconds
+    wide, so a single round catches read-then-write only about half the time
+    (measured). Each round is its own barrier and its own path, and the children
+    busy-spin on the go marker so they arrive together. Correct code cannot fail
+    this — O_EXCL admits exactly one — while read-then-write has to survive every
+    round to pass."""
+    workers, rounds = 4, 8
+    repo = str(pathlib.Path(dictate.__file__).resolve().parent)
+    child = f"""
+import sys, time, pathlib
+sys.path.insert(0, {repo!r})
+import dictate
+d, n, rounds = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+(d / ("ready-" + n)).write_text("")
+answers = []
+for r in range(rounds):
+    while not (d / ("go-%d" % r)).exists():
+        time.sleep(0)                    # yield, do not oversleep the window
+    try:
+        dictate.write_pid(d / ("pid-%d" % r))
+    except Exception:
+        answers.append("REFUSED")
+    else:
+        answers.append("CLAIMED")
+    (d / ("done-%d-%s" % (r, n))).write_text("")
+print(" ".join(answers))
+"""
+    with workdir("pid") as d:
+        started = [subprocess.Popen(
+            [sys.executable, "-c", child, str(d), str(n), str(rounds)],
+            stdout=subprocess.PIPE, text=True) for n in range(workers)]
+        try:
+            assert _wait_for(lambda: len(list(d.glob("ready-*"))) == workers, 60), \
+                f"only {len(list(d.glob('ready-*')))} of {workers} children started"
+            for r in range(rounds):
+                (d / f"go-{r}").write_text("")
+                assert _wait_for(
+                    lambda: len(list(d.glob(f"done-{r}-*"))) == workers, 60), \
+                    f"round {r}: only {len(list(d.glob(f'done-{r}-*')))} answered"
+            answers = [p.communicate(timeout=60)[0].split() for p in started]
+        finally:
+            for p in started:
+                if p.poll() is None:
+                    p.kill()
+    for r in range(rounds):
+        got = [a[r] for a in answers if len(a) > r]
+        assert len(got) == workers, f"round {r}: {len(got)} of {workers} reported"
+        assert got.count("CLAIMED") == 1, \
+            f"round {r}: {got.count('CLAIMED')} of {workers} claimed it: {got!r}"
+    print(f"  {rounds} rounds x {workers} simultaneous starts, one winner each")
+
+
 def test_toggle_with_no_daemon_exits_non_zero():
     """Exiting zero would make a Shortcuts binding look like it worked."""
     with workdir("pid") as d:
@@ -654,6 +719,23 @@ def test_shutdown_does_not_take_the_capture_away_from_a_running_worker():
         f"the worker did not clean up: {capture.events!r}"
 
 
+def test_no_arguments_runs_the_daemon():
+    """The primary entry point, and the one thing here that cannot be tried for
+    real in a test: _run_daemon takes the pid file, loads a model and puts up an
+    event tap. So the branch is what is pinned — without it `dictate.py` with no
+    arguments prints the usage and exits 2, which is a feature that does not
+    start. _run_daemon is replaced for the duration; nothing of it runs."""
+    called, saved = [], dictate._run_daemon
+    try:
+        dictate._run_daemon = lambda: (called.append("ran"), 3)[1]
+        status = dictate.main([])
+    finally:
+        dictate._run_daemon = saved
+    assert called == ["ran"], "main([]) never reached _run_daemon"
+    assert status == 3, f"main([]) returned {status!r}, not _run_daemon's status"
+    print("  main([]) -> _run_daemon()")
+
+
 def test_an_unknown_argument_is_refused():
     """It must not fall through to the daemon path: a typo would then start a
     daemon, load a model and take the pid file."""
@@ -661,24 +743,29 @@ def test_an_unknown_argument_is_refused():
     assert status != 0, "an unknown argument exited zero"
 
 
-def test_each_flag_reaches_signal_daemon_as_its_action():
+def test_every_action_with_a_signal_has_a_flag_that_reaches_it():
     """The one piece of wiring between the CLI and the signals, and nothing else
     covers it: signal_daemon looks its action up in ACTION_SIGNALS only after
     read_pid, so a flag forwarded with its dashes still on exits non-zero — with a
     message blaming a daemon that is not running — whenever none is running, and
-    raises KeyError when one is. signal_daemon is replaced here so no signal is
-    sent and the real pid file is never read."""
+    raises KeyError when one is.
+
+    Driven off ACTION_SIGNALS rather than off a list written out here, so an action
+    given a signal but no way in from the CLI fails this instead of shipping.
+    signal_daemon is replaced for the duration so no signal is sent and the real
+    pid file is never read."""
     asked, saved = [], dictate.signal_daemon
     try:
         dictate.signal_daemon = lambda action, *a, **kw: (asked.append(action), 7)[1]
-        for flag, action in (("--toggle", "toggle"), ("--stop", "stop")):
-            assert dictate.main([flag]) == 7, \
-                f"main swallowed the status signal_daemon returned for {flag}"
-            assert asked[-1] == action, f"{flag} asked for {asked[-1]!r}"
+        for action in dictate.ACTION_SIGNALS:
+            status = dictate.main([f"--{action}"])
+            assert status == 7, \
+                f"--{action} returned {status!r}, not what signal_daemon gave it"
+            assert asked[-1] == action, f"--{action} asked for {asked[-1]!r}"
     finally:
         dictate.signal_daemon = saved
-    assert set(asked) <= set(dictate.ACTION_SIGNALS), \
-        f"an action with no signal behind it: {asked!r}"
+    assert asked == list(dictate.ACTION_SIGNALS), \
+        f"{len(dictate.ACTION_SIGNALS)} actions have signals, {asked!r} got there"
     print(f"  {asked}")
 
 
