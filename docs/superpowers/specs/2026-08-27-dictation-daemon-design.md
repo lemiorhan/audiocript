@@ -339,9 +339,14 @@ removed, rather than assuming it.
 
 These are not yet established and must be settled early in implementation:
 
-- **`gpt-4.1-mini` exists and is appropriate.** It is a sibling of publishing's
-  default, but no request has been made against it. The first implementation step is
-  one real call. If it is wrong, only the default value changes.
+- ~~**`gpt-4.1-mini` exists and is appropriate.**~~ **Settled 2026-08-27.** One real
+  call was made against it during Task 1. It answered, and it obeyed the minimal
+  contract: given `eee bu pr'i bugun mergeleyemeyiz` it returned
+  `Eee, bu PR'i bugün mergeleyemeyiz.` — punctuation and capitalisation added, nothing
+  else changed. `DEFAULT_MODEL` stays `gpt-4.1-mini`. Note that this machine's `.env`
+  sets `OPENAI_MODEL=gpt-5.5` for publishing, so the two features run on different
+  models by design: publishing pays for a document as long as its input, dictation
+  punctuates two sentences.
 - **Input Monitoring can be granted to the virtualenv interpreter.** Unknown. The
   `--toggle` path exists because of this.
 - **Two processes can hold the same input device.** Whether the TUI recording and a
