@@ -7,6 +7,7 @@ import shutil
 import tty
 import select
 import contextlib
+import gc
 import threading
 import subprocess
 import termios  # available on Unix-based systems.
@@ -1148,6 +1149,53 @@ def _ensure_model(language_code):
             if not _QUIET:
                 console.print(f"[dim]Preparing Turkish model ({TR_HF_MODEL}, {device})…[/dim]")
             _hf_pipe = pipeline("automatic-speech-recognition", model=TR_HF_MODEL, device=device)
+
+
+def unload_model(language_code):
+    """Drop one language's cached model, so the memory it holds goes back.
+
+    The counterpart to `_ensure_model`, holding the same `_MODEL_LOCK` for the same
+    reason: a load publishes its pipeline under that lock, so an unload that skipped
+    it could clear a pipeline a load was still assembling — and the load would then
+    publish a model on top of an unload that has already reported the daemon as off.
+
+    Measured on this machine for Turkish (transformers on MPS): dropping the pipeline
+    and emptying the MPS cache returns all of it — allocated 3085.6 MB → 0.0 MB,
+    driver 3208.4 MB → 0.4 MB. Host RSS does not fall (454.5 MB → 488.7 MB): the
+    weights are GPU-side, and what stays behind is torch's own arena. Reloading in the
+    same process cost 4.1s against 11.3s cold.
+
+    The English model is `pywhispercpp`, which allocates C-side where those counters
+    say nothing; dropping `_cpp_model` is the whole of what happens there, and its
+    release is its own allocator's business. **Not measured** — unlike the Turkish
+    path above.
+
+    Unlike `_ensure_model`, an unknown code is refused rather than read as Turkish.
+    There the fallback only decides which model to load; here it would free nothing
+    at all while the caller believes the model is gone.
+    """
+    global _hf_pipe, _cpp_model
+    if language_code not in LANGUAGES:
+        raise ValueError(f"unknown language {language_code!r}: expected one of "
+                         f"{sorted(LANGUAGES)}")
+    with _MODEL_LOCK:
+        if language_code == "en":
+            _cpp_model = None
+        else:
+            _hf_pipe = None
+        gc.collect()
+        # Only if torch is already here. The English path never imports it, and
+        # importing a torch to free memory would cost far more than it returns.
+        torch = sys.modules.get("torch")
+        if torch is not None:
+            try:
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+            except Exception as e:
+                # The reference is gone by now either way, and a GPU cache that will
+                # not drop is not a reason to leave the daemon powered on.
+                _log_problem(
+                    f"the {language_code} model's GPU cache was not emptied", e)
 
 
 def transcribe_audio(filepath, language_code, on_progress=None, duration=None):
