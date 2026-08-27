@@ -3,7 +3,7 @@ today, and — as later tasks add them — the clipboard, the status sinks, and 
 correction pipeline. Kept apart from dictate.py's state machine and hotkey
 listener so all of it can be tested without audio hardware or a running daemon.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pynput.keyboard import HotKey, Key
 
@@ -26,7 +26,9 @@ class DictationConfig:
     hotkeys: dict
     max_seconds: int
     model: str
-    openai_token: str
+    # repr=False: a traceback, a log line, or a careless print/f-string must not
+    # be able to render (and so leak) the API key held here.
+    openai_token: str = field(repr=False)
     openai_base: str
 
 

@@ -128,11 +128,22 @@ def test_env_defaults_to_publish_env_value():
     publish.env_value = fake_env(OPENAI_API_KEY="sk-from-publish")
     try:
         cfg = dictation.resolve_config({})
-        print(f"  openai_token={cfg.openai_token!r}")
         assert cfg.openai_token == "sk-from-publish", \
             "resolve_config's default did not consult publish.env_value"
+        print("  default env consulted publish.env_value")
     finally:
         publish.env_value = saved
+
+
+def test_openai_token_does_not_appear_in_the_rendered_config():
+    """A traceback, a log line, or a careless print/f-string must not be able to
+    reconstruct the token from a rendered DictationConfig — so a resolved config
+    carrying a recognisable sentinel must not show it in repr() or str()."""
+    cfg = dictation.resolve_config({}, fake_env(OPENAI_API_KEY="sk-SECRET-CANARY"))
+    assert "SECRET-CANARY" not in repr(cfg), repr(cfg)
+    assert "SECRET-CANARY" not in str(cfg), str(cfg)
+    assert cfg.openai_token == "sk-SECRET-CANARY", "the field itself must still work"
+    print("  sentinel absent from repr() and str(); still readable as a field")
 
 
 def test_it_resolves_where_publish_config_would_not():
