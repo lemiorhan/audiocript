@@ -1,4 +1,7 @@
 """Align separately captured microphone and system audio into one time base."""
+import contextlib
+import importlib
+import io
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +18,16 @@ class SubtractProcessor:
         self.calls.append((near.copy(), far.copy()))
         return np.clip(near.astype(np.int32) - far.astype(np.int32),
                        -32768, 32767).astype(np.int16)
+
+
+def _native_aec_available(importer=importlib.import_module):
+    """Report whether the optional native AEC integration can be exercised."""
+    try:
+        importer("pywebrtc_audio")
+    except ImportError:
+        print("  pywebrtc_audio unavailable — native AEC integration test skipped")
+        return False
+    return True
 
 
 def test_mic_prefix_is_removed_when_mic_started_first():
@@ -219,8 +232,24 @@ def test_echo_cancellation_rejects_wrong_wav_format():
         assert not (d / "clean.wav.part").exists()
 
 
+def test_native_aec_guard_skips_when_optional_module_cannot_import():
+    """An unavailable optional module must skip only the native integration test."""
+    def unavailable(module_name):
+        assert module_name == "pywebrtc_audio"
+        raise ModuleNotFoundError("No module named 'pywebrtc_audio'")
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        assert not _native_aec_available(importer=unavailable)
+    assert output.getvalue() == (
+        "  pywebrtc_audio unavailable — native AEC integration test skipped\n")
+
+
 def test_native_aec_reduces_echo_and_preserves_near_end_audio():
     """Disabling AEC or enabling destructive processing would violate its purpose."""
+    if not _native_aec_available():
+        return
+
     sample_rate = 16000
     total_frames = 8 * sample_rate
     rng = np.random.default_rng(20260826)
@@ -289,6 +318,7 @@ if __name__ == "__main__":
          "test_echo_cancellation_rejects_unequal_input_lengths",
          "test_echo_cancellation_rejects_malformed_processor_output",
          "test_echo_cancellation_rejects_wrong_wav_format",
+         "test_native_aec_guard_skips_when_optional_module_cannot_import",
          "test_native_aec_reduces_echo_and_preserves_near_end_audio",
          "test_readme_describes_echo_cancellation"],
         globals())
