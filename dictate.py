@@ -452,12 +452,6 @@ def read_pid(path=PID_PATH):
     return pid
 
 
-def _refuse(live):
-    return RuntimeError(f"a dictation daemon is already running (pid {live}) — "
-                        "use `dictate.py --toggle` to dictate, or "
-                        "`dictate.py --stop` to stop it")
-
-
 def write_pid(path=PID_PATH):
     """Claim `path` for this process, or raise if a daemon is already running.
 
@@ -483,10 +477,25 @@ def write_pid(path=PID_PATH):
       linked file already holds the pid the instant it is visible. Measured: with
       the empty window, four simultaneous starts produced two winners.
 
-    Taking a stale file over renames it aside instead of unlinking it in place.
-    `rename` is atomic too, so the process that succeeds is the only one that
-    removes that file, and a daemon which claimed the name in the meantime is
-    never the thing dropped."""
+    Taking a stale file over is unlink-and-retry, and it keeps one residual race
+    rather than pretending otherwise. Between the `read_pid` that answers "stale"
+    and the unlink below, another daemon can link a live claim over that name; the
+    unlink then removes *its* file and both processes believe they own the pid —
+    the same failure the atomic claim above exists to prevent. Two things have to
+    be true at once for the window to open, and it is microseconds wide: a stale
+    file has to be on disk already, *and* two daemons have to start on top of it in
+    that instant. With no stale file — the ordinary case, however many daemons race
+    — the claim is exact.
+
+    Closing it needs the claim verified after the fact: rename-then-fstat, or an
+    open-and-compare loop. That is real concurrency work on a path already correct
+    for every case the daemon meets, so it is not done here.
+
+    Not worth reintroducing: an earlier version moved the stale file aside with
+    `os.rename` first and called that safer. It is not. `rename` identifies the
+    *name*, not the inode `read_pid` just examined, so it carries a rival's fresh
+    claim off exactly as the unlink does — measured, by inode, before it was
+    deleted."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f".{path.name}.{os.getpid()}"
     tmp.write_text(f"{os.getpid()}\n")
@@ -499,13 +508,11 @@ def write_pid(path=PID_PATH):
                 pass
             live = read_pid(path)
             if live is not None:
-                raise _refuse(live) from None
-            aside = path.parent / f".{path.name}.stale.{os.getpid()}"
-            try:
-                os.rename(path, aside)
-            except OSError:
-                continue          # someone moved it first; look again
-            A._unlink_quietly(aside)
+                raise RuntimeError(
+                    f"a dictation daemon is already running (pid {live}) — use "
+                    "`dictate.py --toggle` to dictate, or `dictate.py --stop` to "
+                    "stop it") from None
+            A._unlink_quietly(path)         # stale; drop it and race for the name
         # Three rounds of losing a race we then found nobody had won. Refusing is
         # the safe answer: starting anyway is what leaves two daemons behind.
         raise RuntimeError(f"{path} kept changing hands; no daemon was started")

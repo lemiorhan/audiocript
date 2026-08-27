@@ -529,8 +529,9 @@ def test_only_one_of_several_daemons_started_at_once_claims_the_pid_file():
     wide, so a single round catches read-then-write only about half the time
     (measured). Each round is its own barrier and its own path, and the children
     busy-spin on the go marker so they arrive together. Correct code cannot fail
-    this — O_EXCL admits exactly one — while read-then-write has to survive every
-    round to pass."""
+    this — `os.link` admits exactly one, and every child outlives every round, so a
+    loser's probe always finds a live owner — while read-then-write has to survive
+    every round to pass."""
     workers, rounds = 4, 8
     repo = str(pathlib.Path(dictate.__file__).resolve().parent)
     child = f"""
