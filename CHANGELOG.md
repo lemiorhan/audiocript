@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **A background dictation daemon.** `./run.sh --dictate` runs a global hotkey
+  (`<cmd>+<alt>+d` by default) that starts and stops a recording from anywhere on
+  macOS; on stop, the audio is transcribed locally, corrected by an OpenAI model,
+  and the result replaces the clipboard contents. Nothing is saved to disk — the
+  audio and its transcript exist only for the duration of one dictation. The
+  language follows the existing Language setting. Two new `config.json` keys:
+  `dictation_hotkeys` (default `{"toggle": "<cmd>+<alt>+d"}`) and
+  `dictation_max_seconds` (default `300`, after which a forgotten recording stops
+  itself). A new environment variable, `DICTATION_MODEL` (default
+  `gpt-4.1-mini`), picks the correction model; `OPENAI_API_KEY` (shared with
+  publishing) is required and the daemon refuses to start without it. Requires
+  the **Input Monitoring** permission for the global hotkey; without it,
+  `dictate.py --toggle`/`--stop` still work from another shell, a macOS
+  Shortcut, or `skhd`. This is not offline: every dictation sends its transcript
+  to OpenAI for correction. Uses no new dependencies.
+
 - **Combined microphone and system-audio captures now receive automatic acoustic
   echo cancellation at finalization.** When the optional `pywebrtc-audio` processor
   is available, speaker leakage is removed from the aligned microphone before the

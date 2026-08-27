@@ -52,6 +52,10 @@ meters, and get a saved transcript. Everything runs on your machine.
 - **Per-language models** for quality (Turkish & English — see [below](#models-per-language)).
 - **Runs on the best device automatically** — CUDA → Apple Silicon (MPS/Metal) → CPU.
 - **Background model pre-warming** so your first transcript is fast.
+- **System-wide dictation (optional)** — a global hotkey records anywhere on
+  macOS and delivers a corrected transcript straight to your clipboard, no app
+  window needed. Sends transcript text to an AI provider, so it is not fully
+  offline — see [below](#dictation-optional-off-by-default).
 - **One command to run** — `./run.sh` sets everything up.
 
 ---
@@ -293,6 +297,58 @@ configure it. Never commit `.env` — it is gitignored for that reason.
 
 ---
 
+### Dictation (optional, off by default)
+
+Audiocript can also run as a background dictation daemon instead of the TUI:
+press a global hotkey anywhere on macOS, speak, press it again, and the
+corrected text lands on your clipboard — no need to bring the app to the
+foreground, or even have it open.
+
+```bash
+./run.sh --dictate
+```
+
+**This is not offline.** The badge at the top of this README is earned by
+transcription, which stays local (the same Whisper models used everywhere else
+in the app). Dictation adds a correction pass on top: every dictation, with no
+length threshold and no separate opt-in beyond starting the daemon, has its
+transcript sent as text to OpenAI. Do not dictate anything you would not want
+to leave your machine — a password included.
+
+Press **`<cmd>+<alt>+d`** (Cmd+Option+D) anywhere to start a recording; press
+it again to stop, correct, and copy the result — it replaces whatever was
+already on your clipboard. Forgetting to press it again is covered too: a
+recording stops itself after `dictation_max_seconds` (5 minutes by default).
+Nothing is written to disk at any point — the audio and its transcript exist
+only for the duration of one dictation and are discarded once the clipboard is
+written.
+
+Dictation transcribes in whichever language is set in **Settings → language**
+— the same setting the rest of the app uses, so a session is Turkish or
+English, never a per-dictation choice.
+
+Two `config.json` keys, both optional:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `dictation_hotkeys` | `{"toggle": "<cmd>+<alt>+d"}` | The hotkey that starts and stops a dictation. |
+| `dictation_max_seconds` | `300` | A recording is stopped automatically after this many seconds. |
+
+It also needs `OPENAI_API_KEY` — the same key set up for
+[publishing](#publishing-transcripts-optional-off-by-default) above, in `.env`
+or the environment — and refuses to start without it. One more optional
+environment variable: `DICTATION_MODEL` (default `gpt-4.1-mini`) picks the
+model used for the correction pass.
+
+Like any global hotkey on macOS, it needs the **Input Monitoring** permission:
+grant it under **System Settings → Privacy & Security → Input Monitoring** to
+the terminal (or Python interpreter) running the daemon, then start it again.
+Without it the daemon still runs, but the hotkey does nothing — use
+`.venv/bin/python dictate.py --toggle` and `--stop` instead, which work with no
+permission at all, from another shell, a macOS Shortcut, or `skhd`.
+
+---
+
 ## Permissions (macOS)
 
 On first use, grant these under **System Settings → Privacy & Security**:
@@ -300,6 +356,9 @@ On first use, grant these under **System Settings → Privacy & Security**:
 - **Microphone** — for recording.
 - **System Audio Recording** — for the tap. If denied (or `swiftc` is missing),
   the app continues mic-only.
+- **Input Monitoring** — only for [dictation](#dictation-optional-off-by-default)'s
+  global hotkey. If denied, the daemon still runs; `--toggle`/`--stop` work
+  without it.
 
 ---
 
@@ -317,6 +376,11 @@ On first use, grant these under **System Settings → Privacy & Security**:
   `.venv/bin/python -m pip install -r requirements-aec.txt`; a native compiler may
   be needed when `pywebrtc-audio` has no wheel for your Python version. Headphones
   are the cleanest way to avoid speaker leakage.
+- **The dictation hotkey does nothing** — grant *Input Monitoring* (see
+  [Permissions](#permissions-macos)) to the terminal or Python interpreter
+  running `./run.sh --dictate`, then start the daemon again. Until then,
+  `.venv/bin/python dictate.py --toggle` (or `--stop`) works without any
+  permission at all.
 
 ---
 
@@ -324,8 +388,11 @@ On first use, grant these under **System Settings → Privacy & Security**:
 
 ```
 audiocript.py                  # the app (TUI + recording + transcription)
+dictate.py                     # the dictation daemon: state machine, hotkey, CLI
+dictation.py                   # dictation config, clipboard, status sinks, correction
 publish.py                     # optional: OpenAI passes + the GitHub commit
-prompts/                       # the two prompts publishing runs a transcript through
+prompts/                       # transcript_prompt.md + documentation_prompt.md
+                                #   (publishing), dictation_prompt.md (dictation)
 mac_audio_tap/
   └── system_audio_tap.swift   # Core Audio process-tap helper (compiled on first run)
 tests/                         # plain scripts; see tests/run_all.py

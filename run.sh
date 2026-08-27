@@ -4,6 +4,7 @@
 # dependencies (when needed), check optional external tools, and launch the app.
 #
 #   ./run.sh
+#   ./run.sh --dictate           # run the dictation daemon instead of the TUI
 #
 # Optional environment variables:
 #   PYTHON=python3.12 ./run.sh   # interpreter to use
@@ -117,5 +118,13 @@ if [ "${SKIP_DEP_CHECK:-0}" != "1" ]; then
   fi
 fi
 
-# 4) Launch the app (pass through any arguments).
-exec "$VPY" audiocript.py "$@"
+# 4) Launch the app (pass through any remaining arguments).
+#    --dictate runs the dictation daemon (dictate.py) instead of the TUI; it is
+#    consumed here so it is never forwarded to audiocript.py, which reads no
+#    arguments at all and would otherwise launch the TUI silently.
+SCRIPT="audiocript.py"
+if [ "${1:-}" = "--dictate" ]; then
+  SCRIPT="dictate.py"
+  shift
+fi
+exec "$VPY" "$SCRIPT" "$@"

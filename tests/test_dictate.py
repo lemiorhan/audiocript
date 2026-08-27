@@ -8,8 +8,10 @@ The doubles come from support, never from test_dictation: importing a test file
 runs its suite and exits, which would look like a pass.
 """
 import contextlib
+import io
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -576,6 +578,28 @@ print(" ".join(answers))
         assert got.count("CLAIMED") == 1, \
             f"round {r}: {got.count('CLAIMED')} of {workers} claimed it: {got!r}"
     print(f"  {rounds} rounds x {workers} simultaneous starts, one winner each")
+
+
+def test_the_launcher_flag_matches_what_signal_daemon_names():
+    """run.sh's --dictate switch and signal_daemon's "no daemon is running"
+    message are two independent spellings of the same flag, and nothing else
+    pins them together — a rename on either side would go silently stale.
+    Extracting both and comparing catches a change made to only one of them."""
+    run_sh = pathlib.Path(dictate.__file__).resolve().parent / "run.sh"
+    text = run_sh.read_text()
+    match = re.search(r'"\$\{1:-\}"\s*=\s*"(--[\w-]+)"', text)
+    assert match, f"run.sh's launcher switch was not found in {run_sh}"
+    launcher_flag = match.group(1)
+
+    with workdir("pid") as d:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            dictate.signal_daemon("toggle", d / "absent.pid")
+    message = out.getvalue()
+    assert launcher_flag in message, (
+        f"run.sh consumes {launcher_flag!r} but the daemon's message says "
+        f"{message.strip()!r}")
+    print(f"  run.sh consumes {launcher_flag!r}, the daemon's message names it too")
 
 
 def test_toggle_with_no_daemon_exits_non_zero():
