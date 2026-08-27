@@ -33,6 +33,12 @@ DEFAULT_MODEL = "gpt-4.1-mini"
 IDLE, RECORDING, PROCESSING = "idle", "recording", "processing"
 POWER_OFF, POWER_LOADING, POWER_ON = "off", "loading", "on"
 
+# Every value of each axis, so a caller — or a test — can cover all of them without
+# naming them. A fourth value added to either tuple widens every scan that iterates
+# it, which is the only way an added state does not go silently unhandled.
+STATES = (IDLE, RECORDING, PROCESSING)
+POWERS = (POWER_OFF, POWER_LOADING, POWER_ON)
+
 
 class ConfigError(Exception):
     """Raised by resolve_config when a configured value cannot be used as given."""
@@ -487,3 +493,123 @@ class History:
             except (ValueError, KeyError, TypeError):
                 continue
         return entries
+
+
+# =============================== The menu model ===============================
+#
+# What the two menus contain, as data. This is the whole of the menu bar's
+# decision-making: menubar.py turns these lists into NSMenu objects and decides
+# nothing. The split is not tidiness — there is no headless AppKit to test against,
+# so anything that branches on power or state has to live on this side of the line to
+# be testable at all.
+
+# How much of a dictation a menu item shows. The user asked for 250 characters. How
+# wide macOS actually draws a title of that length, and where it puts its own
+# ellipsis, is not ours to control; the full text is the item's tooltip and is what a
+# click copies, so nothing is lost to that.
+MENU_PREVIEW_CHARS = 250
+
+# Every action a menu item can carry. A closed set because menubar.py dispatches on
+# these strings: a typo would otherwise produce an item that looks live and silently
+# does nothing, and a test scans this against what the builders below actually offer.
+MENU_ACTIONS = ("power_on", "power_off", "record_toggle", "copy", "reveal", "quit")
+
+# Icon 1 draws the power axis. Three glyphs rather than three colours: the menu bar is
+# monochrome in both appearances, and a filled/hollow distinction survives that.
+POWER_ICONS = {POWER_OFF: "◯", POWER_LOADING: "◌", POWER_ON: "●"}
+
+# Icon 2 draws one dictation's stage, and is dimmed whenever the daemon is not up.
+DICTATION_ICONS = {IDLE: "🎙", RECORDING: "🔴", PROCESSING: "⏳"}
+
+# Said by both menus while the model loads, in the same words on purpose: one name per
+# thing the user is waiting for.
+LOADING_TITLE = "Model yükleniyor…"
+
+
+@dataclass
+class MenuItem:
+    """One row of a menu. `payload` is the full text for a `copy` row and nothing for
+    the rest — the title is cut for reading, and a click must put back everything
+    that was on the clipboard."""
+    title: str
+    action: str = None
+    enabled: bool = True
+    payload: str = None
+    separator: bool = False
+
+
+def _separator():
+    return MenuItem("", separator=True)
+
+
+def menu_preview(text, limit=MENU_PREVIEW_CHARS):
+    """`text` as one line, cut to `limit` characters with an ellipsis if it was cut.
+
+    Whitespace is collapsed because a menu item is a single line: a newline in a title
+    renders as a box or swallows the rest of the row, and dictated text has newlines
+    in it as a matter of course."""
+    one_line = " ".join(text.split())
+    if len(one_line) <= limit:
+        return one_line
+    return one_line[:limit] + "…"
+
+
+def power_icon(power):
+    """Icon 1's title. An unexpected value draws the off glyph rather than raising:
+    this is called from a menu callback, where an exception is a wedged menu."""
+    return POWER_ICONS.get(power, POWER_ICONS[POWER_OFF])
+
+
+def dictation_icon(power, state):
+    """Icon 2's title, and whether it is dimmed.
+
+    Dimmed for every power but ON, whatever the state. An icon that looks live and
+    does nothing is worse than one that says it is asleep."""
+    if power != POWER_ON:
+        return DICTATION_ICONS[IDLE], True
+    return DICTATION_ICONS.get(state, DICTATION_ICONS[IDLE]), False
+
+
+def power_menu(power, state):
+    """Icon 1's menu: start or stop the daemon, and quit.
+
+    Stop and quit are refused while a dictation is running. The invariant itself is in
+    dictate.Daemon.disable — this is the menu saying so in advance rather than
+    offering an item whose click would be turned down."""
+    idle = state == IDLE
+    if power == POWER_OFF:
+        first = MenuItem("Daemon'ı başlat", "power_on")
+    elif power == POWER_ON:
+        first = MenuItem("Daemon'ı durdur", "power_off", enabled=idle)
+    else:
+        first = MenuItem(LOADING_TITLE, enabled=False)
+    return [first, _separator(), MenuItem("Çıkış", "quit", enabled=idle)]
+
+
+
+def dictation_menu(power, state, entries):
+    """Icon 2's menu: the stage, the last dictations, and the log itself.
+
+    `entries` are HistoryEntry objects, newest first — the order History.recent
+    returns and the order the menu shows. The builder takes entries rather than a
+    History so it stays pure: reading the file is the caller's job, and a caller that
+    could not read it has something to say that this cannot guess."""
+    if power == POWER_LOADING:
+        stage = MenuItem(LOADING_TITLE, enabled=False)
+    elif power != POWER_ON:
+        stage = MenuItem("Daemon kapalı", enabled=False)
+    elif state == IDLE:
+        stage = MenuItem("Kaydı başlat", "record_toggle")
+    elif state == RECORDING:
+        stage = MenuItem("Kaydı bitir", "record_toggle")
+    else:
+        stage = MenuItem("İşleniyor…", enabled=False)
+
+    if entries:
+        history = [MenuItem(menu_preview(e.text), "copy", payload=e.text)
+                   for e in entries]
+    else:
+        history = [MenuItem("Henüz dictation yok", enabled=False)]
+
+    return [stage, _separator(), *history, _separator(),
+            MenuItem("Geçmiş dosyasını aç", "reveal")]
