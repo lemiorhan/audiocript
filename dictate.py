@@ -132,7 +132,8 @@ class Daemon:
     """
 
     def __init__(self, config, clipboard, sink, cfg=None,
-                 capture_factory=MicCapture, transcribe=None, deliver=None):
+                 capture_factory=MicCapture, transcribe=None, deliver=None,
+                 history=None, ensure_model=None, unload_model=None):
         self._config = config
         self._clipboard = clipboard
         self._sink = sink
@@ -140,15 +141,139 @@ class Daemon:
         self._capture_factory = capture_factory
         self._transcribe = transcribe or A.transcribe_audio
         self._deliver = deliver or dictation.deliver
+        self._history = history
+        # Injected for the same reason `transcribe` and `deliver` are: no test here
+        # may load or unload a real model.
+        self._ensure_model = ensure_model or A._ensure_model
+        self._unload_model = unload_model or A.unload_model
 
         # `state` is read from anywhere and written only under `_lock`.
         self.state = dictation.IDLE
+        # `power` likewise — and every power_changed report is made *under* the lock
+        # too, unlike the dictation reports. enable() reports LOADING and the loader
+        # thread reports ON; reported outside the lock they can arrive in the other
+        # order, which leaves an icon saying "loading" over a daemon that is up.
+        self.power = dictation.POWER_OFF
+        self._loader = None
         self._lock = threading.Lock()
         self._capture = None
         self._worker = None
         self._timer = None
         # Which recording the live duration timer belongs to; see _leave_recording.
         self._epoch = 0
+
+    # ------------------------------ the power axis ------------------------------
+
+    def enable(self):
+        """Bring the daemon up: load the model, then start accepting recordings.
+
+        Returns as soon as the transition is made. The load runs on a thread of its
+        own because it takes seconds — measured 11.3s cold, 4.1s warm on this machine
+        — and this is called from the AppKit main thread, which has to keep drawing
+        the menu bar while it happens.
+
+        A second call while the daemon is coming up or already up does nothing.
+        A._ensure_model would serialise two loads on its own lock anyway, so the
+        second would be pure waiting behind an icon that already says what is
+        happening."""
+        with self._lock:
+            if self.power != dictation.POWER_OFF:
+                return
+            loader = threading.Thread(target=self._load, name="dictation-model",
+                                      daemon=True)
+            try:
+                loader.start()
+            except Exception as e:
+                # Thread exhaustion. Power has not moved, so the next click retries.
+                A._log_problem("the dictation model loader could not be started", e)
+                self._sink.failed(f"the daemon could not be started: {e}")
+                return
+            # After start(), so a loader that could not start leaves power alone —
+            # and safe in that order because _load reaches for this lock before it
+            # looks at `power`, so it cannot see OFF here and call itself stale.
+            self.power = dictation.POWER_LOADING
+            self._loader = loader
+            self._sink.power_changed(dictation.POWER_LOADING)
+
+    def _load(self):
+        """Load the model, then open the daemon for recordings. The slow half of the
+        power axis, on a thread of its own."""
+        try:
+            self._ensure_model(self._config.language)
+        except BaseException as e:                                     # noqa: BLE001
+            # BaseException for the reason _deferred catches it: this is a thread of
+            # its own, and anything escaping here strands power at LOADING behind an
+            # icon that never resolves, with nothing on screen and nothing in a log.
+            A._log_problem("the dictation model could not be loaded", e)
+            with self._lock:
+                self.power = dictation.POWER_OFF
+                self._sink.power_changed(dictation.POWER_OFF)
+            self._sink.failed(f"the model could not be loaded: {e}")
+            return
+        with self._lock:
+            stale = self.power != dictation.POWER_LOADING
+            if not stale:
+                self.power = dictation.POWER_ON
+                self._sink.power_changed(dictation.POWER_ON)
+        if stale:
+            # disable() arrived while this load was running, and the user has already
+            # been told the daemon is off. Two things go wrong if what the load
+            # produced is left alone: the memory stays resident behind an icon that
+            # says off, and the next enable() finds A._ensure_model already satisfied
+            # and returns without loading anything the user waited for.
+            self._drop_model()
+
+    def disable(self):
+        """Take the daemon down: refuse new recordings, and give the model's memory
+        back. Measured: unloading returns 3085.6 MB of MPS memory.
+
+        Refused while a dictation is in flight. That is the rule this feature was
+        asked for, and it lives here rather than only in the menu's greyed-out item —
+        so it holds for `--toggle`'s door too, and so the invariant below is true
+        rather than merely likely:
+
+        **Power OFF implies state IDLE.** No caller anywhere has to handle "off while
+        recording", because there is no way to reach it."""
+        with self._lock:
+            if self.power == dictation.POWER_OFF:
+                return
+            if self.state != dictation.IDLE:
+                self._sink.failed("a dictation is in progress; the daemon cannot be "
+                                  "stopped until it finishes")
+                return
+            # Whether a load is still in flight decides who drops the model; see
+            # below. Read under the lock, because _load moves it out of LOADING.
+            loading = self.power == dictation.POWER_LOADING
+            self.power = dictation.POWER_OFF
+            self._sink.power_changed(dictation.POWER_OFF)
+        if loading:
+            # Nothing to drop yet, and dropping anyway would be worse than useless:
+            # the load in flight holds A._MODEL_LOCK, which A.unload_model takes, so
+            # this thread — the AppKit main thread — would block for the rest of the
+            # load. Measured: 11.3s for a cold one. _load's own stale path drops what
+            # the load produced, on the loader's thread, the moment it has it.
+            return
+        # Outside the lock: a gc pass and a GPU cache drop are not instant, and with
+        # power already OFF nothing can start a recording behind this call.
+        self._drop_model()
+
+    def _drop_model(self):
+        """Unload the configured language's model, reporting a refusal rather than
+        raising. The reference the daemon held is gone by the time this runs either
+        way, and a model that will not drop is not a reason to leave the daemon on."""
+        try:
+            self._unload_model(self._config.language)
+        except Exception as e:
+            A._log_problem("the dictation model could not be unloaded", e)
+
+    def join_power(self, timeout=None):
+        """Wait for a model load, if one is running. Called by the tests and by the
+        shutdown path, never by the daemon's own threads — the mirror of
+        join_worker."""
+        with self._lock:
+            loader = self._loader
+        if loader is not None:
+            loader.join(timeout)
 
     # ------------------------------- the way in -------------------------------
 
@@ -158,7 +283,13 @@ class Daemon:
         the correction run on a worker thread, because this is called from the
         hotkey listener."""
         with self._lock:
-            if self.state == dictation.IDLE:
+            if self.power != dictation.POWER_ON:
+                # Both doors arrive here. The menu greys its own item out, but
+                # SIGUSR1 from `dictate.py --toggle` reaches this directly, and
+                # opening a microphone with no model behind it would record a
+                # dictation nothing can transcribe.
+                self._sink.failed("the dictation daemon is not running")
+            elif self.state == dictation.IDLE:
                 self._begin_recording()
             elif self.state == dictation.RECORDING:
                 self._begin_processing()

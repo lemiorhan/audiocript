@@ -61,8 +61,15 @@ class StopFailsCapture(FakeCapture):
 
 
 def build(transcript="bir cumle", deliver=None, capture=None, max_seconds=300,
-          transcribe=None, sink=None):
-    """A daemon with every edge faked. Returns (daemon, clipboard, sink, delivered)."""
+          transcribe=None, sink=None, power=dictation.POWER_ON,
+          ensure_model=None, unload_model=None, history=None):
+    """A daemon with every edge faked. Returns (daemon, clipboard, sink, delivered).
+
+    `power` defaults to ON, and gets there through the real `enable()` with the model
+    load faked — a daemon that is off refuses every toggle, and almost every test here
+    drives a dictation. The sink's record is cleared afterwards, so a case that
+    asserts on the exact sequence of reports sees the dictation's moments and not the
+    fixture's two power reports. Pass POWER_OFF to test the power axis itself."""
     FakeCapture.instances = []
     clip, sink, delivered = FakeClipboard(), sink or RecordingSink(), []
     config = dictation.resolve_config(
@@ -78,7 +85,17 @@ def build(transcript="bir cumle", deliver=None, capture=None, max_seconds=300,
     daemon = dictate.Daemon(config, clip, sink, cfg={},
                             capture_factory=capture or FakeCapture,
                             transcribe=transcribe or (lambda wav, lang: transcript),
-                            deliver=deliver or default_deliver)
+                            deliver=deliver or default_deliver,
+                            history=history,
+                            ensure_model=ensure_model or (lambda _language: None),
+                            unload_model=unload_model or (lambda _language: None))
+    if power == dictation.POWER_ON:
+        daemon.enable()
+        daemon.join_power(5)
+        assert daemon.power == dictation.POWER_ON, \
+            f"the fixture could not power the daemon up: {daemon.power!r}"
+        sink.calls.clear()
+        sink.notes.clear()
     return daemon, clip, sink, delivered
 
 
@@ -796,6 +813,294 @@ def test_every_action_with_a_signal_has_a_flag_that_reaches_it():
     assert asked == list(dictate.ACTION_SIGNALS), \
         f"{len(dictate.ACTION_SIGNALS)} actions have signals, {asked!r} got there"
     print(f"  {asked}")
+
+
+# =============================== the power axis ===============================
+
+
+class Loader:
+    """Stands in for audiocript._ensure_model with the timing under the test's
+    control. `block=True` holds the load open until release() is called, so LOADING
+    can be observed rather than raced; `fail` is settable afterwards, so one loader
+    can fail and then succeed."""
+
+    def __init__(self, fail=None, block=False):
+        self.calls = []
+        self.fail = fail
+        self.entered = threading.Event()
+        self._release = threading.Event() if block else None
+
+    def __call__(self, language):
+        self.calls.append(language)
+        self.entered.set()
+        if self._release is not None:
+            assert self._release.wait(10), "the test never released the load"
+        if self.fail is not None:
+            raise self.fail
+
+    def release(self):
+        self._release.set()
+
+
+def build_off(loader=None, unload_model=None, **kw):
+    """A daemon that has not been powered up. Returns (daemon, sink, loader, unloaded).
+
+    `unloaded` records the languages the default unload was asked for; a case that
+    needs the unload to block passes its own `unload_model` and ignores it."""
+    loader = loader or Loader()
+    unloaded = []
+    daemon, _clip, sink, _delivered = build(power=dictation.POWER_OFF,
+                                            ensure_model=loader,
+                                            unload_model=unload_model or unloaded.append,
+                                            **kw)
+    return daemon, sink, loader, unloaded
+
+
+def _powers(sink):
+    return [value for kind, value in sink.calls if kind == "power_changed"]
+
+
+def _reasons(sink):
+    return [text for kind, text in sink.calls if kind == "failed"]
+
+
+def test_enable_reaches_on_through_loading():
+    daemon, sink, loader, _ = build_off(loader=Loader(block=True))
+    assert daemon.power == dictation.POWER_OFF, \
+        f"a new daemon starts at {daemon.power!r}, not off"
+    daemon.enable()
+    assert loader.entered.wait(5), "the load never started"
+    assert daemon.power == dictation.POWER_LOADING, \
+        f"power is {daemon.power!r} while the model is still loading"
+    loader.release()
+    daemon.join_power(5)
+    assert daemon.power == dictation.POWER_ON, \
+        f"power is {daemon.power!r} after the load returned"
+    assert _powers(sink) == [dictation.POWER_LOADING, dictation.POWER_ON], \
+        f"the sink saw {_powers(sink)!r}, in that order"
+    assert loader.calls == ["tr"], f"the model was loaded for {loader.calls!r}"
+    print(f"  {_powers(sink)}")
+
+
+def test_enable_does_not_block_the_caller():
+    """It is called from the AppKit main thread, which has to keep drawing the menu
+    bar while the model loads — measured at 11.3s cold and 4.1s warm."""
+    daemon, _sink, loader, _ = build_off(loader=Loader(block=True))
+    started = time.monotonic()
+    daemon.enable()
+    elapsed = time.monotonic() - started
+    assert loader.entered.wait(5), "the load never started"
+    assert elapsed < 1.0, \
+        f"enable() took {elapsed:.2f}s while the load was still blocked"
+    loader.release()
+    daemon.join_power(5)
+    print(f"  enable() returned in {elapsed * 1000:.0f} ms, load still blocked")
+
+
+def test_a_load_that_raises_returns_to_off_and_is_retryable():
+    """A daemon that cannot come back from a network blip is dead to the user: the
+    icon would say off and no click would ever change it."""
+    logged = []
+    saved = A._log_problem
+    A._log_problem = lambda what, exc=None: logged.append((what, exc))
+    try:
+        loader = Loader(fail=RuntimeError("could not reach huggingface.co"))
+        daemon, sink, _loader, unloaded = build_off(loader=loader)
+        daemon.enable()
+        daemon.join_power(5)
+        assert daemon.power == dictation.POWER_OFF, \
+            f"a failed load left power at {daemon.power!r}"
+        assert any("huggingface" in (text or "") for text in _reasons(sink)), \
+            f"the reason did not reach the user: {sink.calls!r}"
+        assert logged, "the failure was not logged"
+        assert unloaded == [], f"a load that never finished unloaded anyway: {unloaded}"
+        loader.fail = None
+        daemon.enable()
+        daemon.join_power(5)
+        assert daemon.power == dictation.POWER_ON, \
+            f"a second enable() after a failure reached {daemon.power!r}"
+    finally:
+        A._log_problem = saved
+    print(f"  failed, reported, and came back: {_powers(sink)}")
+
+
+def test_enable_is_idempotent():
+    """Two clicks on "Daemon'ı başlat", or a click while the model is loading, must
+    not start a second load — _ensure_model would serialise them on its own lock and
+    the second would be pure waiting."""
+    daemon, _sink, loader, _ = build_off(loader=Loader(block=True))
+    daemon.enable()
+    assert loader.entered.wait(5), "the load never started"
+    daemon.enable()                                   # while LOADING
+    loader.release()
+    daemon.join_power(5)
+    daemon.enable()                                   # while ON
+    daemon.join_power(5)
+    assert loader.calls == ["tr"], \
+        f"the model was loaded {len(loader.calls)} times: {loader.calls!r}"
+
+
+def test_disable_unloads_the_configured_language():
+    daemon, sink, _loader, unloaded = build_off()
+    daemon.enable()
+    daemon.join_power(5)
+    daemon.disable()
+    assert daemon.power == dictation.POWER_OFF, \
+        f"disable() left power at {daemon.power!r}"
+    assert unloaded == ["tr"], \
+        f"unload_model was called with {unloaded!r}, not the configured language"
+    assert _powers(sink)[-1] == dictation.POWER_OFF, _powers(sink)
+    print(f"  {_powers(sink)}, unloaded {unloaded}")
+
+
+def test_disable_is_refused_while_recording():
+    """The rule the user asked for: the daemon cannot be stopped before the recording
+    ends. Enforced here rather than only by a greyed-out menu item, so it holds for
+    the CLI and for any other caller too."""
+    daemon, sink, _loader, unloaded = build_off()
+    daemon.enable()
+    daemon.join_power(5)
+    daemon.toggle()
+    assert daemon.state == dictation.RECORDING, f"state {daemon.state!r}"
+    daemon.disable()
+    assert daemon.power == dictation.POWER_ON, \
+        f"the daemon was stopped mid-recording: power {daemon.power!r}"
+    assert unloaded == [], f"the model was unloaded mid-recording: {unloaded!r}"
+    assert _reasons(sink), f"the user was not told why: {sink.calls!r}"
+    daemon.toggle()
+    daemon.join_worker(timeout=5)
+    print(f"  refused with: {_reasons(sink)[-1]!r}")
+
+
+def test_disable_is_refused_while_processing():
+    """The worse half of the same rule: here the text has already been spoken and is
+    being transcribed, so stopping would throw away work the user is waiting for."""
+    gate = threading.Event()
+
+    def slow_deliver(text, cfg, clipboard, status_sink, **kw):
+        gate.wait(5)
+        clipboard.copy(text)
+        return dictation.Delivery(dictation.CORRECTED, text, "")
+
+    daemon, sink, _loader, unloaded = build_off(deliver=slow_deliver)
+    daemon.enable()
+    daemon.join_power(5)
+    daemon.toggle()
+    daemon.toggle()
+    assert _wait_for(lambda: daemon.state == dictation.PROCESSING, 5), \
+        f"state {daemon.state!r}"
+    daemon.disable()
+    assert daemon.power == dictation.POWER_ON, \
+        f"the daemon was stopped mid-transcription: power {daemon.power!r}"
+    assert unloaded == [], f"the model was unloaded under the worker: {unloaded!r}"
+    assert _reasons(sink), f"the user was not told why: {sink.calls!r}"
+    gate.set()
+    daemon.join_worker(timeout=5)
+
+
+def test_disable_is_idempotent():
+    daemon, _sink, _loader, unloaded = build_off()
+    daemon.disable()
+    daemon.disable()
+    assert unloaded == [], f"a daemon that was never up unloaded {unloaded!r}"
+    assert daemon.power == dictation.POWER_OFF, daemon.power
+
+
+def test_toggle_is_refused_while_the_daemon_is_down():
+    """Both doors, both powers. The menu greys its item out, but SIGUSR1 from
+    `dictate.py --toggle` reaches toggle() directly and must be told the same thing
+    instead of opening a microphone with no model behind it."""
+    for power, arrange in (("off", lambda d, l: None),
+                           ("loading", lambda d, l: (d.enable(),
+                                                     l.entered.wait(5)))):
+        loader = Loader(block=True)
+        daemon, sink, _loader, _ = build_off(loader=loader)
+        arrange(daemon, loader)
+        before = len(FakeCapture.instances)
+        daemon.toggle()
+        assert len(FakeCapture.instances) == before, \
+            f"a microphone was opened with the daemon {power}"
+        assert daemon.state == dictation.IDLE, \
+            f"state {daemon.state!r} after a refused toggle ({power})"
+        assert _reasons(sink), f"the user was not told ({power}): {sink.calls!r}"
+        loader.release()
+        daemon.join_power(5)
+    print("  refused from off and from loading, both reported")
+
+
+def test_power_off_implies_idle():
+    """The invariant the rest of the code is allowed to assume: there is no way to
+    reach OFF while a dictation is in flight, because disable() refuses. Nothing has
+    to handle "off while recording"."""
+    daemon, _sink, _loader, _ = build_off()
+    daemon.enable()
+    daemon.join_power(5)
+    daemon.toggle()
+    daemon.disable()                     # refused: RECORDING
+    assert daemon.power == dictation.POWER_ON, daemon.power
+    daemon.toggle()
+    daemon.join_worker(timeout=5)
+    assert daemon.state == dictation.IDLE, daemon.state
+    daemon.disable()                     # accepted: IDLE
+    assert (daemon.power, daemon.state) == (dictation.POWER_OFF, dictation.IDLE), \
+        f"({daemon.power!r}, {daemon.state!r})"
+
+
+def test_a_disable_during_the_load_does_not_leave_the_model_resident():
+    """The race the two axes make possible: the user clicks start, changes their mind
+    while the model is still loading, and the load then finishes into a daemon whose
+    icon says off. Without this the 3 GB stays resident behind an off icon, and the
+    next enable() would find _ensure_model already satisfied and never reload."""
+    loader = Loader(block=True)
+    daemon, sink, _loader, unloaded = build_off(loader=loader)
+    daemon.enable()
+    assert loader.entered.wait(5), "the load never started"
+    daemon.disable()
+    assert daemon.power == dictation.POWER_OFF, \
+        f"disable() during a load left power at {daemon.power!r}"
+    loader.release()
+    daemon.join_power(5)
+    assert daemon.power == dictation.POWER_OFF, \
+        f"the finished load powered the daemon up behind the user: {daemon.power!r}"
+    assert unloaded == ["tr"], (
+        f"the model was unloaded {len(unloaded)} times ({unloaded!r}); exactly one "
+        "drop belongs here, from _load's stale path — disable() must not take "
+        "A._MODEL_LOCK while the load in flight is holding it, or it blocks the "
+        "AppKit main thread for the rest of the load")
+    assert _powers(sink)[-1] == dictation.POWER_OFF, _powers(sink)
+    print(f"  {_powers(sink)}, unloaded {unloaded}")
+
+
+def test_disable_does_not_wait_for_a_load_in_flight():
+    """A.unload_model takes A._MODEL_LOCK, and the load in flight is holding it. A
+    disable() that dropped the model itself would therefore block until the load
+    finished — on the AppKit main thread, for the 11.3s a cold load takes. The drop
+    belongs to _load's stale path instead, on the loader's own thread.
+
+    The count in the test above is the visible half of this; this case pins the timing
+    directly, with an unload that blocks if it is ever reached from here."""
+    loader = Loader(block=True)
+    reached_unload = threading.Event()
+    release_unload = threading.Event()
+
+    def blocking_unload(_language):
+        reached_unload.set()
+        assert release_unload.wait(10), "the test never released the unload"
+
+    daemon, _sink, _loader, _unloaded = build_off(loader=loader,
+                                                 unload_model=blocking_unload)
+    daemon.enable()
+    assert loader.entered.wait(5), "the load never started"
+    started = time.monotonic()
+    daemon.disable()
+    elapsed = time.monotonic() - started
+    assert not reached_unload.is_set(), \
+        "disable() dropped the model while the load in flight held A._MODEL_LOCK"
+    assert elapsed < 1.0, f"disable() took {elapsed:.2f}s during a load"
+    print(f"  disable() returned in {elapsed * 1000:.0f} ms, load still blocked")
+    loader.release()
+    release_unload.set()
+    daemon.join_power(5)
 
 
 if __name__ == "__main__":
