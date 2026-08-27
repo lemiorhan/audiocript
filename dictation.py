@@ -3,9 +3,12 @@ the clipboard, the status sinks, and the correction pipeline that decides what
 reaches the clipboard. Kept apart from dictate.py's state machine and hotkey
 listener so all of it can be tested without audio hardware or a running daemon.
 """
+import json
 import pathlib
 import subprocess
+import threading
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from pynput.keyboard import HotKey, Key
 
@@ -379,3 +382,108 @@ def deliver(transcript, config, clipboard, sink, complete=None):
     clipboard.copy(corrected)
     sink.done(corrected)
     return Delivery(CORRECTED, corrected)
+
+
+# ================================= The history =================================
+
+# Beside the pid file the daemon already writes there.
+HISTORY_PATH = pathlib.Path("~/.audiocript/dictations.jsonl").expanduser()
+
+# How many entries the menu lists.
+HISTORY_ITEMS = 10
+
+# How much of the end of the log `recent` reads. The file is unbounded and the menu
+# reads it every time it opens, so what is bounded is the read rather than the file.
+# At the length a menu entry shows, this window holds several hundred dictations —
+# far more than HISTORY_ITEMS ever asks for.
+HISTORY_TAIL_BYTES = 256 * 1024
+
+
+@dataclass
+class HistoryEntry:
+    """One delivered dictation, read back from the log."""
+    at: str                    # local time with offset, seconds resolution
+    status: str                # CORRECTED, UNCORRECTED or SKIPPED
+    text: str                  # exactly what reached the clipboard
+
+
+class History:
+    """The log of what reached the clipboard: one JSON object per line, appended.
+
+    The point is that a dictation outlives the clipboard. Every delivered text used to
+    live exactly as long as it took the next one to replace it; here the newest ten
+    are one click away and the whole log is a file the user can grep.
+
+    Written with `ensure_ascii=False`: the primary language here is Turkish, and a log
+    full of `\u011f` is a log nobody reads. Local time with an offset rather than UTC,
+    for the same reason — it is read by the person who spoke it.
+
+    `append` swallows its failures and `recent` does not, deliberately. By the time
+    append runs, the text is already on the clipboard and the user has been told; a
+    log that cannot be written must not cost them the dictation. But a `recent` that
+    answered `[]` for an unreadable file would look exactly like "no dictations yet"
+    in the menu, which is the one thing the menu must not say wrongly — so the layer
+    that draws the menu decides what to show, and gets the error to decide with.
+
+    `tail_bytes` is a parameter so a test can shrink the window and observe that the
+    older entries are genuinely not read, without timing anything.
+    """
+
+    def __init__(self, path=HISTORY_PATH, tail_bytes=HISTORY_TAIL_BYTES):
+        self._path = pathlib.Path(path)
+        self._tail_bytes = tail_bytes
+        # The worker thread appends while the main thread reads the menu, so both
+        # ends of the file go through one lock. Without it two appends can land
+        # inside each other, and the line that destroys is a dictation the user has
+        # already spoken.
+        self._lock = threading.Lock()
+
+    @property
+    def path(self):
+        """Where the log is — for the menu item that reveals it in Finder."""
+        return self._path
+
+    def append(self, text, status):
+        """Add one entry. Never raises: see the class docstring."""
+        line = json.dumps(
+            {"at": datetime.now().astimezone().isoformat(timespec="seconds"),
+             "status": status, "text": text}, ensure_ascii=False) + "\n"
+        try:
+            with self._lock:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._path, "a", encoding="utf-8") as f:
+                    f.write(line)
+        except Exception as e:
+            A._log_problem(f"a dictation could not be added to {self._path}", e)
+
+    def recent(self, limit=HISTORY_ITEMS):
+        """The newest `limit` entries, newest first; `[]` when there is no log yet.
+
+        Anything else that goes wrong is raised, not swallowed. A line that will not
+        parse costs that line and nothing more — a file a user can open can hold
+        anything, and the last line of a file being appended to is routinely half
+        written."""
+        try:
+            with self._lock:
+                start = max(0, self._path.stat().st_size - self._tail_bytes)
+                with open(self._path, "rb") as f:
+                    f.seek(start)
+                    block = f.read()
+        except FileNotFoundError:
+            return []
+        lines = block.split(b"\n")
+        if start:
+            del lines[0]              # the window opened in the middle of a line
+        entries = []
+        for line in reversed(lines):
+            if len(entries) >= limit:
+                break
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+                entries.append(HistoryEntry(at=entry["at"], status=entry["status"],
+                                            text=entry["text"]))
+            except (ValueError, KeyError, TypeError):
+                continue
+        return entries

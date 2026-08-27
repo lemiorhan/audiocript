@@ -8,12 +8,14 @@ ever touching a real .env. Every provider call goes to a FakeAPI on localhost or
 to an address with nothing listening, so no test can spend a real API key.
 """
 import inspect
+import json
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 
-from support import A, run, fake_env, FakeClipboard, RecordingSink
+from support import A, run, fake_env, FakeClipboard, RecordingSink, workdir
 from test_publish import FakeAPI, completion
 
 import dictation
@@ -640,6 +642,202 @@ def test_the_prompt_path_does_not_depend_on_the_working_directory():
         os.chdir(saved)
     assert RAW in body, "the prompt did not render from another directory"
     print(f"  the prompt rendered from {tempfile.gettempdir()}")
+
+
+# ================================ the history ================================
+
+
+def _lines(path):
+    """Every line of the log, parsed. Individually, so one bad line is visible as
+    that line rather than as the whole file being unreadable."""
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+def test_one_line_per_append():
+    with workdir("history-append") as home:
+        path = home / "dictations.jsonl"
+        history = dictation.History(path)
+        history.append("Bir.", dictation.CORRECTED)
+        history.append("İki.", dictation.UNCORRECTED)
+        history.append("Üç.", dictation.SKIPPED)
+        entries = _lines(path)
+        assert len(entries) == 3, f"three appends left {len(entries)} lines"
+        for entry in entries:
+            assert set(entry) == {"at", "status", "text"}, \
+                f"unexpected shape: {sorted(entry)}"
+        assert [e["status"] for e in entries] == [
+            dictation.CORRECTED, dictation.UNCORRECTED, dictation.SKIPPED], entries
+        print(f"  {[e['text'] for e in entries]}")
+
+
+def test_turkish_survives_the_round_trip():
+    """A log full of \\u011f is a log nobody greps. ensure_ascii=False is the point,
+    and the raw bytes are what proves it — a json.loads round trip would pass either
+    way."""
+    spoken = "Toplantıyı yarına alalım, şimdi çıkıyorum. ĞÜŞİÖÇ ığüşöç"
+    with workdir("history-turkish") as home:
+        path = home / "dictations.jsonl"
+        dictation.History(path).append(spoken, dictation.CORRECTED)
+        assert _lines(path)[0]["text"] == spoken, "the text did not round trip"
+        raw = path.read_bytes()
+        assert "ığüşöç".encode("utf-8") in raw, \
+            "the file escaped its non-ASCII characters instead of writing them"
+        assert b"\\u" not in raw, f"the file holds escape sequences: {raw!r}"
+        print(f"  {len(raw)} bytes, readable as written")
+
+
+def test_the_parent_directory_is_created():
+    """~/.audiocript exists only because the daemon made it; a fresh machine has
+    neither it nor the log."""
+    with workdir("history-mkdir") as home:
+        path = home / "not" / "there" / "dictations.jsonl"
+        dictation.History(path).append("Bir.", dictation.CORRECTED)
+        assert path.exists(), f"{path} was not created"
+
+
+def test_recent_returns_the_newest_first():
+    """The menu lists the newest dictation at the top: it is the one the user is most
+    likely to want back."""
+    with workdir("history-order") as home:
+        history = dictation.History(home / "dictations.jsonl")
+        for i in range(5):
+            history.append(f"dictation {i}", dictation.CORRECTED)
+        texts = [e.text for e in history.recent()]
+        assert texts == [f"dictation {i}" for i in reversed(range(5))], texts
+        print(f"  {texts}")
+
+
+def test_recent_honours_the_limit():
+    with workdir("history-limit") as home:
+        history = dictation.History(home / "dictations.jsonl")
+        for i in range(25):
+            history.append(f"dictation {i:02d}", dictation.CORRECTED)
+        entries = history.recent(3)
+        assert [e.text for e in entries] == ["dictation 24", "dictation 23",
+                                             "dictation 22"], [e.text for e in entries]
+        assert len(history.recent()) == dictation.HISTORY_ITEMS, \
+            f"the default limit is not HISTORY_ITEMS: {len(history.recent())}"
+
+
+def test_an_unparseable_line_is_skipped():
+    """Anything can end up in a file a user can open. One bad line must cost that
+    line, not the whole history."""
+    with workdir("history-garbage") as home:
+        path = home / "dictations.jsonl"
+        history = dictation.History(path)
+        history.append("Bir.", dictation.CORRECTED)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("this is not json at all\n")
+        history.append("İki.", dictation.CORRECTED)
+        texts = [e.text for e in history.recent()]
+        assert texts == ["İki.", "Bir."], f"the garbage line was not skipped: {texts}"
+        print(f"  survived a garbage line: {texts}")
+
+
+def test_a_truncated_final_line_is_survived():
+    """The normal thing to find in a file being appended to when the process died
+    mid-write. The complete entries before it are still the user's history."""
+    with workdir("history-truncated") as home:
+        path = home / "dictations.jsonl"
+        history = dictation.History(path)
+        for i in range(3):
+            history.append(f"dictation {i}", dictation.CORRECTED)
+        raw = path.read_bytes()
+        last = raw.rfind(b"\n")                  # newline ending the third line
+        previous = raw.rfind(b"\n", 0, last)     # newline ending the second
+        path.write_bytes(raw[:previous + 21])    # two whole lines + 20 B of the third
+        texts = [e.text for e in history.recent()]
+        assert texts == ["dictation 1", "dictation 0"], \
+            f"a truncated tail cost more than its own line: {texts}"
+        print(f"  {texts} survived a truncated last line")
+
+
+def test_a_missing_file_reads_empty():
+    """The menu asks for the history before the first dictation exists. Reading must
+    not create the file either — an empty log on disk is a lie about what happened."""
+    with workdir("history-missing") as home:
+        path = home / "dictations.jsonl"
+        assert dictation.History(path).recent() == [], "a missing log read non-empty"
+        assert not path.exists(), "reading the history created the file"
+
+
+def test_only_the_tail_is_read():
+    """The log is unbounded and the menu reads it every time it opens, so recent()
+    must not scale with the whole file.
+
+    Pinned by shrinking the window rather than by timing anything: with a window that
+    holds only the last few lines, the older ones are provably not read, because they
+    do not come back."""
+    with workdir("history-tail") as home:
+        path = home / "dictations.jsonl"
+        history = dictation.History(path, tail_bytes=300)
+        for i in range(40):
+            history.append(f"dictation number {i:03d}", dictation.CORRECTED)
+        size = path.stat().st_size
+        assert size > 300 * 4, f"the fixture is too small to prove anything: {size} B"
+        entries = history.recent(40)
+        assert entries, "the tail read returned nothing at all"
+        assert len(entries) < 40, (
+            f"all {len(entries)} entries came back from a {size} B file with a 300 B "
+            "window, so the whole file was read")
+        assert entries[0].text == "dictation number 039", \
+            f"the newest entry is not first: {entries[0].text!r}"
+        print(f"  {len(entries)} of 40 entries, from the last 300 B of {size} B")
+
+
+def test_a_write_failure_is_swallowed():
+    """The text is already on the clipboard by the time the log is written. Losing the
+    log entry must not cost the dictation, and must not be silent either."""
+    logged = []
+    saved = A._log_problem
+    A._log_problem = lambda what, exc=None: logged.append((what, exc))
+    try:
+        with workdir("history-unwritable") as home:
+            blocker = home / "blocker"
+            blocker.write_text("not a directory")
+            dictation.History(blocker / "dictations.jsonl").append(
+                "Bir.", dictation.CORRECTED)
+    finally:
+        A._log_problem = saved
+    assert len(logged) == 1, f"the failure was not logged exactly once: {logged}"
+    print(f"  swallowed and logged: {logged[0][0]}")
+
+
+def test_a_read_failure_is_not_swallowed():
+    """The counterpart decision. An unreadable log returning [] would look exactly
+    like "no dictations yet" in the menu, which is the one thing the menu must not
+    say wrongly — so the menu layer decides what to show, not History."""
+    with workdir("history-unreadable") as home:
+        path = home / "dictations.jsonl"
+        path.mkdir()                     # a directory where a file belongs
+        try:
+            dictation.History(path).recent()
+        except OSError as e:
+            print(f"  raised, as it should: {type(e).__name__}")
+            return
+        raise AssertionError("an unreadable log read as an empty history")
+
+
+def test_concurrent_appends_do_not_interleave():
+    """The worker thread appends while the main thread reads the menu. Two appends
+    landing in the middle of each other would leave a line no parser can read — and
+    the entry it destroyed would be a dictation the user had already spoken."""
+    with workdir("history-threads") as home:
+        path = home / "dictations.jsonl"
+        history = dictation.History(path)
+        threads = [threading.Thread(
+            target=lambda n=n: [history.append(f"thread {n} line {i} " + "x" * 200,
+                                               dictation.CORRECTED)
+                                for i in range(20)])
+                   for n in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(20)
+        entries = _lines(path)           # raises if any single line is unparseable
+        assert len(entries) == 8 * 20, f"{len(entries)} of 160 appends survived"
+        print(f"  {len(entries)} lines from 8 threads, every one parseable")
 
 
 if __name__ == "__main__":
