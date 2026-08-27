@@ -721,6 +721,8 @@ The pid-file tests each run inside `workdir("pid")` — add it to the file's `su
 | `test_a_stale_pid_file_reads_as_absent_and_does_not_block` | a file holding `"999999"` → `read_pid` is `None`, and `write_pid` succeeds and then reads back as this process |
 | `test_a_live_pid_file_blocks_a_second_daemon` | after `write_pid`, a second `write_pid` on the same path raises |
 | `test_toggle_with_no_daemon_exits_non_zero` | `signal_daemon("toggle", d / "absent.pid") != 0` — exiting zero would make a Shortcuts binding look like it worked |
+| `test_the_listener_callback_does_not_wait_for_the_toggle` | a callback wired to a toggle that blocks returns promptly — a slow callback gets the event tap disabled, and pynput never re-enables it |
+| `test_a_toggle_that_raises_does_not_kill_the_hotkey` | after a toggle raises, a second hotkey event is still delivered and acted on |
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -731,6 +733,15 @@ The pid-file tests each run inside `workdir("pid")` — add it to the file's `su
 Expected: the new tests FAIL with `AttributeError` on `dictate.check_listener` and friends; Task 4's tests still PASS.
 
 - [ ] **Step 3: Implement the listener and the permission check**
+
+**Two requirements Task 4's review chain produced, which nothing in this task's original text carried.** Both are the same silent failure — the hotkey stops working for the rest of the session with nothing in any log — reached by two different doors:
+
+1. **The toggle must not run on the `pynput` callback thread.** `pynput` delivers hotkeys on a CGEventTap callback and calls the registered callback synchronously. `Daemon.toggle` takes a lock that a status report can hold for up to `2 × dictation.NOTIFY_TIMEOUT_SECONDS`, and macOS disables an event tap whose callback is too slow. Verified in `pynput/_util/darwin.py`: `CGEventTapEnable(tap, True)` is called exactly once, at listener startup, and there is no handling for a disabled tap anywhere in the file — so a tap macOS switches off is never switched back on, `IS_TRUSTED` stays true, the listener stays alive, and the hotkey is simply dead. The listener callback must hand the event to a queue or a short-lived thread and return immediately.
+2. **The thread that does run the toggle must survive anything it raises.** `Daemon._begin_recording`'s trailing `sink.recording()` is deliberately outside its guard, so `toggle` can raise on the recording path. An uncaught exception in the queue thread kills the hotkey exactly as silently as a disabled tap does.
+
+Both get a test. The first is pinned by asserting the listener's callback returns without waiting for the toggle; the second by a `toggle` that raises and a hotkey that still works afterwards.
+
+Note also that Task 4 marked its worker and timer threads `daemon=True`, so shutdown drains a dictation in flight only if this task's `main` calls `join_worker` itself.
 
 - `build_listener` maps each of `config.hotkeys` to its callback and returns the constructed listener **without starting it**. `hotkeys_class` is a parameter purely so the tests above can watch what was registered; no real event tap is created in a test.
 - `check_listener` is called after `start()` and `wait()`. It returns `None` when `IS_TRUSTED` and `is_alive()` are both true, otherwise the warning. Both signals are needed: `IS_TRUSTED` comes from `AXIsProcessTrusted()` at the top of the darwin backend's `_run`, while a tap that fails for another reason marks itself ready and exits its thread.
