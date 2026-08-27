@@ -16,7 +16,8 @@ recordings folder.
 A new long-lived process (`dictate.py`) that reuses Audiocript's existing capture and
 transcription code by importing it. The full-screen TUI in `audiocript.py` is not
 changed; only `run.sh` gains a `--dictate` switch so the daemon can be launched
-without naming the virtualenv's interpreter.
+without naming the virtualenv's interpreter. `config.json` gains keys the daemon reads
+and the TUI ignores.
 
 **One language at a time.** The daemon reads the language from the existing
 `language` key in `config.json` and warms exactly one model. There is no per-hotkey
@@ -136,33 +137,62 @@ still lives in one place.
 
 ## Configuration
 
-The language comes from `config.json`'s existing `language` key, the same one the TUI's
-Settings screen writes. It currently defaults to `tr` when the key is absent. A
-consequence worth stating: switching the TUI language switches dictation too. That is
-the intended single-language behaviour.
+Configuration is split along the line the project already uses: `config.json` holds
+user preferences, `.env` holds provider credentials and provider settings.
 
-Everything else is read through `publish.env_value`, so an exported variable wins over
-`.env`:
+### Preferences — `config.json`
+
+The language comes from the existing `language` key, the same one the TUI's Settings
+screen writes. It currently defaults to `tr` when the key is absent. A consequence
+worth stating: switching the TUI language switches dictation too. That is the intended
+single-language behaviour.
+
+Two keys are added, read through `audiocript.load_config`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `dictation_hotkeys` | `{"toggle": "<cmd>+<alt>+d"}` | Hotkey combinations, by action |
+| `dictation_max_seconds` | `300` | Upper bound on one recording |
+
+`dictation_hotkeys` is an object rather than a single string so that a second binding —
+a cancel key, for instance — is a new entry rather than a schema change. Only `toggle`
+is read in this change; an unrecognised action name is reported at startup rather than
+ignored, since a silently dead hotkey is indistinguishable from a missing permission.
+
+Each combination is passed to `pynput`'s own syntax unchanged: modifiers in angle
+brackets, joined by `+`. `keyboard.HotKey.parse` raises `ValueError` on anything it
+does not understand (`cmd+alt+d` and `<zort>+d` both fail), so an unusable combination
+is caught at startup with the syntax explained, never at the moment the user first
+presses it.
+
+**At least one modifier is required.** `parse` accepts a bare `d`, which would fire on
+every `d` typed anywhere on the machine. A combination with no modifier is refused.
+
+A `language` value outside `audiocript.LANGUAGES` is refused the same way. Falling back
+to a default would transcribe with a model the user did not ask for and blame the
+microphone for the result.
+
+`dictation_max_seconds` exists because a forgotten second keypress otherwise records
+until the disk fills. Reaching the bound stops the capture and processes it exactly as
+a keypress would, and the notification says the limit was reached rather than
+pretending the user stopped it.
+
+These keys are edited in the file. Adding rows to the TUI's Settings screen would mean
+changing `audiocript.py`, which this design keeps out of scope; it is a small, separate
+change once the daemon works.
+
+### Provider — `.env` or the environment
+
+Read through `publish.env_value`, so an exported variable wins over `.env`:
 
 | Variable | Required | Default |
 |---|---|---|
 | `OPENAI_API_KEY` | yes | — (shared with publishing) |
 | `DICTATION_MODEL` | no | `gpt-4.1-mini` |
-| `DICTATION_HOTKEY` | no | `<cmd>+<alt>+d` |
-| `DICTATION_MAX_SECONDS` | no | `300` |
 
-`DICTATION_MODEL` exists because publishing's default is chosen for documents as long
-as their input; punctuating two sentences should not pay for that. The hotkey string is
-passed to `pynput` unchanged, in its own syntax.
-
-A `language` value outside `audiocript.LANGUAGES` is refused at startup, naming the
-values that are accepted. Falling back to a default would transcribe with a model the
-user did not ask for and blame the microphone for the result.
-
-A recording also has an upper bound of `DICTATION_MAX_SECONDS` (default 300). A
-forgotten second keypress otherwise records until the disk fills. Reaching the bound
-stops the capture and processes it exactly as a keypress would, and the notification
-says the limit was reached rather than pretending the user stopped it.
+`DICTATION_MODEL` sits here beside the existing `OPENAI_MODEL` rather than in
+`config.json`: publishing's default is chosen for documents as long as their input, and
+punctuating two sentences should not pay for that.
 
 ## Correction Contract
 
@@ -217,7 +247,10 @@ The clipboard is likewise behind a small interface, so tests never shell out.
 | A daemon is already running (PID file) | The second copy explains and exits. |
 | `--toggle` or `--stop` with no daemon running | Say so and exit non-zero, rather than exiting silently as if it worked. |
 | `language` not in `audiocript.LANGUAGES` | Refuse to start; name the accepted values. |
-| Recording reached `DICTATION_MAX_SECONDS` | Stop and process it; the notification says the limit was reached. |
+| A hotkey combination `HotKey.parse` rejects | Refuse to start; show the offending value and the expected syntax. |
+| A hotkey combination with no modifier | Refuse to start; explain that it would fire on every such keypress. |
+| An unknown action name in `dictation_hotkeys` | Refuse to start; name the actions that are understood. |
+| Recording reached `dictation_max_seconds` | Stop and process it; the notification says the limit was reached. |
 
 No failure leaves the state machine outside IDLE, and no failure leaves a temporary
 directory behind.
@@ -247,7 +280,11 @@ python dictate.py --stop    # ask the running daemon to exit
 9. No dictation leaves a file behind, in the recordings folder or in the temporary one.
 10. A recording left running stops itself at the configured bound and the clipboard
     still receives what was said up to that point.
-11. The TUI behaves exactly as before; `tests/run_all.py` still passes.
+11. Changing `dictation_hotkeys.toggle` in `config.json` and restarting the daemon
+    makes the new combination drive dictation and the old one do nothing.
+12. An unusable hotkey or language value stops the daemon at startup with a message
+    that names the offending value.
+13. The TUI behaves exactly as before; `tests/run_all.py` still passes.
 
 ## Testing
 
@@ -274,6 +311,10 @@ Each of these must fail if the line it protects is removed:
 9. A completed dictation leaves no temporary directory.
 10. A `language` value outside `LANGUAGES` is refused at startup.
 11. Reaching the duration bound stops the capture and processes what was captured.
+12. `dictation_hotkeys.toggle` from `config.json` is the combination actually
+    registered, and its absence falls back to the documented default.
+13. A combination `HotKey.parse` rejects, and a combination with no modifier, are both
+    refused at startup rather than registered.
 
 The `mutation-gate` skill is used to prove each of these fails when its subject is
 removed, rather than assuming it.
