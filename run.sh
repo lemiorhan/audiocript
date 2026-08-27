@@ -17,6 +17,7 @@ cd "$(dirname "$0")"
 PYTHON="${PYTHON:-python3}"
 VENV=".venv"
 REQ="requirements.txt"
+AEC_REQ="requirements-aec.txt"
 STAMP="$VENV/.requirements.sha"
 MIN_PY="3.12"                   # minimum supported Python (see README Requirements)
 
@@ -78,12 +79,16 @@ VPY="$VENV/bin/python"
 require_python "$VPY" \
   "The existing $VENV was built with it; remove it (rm -rf $VENV) and re-run."
 
-# 2) Install Python dependencies only when requirements.txt changed (or first run).
-NEWSHA="$(shasum "$REQ" | awk '{print $1}')"
+# 2) Install Python dependencies only when either requirements file changed (or first run).
+NEWSHA="$(shasum "$REQ" "$AEC_REQ" | shasum | awk '{print $1}')"
 if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$NEWSHA" ]; then
   echo "==> Installing dependencies (first run downloads large packages like torch; this can take a while)…"
   "$VPY" -m pip install --upgrade pip
   "$VPY" -m pip install -r "$REQ"
+  if ! "$VPY" -m pip install -r "$AEC_REQ"; then
+    echo "Warning: Could not install optional WebRTC echo cancellation; starting without it." >&2
+    echo "    Retry later: $VPY -m pip install -r $AEC_REQ" >&2
+  fi
   echo "$NEWSHA" > "$STAMP"
 fi
 

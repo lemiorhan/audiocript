@@ -9,4 +9,3 @@ torch
 torchvision
 torchaudio
 pyannote.audio  # optional: speaker labels (needs a Hugging Face token; see README)
-pywebrtc-audio>=0.1.0,<0.2
