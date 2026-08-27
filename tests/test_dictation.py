@@ -184,15 +184,21 @@ def test_clipboard_round_trips_turkish():
 
 
 def test_notify_sink_reports_each_stage():
+    """recording() and processing() are the start and the stop of speaking —
+    each must cue on its own, so the cue count is checked right after each
+    call rather than once at the end (where one missing cue would hide behind
+    the other)."""
     notified, sounds = [], []
     sink = dictation.NotifySink(notify=notified.append,
                                 sound=lambda: sounds.append(None))
     sink.recording()
+    assert len(sounds) == 1, f"recording() did not cue: {sounds}"
     sink.processing()
+    assert len(sounds) == 2, f"processing() did not cue: {sounds}"
     sink.done("Bir cümle.")
     sink.failed("mikrofon açılamadı")
+    assert len(sounds) == 2, f"done/failed must not cue: {sounds}"
     assert len(notified) == 4, notified
-    assert len(sounds) >= 1, sounds
     assert any("Bir cümle." in m for m in notified), notified
     assert any("mikrofon açılamadı" in m for m in notified), notified
     print(f"  notified={notified}  sounds={len(sounds)}")
@@ -226,6 +232,33 @@ def test_notify_sink_survives_a_failing_notifier():
         A._log_problem = saved
     assert len(logged) == 2, logged
     print(f"  survived a failing notifier; logged {len(logged)} problems")
+
+
+def test_default_notify_and_sound_pass_a_timeout():
+    """NotifySink's try/except only catches a raise, not a hang. A stuck
+    osascript or afplay (no timeout=) would block the caller indefinitely —
+    Task 4's state machine, on the hotkey thread — so the defaults must bound
+    the subprocess themselves. Pinned by stubbing subprocess.run and reading
+    back the kwargs it was called with."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(kwargs)
+
+    saved = dictation.subprocess.run
+    dictation.subprocess.run = fake_run
+    try:
+        dictation._osascript_notify("hello")
+        dictation._afplay_sound()
+    finally:
+        dictation.subprocess.run = saved
+
+    assert len(calls) == 2, calls
+    for kwargs in calls:
+        assert "timeout" in kwargs, kwargs
+        assert isinstance(kwargs["timeout"], (int, float)) and kwargs["timeout"] > 0, \
+            f"timeout must be a positive number: {kwargs}"
+    print(f"  timeouts={[c['timeout'] for c in calls]}")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,6 @@ the clipboard, and the status sinks today, and — as a later task adds it — t
 correction pipeline. Kept apart from dictate.py's state machine and hotkey
 listener so all of it can be tested without audio hardware or a running daemon.
 """
-import json
 import subprocess
 from dataclasses import dataclass, field
 
@@ -102,6 +101,11 @@ PREVIEW_CHARS = 60
 # Confirmed present on the target machine, same as afplay/osascript themselves.
 DEFAULT_SOUND = "/System/Library/Sounds/Pop.aiff"
 
+# A notification or a sound cue that has not happened in this long has already
+# failed at its purpose; bounding it keeps a stuck osascript/afplay from
+# freezing the caller — Task 4's state machine, on the hotkey thread.
+NOTIFY_TIMEOUT_SECONDS = 2
+
 
 class Clipboard:
     """Puts text on the system clipboard, for the user to paste into any app."""
@@ -134,17 +138,27 @@ class StatusSink:
 
 
 def _osascript_notify(message):
-    """Show `message` as a macOS notification titled Audiocript."""
+    """Show `message` as a macOS notification titled Audiocript.
+
+    `message` is passed as an argv item to an `on run argv` handler rather than
+    interpolated into the script text, so nothing about it needs AppleScript's
+    own escaping rules — a prior version built the script with json.dumps(),
+    which escapes non-ASCII characters (Turkish letters included) as \\uXXXX
+    sequences AppleScript does not understand, and reproduces quotes/backslashes
+    /newlines by coincidence rather than by contract."""
     subprocess.run(
-        ["osascript", "-e",
-         f'display notification {json.dumps(message)} with title "Audiocript"'],
-        check=True)
+        ["osascript",
+         "-e", "on run argv",
+         "-e", 'display notification (item 1 of argv) with title "Audiocript"',
+         "-e", "end run",
+         "--", message],
+        check=True, timeout=NOTIFY_TIMEOUT_SECONDS)
 
 
 def _afplay_sound():
     """Play a short cue, so a stage change can be felt without looking at
     anything."""
-    subprocess.run(["afplay", DEFAULT_SOUND], check=True)
+    subprocess.run(["afplay", DEFAULT_SOUND], check=True, timeout=NOTIFY_TIMEOUT_SECONDS)
 
 
 class NotifySink(StatusSink):
