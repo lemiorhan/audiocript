@@ -721,9 +721,17 @@ def _run_daemon():
         # scheduled, 197 ms with it.
         for stop_signal in (signal.SIGTERM, signal.SIGINT):
             signal.signal(stop_signal, lambda *_: menubar.stop_the_loop())
-        print("Two icons are now in the menu bar. Click the left one to start the "
-              f"daemon; the first start loads the {A.lang_name(config.language)} "
-              "model, and the very first one downloads it, which takes a while.")
+        # The glyphs rather than "left" and "right": where each one lands depends on
+        # what else is in the menu bar, and a menu bar manager can move one of them
+        # out of sight entirely — which is worth saying, because it looks exactly
+        # like the icon was never created.
+        print(f"Two icons are now in the menu bar: {dictation.power_icon(dictation.POWER_OFF)} "
+              f"starts and stops the daemon, {dictation.dictation_icon(dictation.POWER_OFF, dictation.IDLE)[0]} "
+              "records. The first start loads the "
+              f"{A.lang_name(config.language)} model, and the very first one "
+              "downloads it, which takes a while.")
+        print("If you only see one of them, a menu bar manager (Ice, Bartender) has "
+              "hidden the other; both are there.")
         print("Ctrl-C stops the app.", flush=True)
         menubar.run(daemon, history, clipboard)
     except KeyboardInterrupt:

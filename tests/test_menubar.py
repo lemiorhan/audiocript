@@ -242,8 +242,8 @@ def test_an_action_that_raises_does_not_escape():
 def test_the_icons_follow_the_daemon():
     with workdir("menubar-icons") as home:
         bar, daemon, _h, _c, status_bar = _bar(home)
-        power_button = status_bar.items[0].button()
-        dictation_button = status_bar.items[1].button()
+        power_button = bar._power_item.button()
+        dictation_button = bar._dictation_item.button()
         seen = {}
         for power in dictation.POWERS:
             for state in dictation.STATES:
@@ -260,6 +260,22 @@ def test_the_icons_follow_the_daemon():
                 f"({power}, {state}) drew {dictation_title!r}"
             assert dimmed is expected_dim, f"({power}, {state}) dimmed={dimmed}"
         print(f"  {len(seen)} combinations, all drawn from the model")
+
+
+def test_the_dictation_icon_is_created_first():
+    """Creation order is position, and position decides which icon a menu bar manager
+    swallows. NSStatusBar puts the first item created rightmost, nearest the clock,
+    and every later one to its left: measured, the first item's window sat at x=1054
+    on a 1920-wide screen while the second sat at x=-4577, where Ice had moved it.
+
+    The dictation icon is the one used constantly, so it is created first and takes
+    the position least likely to be hidden."""
+    with workdir("menubar-order") as home:
+        bar, _d, _h, _c, status_bar = _bar(home)
+        assert status_bar.items[0] is bar._dictation_item, (
+            "the power icon was created first, which gives the dictation icon the "
+            "position a menu bar manager hides")
+        assert status_bar.items[1] is bar._power_item, "only two items belong here"
 
 
 def test_refresh_redraws_only_when_something_changed():

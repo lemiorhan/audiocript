@@ -157,9 +157,18 @@ class MenuBar:
         self._history = history
         self._clipboard = clipboard
         bar = bar or AppKit.NSStatusBar.systemStatusBar()
-        self._power_item = bar.statusItemWithLength_(
-            AppKit.NSVariableStatusItemLength)
+        # Creation order is position, and position decides which of the two a menu
+        # bar manager swallows. NSStatusBar puts the first item created rightmost,
+        # nearest the clock, and every later one to its left — measured on this
+        # machine, where the first item's window sat at x=1054 on a 1920-wide screen
+        # and the second at x=-4577, which is where Ice had moved it out of sight.
+        #
+        # So the dictation icon is created first. It is the one used constantly; the
+        # power icon is clicked twice a day, and it is the one that can afford to be
+        # the one hidden.
         self._dictation_item = bar.statusItemWithLength_(
+            AppKit.NSVariableStatusItemLength)
+        self._power_item = bar.statusItemWithLength_(
             AppKit.NSVariableStatusItemLength)
         self._power_menu = AppKit.NSMenu.alloc().init()
         self._dictation_menu = AppKit.NSMenu.alloc().init()
