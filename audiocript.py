@@ -24,6 +24,7 @@ from rich.live import Live
 from rich.text import Text
 from rich.layout import Layout
 
+import audio_echo
 import publish  # optional OpenAI + GitHub publishing; inert without a configured .env
 
 # Suppress warnings (FutureWarning, DeprecationWarning, UserWarning)
@@ -809,7 +810,7 @@ def _mix_wavs_to_wav(paths, out_path, target_fs=16000, on_progress=None):
 
 
 def _finalize_sources(project_dir, sources, save_channels=False, target_fs=16000,
-                      on_progress=None):
+                      on_progress=None, echo_processor_factory=None):
     """Build audio.wav from raw capture files, streaming so memory stays flat.
 
     `sources` is a capture manifest — the same list meta.json stores and the recorders
@@ -840,9 +841,13 @@ def _finalize_sources(project_dir, sources, save_channels=False, target_fs=16000
     if not readers:
         return 0
 
-    # Resampling dominates; leave the last tenth for the two mixing passes.
+    by_kind = {s.get("kind"): (s, r) for s, r in readers}
+    use_echo_pipeline = "mic" in by_kind and "system" in by_kind
+
+    # Resampling dominates. Dual-source AEC reserves explicit ranges for alignment,
+    # cancellation, and mixing; all other captures keep their historical weighting.
     stage1_total = sum(len(r) for _, r in readers) or 1
-    stage1_weight = 0.9 if len(readers) > 1 else 1.0
+    stage1_weight = 0.7 if use_echo_pipeline else (0.9 if len(readers) > 1 else 1.0)
     done = [0, 0]
 
     def report(stage, units):
@@ -856,7 +861,7 @@ def _finalize_sources(project_dir, sources, save_channels=False, target_fs=16000
             frac = stage1_weight * done[0] / stage1_total
         on_progress(min(frac, 1.0))
 
-    parts, n = [], 0
+    parts, part_sources, n = [], {}, 0
     try:
         for s, r in readers:
             part = d / f"{s.get('kind', 'mic')}.wav.part"
@@ -865,12 +870,14 @@ def _finalize_sources(project_dir, sources, save_channels=False, target_fs=16000
                                                 target_fs, lambda u: report(0, u))
             if written:
                 parts.append(part)
+                part_sources[s.get("kind", "mic")] = (s, part)
             else:
                 part.unlink(missing_ok=True)
         if not parts:
             return 0
 
         audio_part = d / "audio.wav.part"
+        channel_parts = [(p, p.with_suffix("")) for p in parts]
         if len(parts) == 1:
             n = _wav_frame_count(parts[0])
             if save_channels:
@@ -878,13 +885,80 @@ def _finalize_sources(project_dir, sources, save_channels=False, target_fs=16000
             else:
                 parts[0].replace(audio_part)
                 parts = []
+                channel_parts = []
         else:
-            n = _mix_wavs_to_wav(parts, audio_part, target_fs, lambda u: report(1, u))
+            mix_parts = parts
+            if use_echo_pipeline:
+                mic_source, mic_part = part_sources["mic"]
+                system_source, system_part = part_sources["system"]
+                aligned_mic = d / "mic.aligned.wav.part"
+                aligned_system = d / "system.aligned.wav.part"
 
-        for p in parts:                       # mic.wav.part -> mic.wav
-            if save_channels:
-                p.replace(p.with_suffix(""))
+                aligned_total = min(
+                    _wav_frame_count(mic_part), _wav_frame_count(system_part))
+
+                def alignment_progress(copied):
+                    if on_progress:
+                        on_progress(min(0.70 + 0.05 * copied / max(aligned_total, 1),
+                                        0.75))
+
+                n = audio_echo.align_wav_pair(
+                    mic_part, system_part, aligned_mic, aligned_system,
+                    mic_started_ns=mic_source.get("started_ns"),
+                    system_started_ns=system_source.get("started_ns"),
+                    sample_rate=target_fs, on_progress=alignment_progress)
+                if on_progress:
+                    on_progress(0.75)
+
+                clean_mic = d / "mic.clean.wav.part"
+
+                def echo_progress(processed):
+                    if on_progress:
+                        on_progress(min(0.75 + 0.15 * processed / max(n, 1), 0.90))
+
+                selected_mic = aligned_mic
+                try:
+                    audio_echo.cancel_echo(
+                        aligned_mic, aligned_system, clean_mic,
+                        sample_rate=target_fs,
+                        processor_factory=echo_processor_factory,
+                        on_progress=echo_progress)
+                    selected_mic = clean_mic
+                except Exception as exc:
+                    _log_problem(
+                        "acoustic echo cancellation failed; using original microphone",
+                        exc)
+                if on_progress:
+                    on_progress(0.90)
+
+                replacements = {mic_part: selected_mic, system_part: aligned_system}
+                mix_parts = [replacements.get(p, p) for p in parts]
+                channel_parts = []
+                for kind, (_source, part) in part_sources.items():
+                    selected = replacements.get(part, part)
+                    channel_parts.append((selected, d / f"{kind}.wav"))
+
+                mix_done = [0]
+                mix_total = max(2 * n, 1)
+
+                def mix_progress(units):
+                    mix_done[0] += units
+                    if on_progress:
+                        on_progress(min(0.90 + 0.10 * mix_done[0] / mix_total, 1.0))
+
+                n = _mix_wavs_to_wav(
+                    mix_parts, audio_part, target_fs, mix_progress)
             else:
+                n = _mix_wavs_to_wav(
+                    mix_parts, audio_part, target_fs, lambda u: report(1, u))
+
+        for p, destination in channel_parts:
+            if save_channels:
+                p.replace(destination)
+            else:
+                p.unlink(missing_ok=True)
+        for p in d.glob("*.part"):
+            if p != audio_part:
                 p.unlink(missing_ok=True)
         audio_part.replace(d / "audio.wav")   # last: its presence means "finished"
     except BaseException:

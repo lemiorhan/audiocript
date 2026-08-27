@@ -41,7 +41,8 @@ def workdir(name):
         shutil.rmtree(path, ignore_errors=True)
 
 
-def build_capture(d, seconds, seed=0, loud=False, sources=SOURCES, chunk_seconds=10):
+def build_capture(d, seconds, seed=0, loud=False, sources=SOURCES, chunk_seconds=10,
+                  started_ns=None):
     """Write a raw capture and its meta.json into d, as an interrupted recording
     would have left them. `loud` makes the sources sum past int16 so the mix has to
     scale itself down.
@@ -50,6 +51,11 @@ def build_capture(d, seconds, seed=0, loud=False, sources=SOURCES, chunk_seconds
     in one array would cost more memory than the code under test is allowed to use."""
     d = Path(d)
     d.mkdir(parents=True, exist_ok=True)
+    sources = [dict(s) for s in sources]
+    if started_ns is not None:
+        for s in sources:
+            if s.get("kind") in started_ns:
+                s["started_ns"] = started_ns[s["kind"]]
     rng = np.random.default_rng(seed)
     amp = 0.95 if loud else 0.3
     for s in sources:
@@ -67,6 +73,20 @@ def build_capture(d, seconds, seed=0, loud=False, sources=SOURCES, chunk_seconds
     (d / "meta.json").write_text(json.dumps(
         {"capture": {"in_progress": True, "sources": sources}}))
     return d
+
+
+class IdentityProcessor:
+    def process(self, near, far):
+        return near.copy()
+
+
+def identity_processor_factory(_sample_rate):
+    return IdentityProcessor()
+
+
+def finalize_with_processor(project_dir, sources, processor_factory, **kwargs):
+    return A._finalize_sources(
+        project_dir, sources, echo_processor_factory=processor_factory, **kwargs)
 
 
 def wav_samples(path):
