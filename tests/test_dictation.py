@@ -168,5 +168,65 @@ def test_it_resolves_where_publish_config_would_not():
                 os.environ[key] = value
 
 
+def test_clipboard_round_trips_turkish():
+    """pbcopy is real here — the encoding is the thing under test — so the
+    developer's actual clipboard is saved and restored around it."""
+    import subprocess
+    before = subprocess.run(["pbpaste"], capture_output=True).stdout
+    try:
+        text = "Şu PR'ı bugün merge edemeyiz — çünkü İĞÜÖÇ testleri geçmiyor."
+        dictation.Clipboard().copy(text)
+        back = subprocess.run(["pbpaste"], capture_output=True).stdout.decode("utf-8")
+        assert back == text, f"clipboard {back!r} != {text!r}"
+    finally:
+        subprocess.run(["pbcopy"], input=before)
+    print("  round-tripped Turkish text through the real clipboard")
+
+
+def test_notify_sink_reports_each_stage():
+    notified, sounds = [], []
+    sink = dictation.NotifySink(notify=notified.append,
+                                sound=lambda: sounds.append(None))
+    sink.recording()
+    sink.processing()
+    sink.done("Bir cümle.")
+    sink.failed("mikrofon açılamadı")
+    assert len(notified) == 4, notified
+    assert len(sounds) >= 1, sounds
+    assert any("Bir cümle." in m for m in notified), notified
+    assert any("mikrofon açılamadı" in m for m in notified), notified
+    print(f"  notified={notified}  sounds={len(sounds)}")
+
+
+def test_notify_sink_truncates_a_long_preview():
+    notified = []
+    sink = dictation.NotifySink(notify=notified.append, sound=lambda: None)
+    sink.done("x" * 500)
+    assert len(notified) == 1, notified
+    message = notified[0]
+    assert len(message) < 200, f"message is {len(message)} chars: {message!r}"
+    print(f"  message length={len(message)}")
+
+
+def test_notify_sink_survives_a_failing_notifier():
+    """A broken osascript must not cost the user a dictation whose text is
+    already on the clipboard: notify raising must not propagate. The swallowed
+    exception must not be lost entirely either — it goes to
+    audiocript._log_problem, pinned here by monkeypatching it."""
+    logged = []
+    saved = A._log_problem
+    A._log_problem = lambda what, exc=None: logged.append((what, exc))
+    try:
+        def broken_notify(message):
+            raise OSError("osascript is not available")
+        sink = dictation.NotifySink(notify=broken_notify, sound=lambda: None)
+        sink.done("Bir cümle.")
+        sink.failed("mikrofon açılamadı")
+    finally:
+        A._log_problem = saved
+    assert len(logged) == 2, logged
+    print(f"  survived a failing notifier; logged {len(logged)} problems")
+
+
 if __name__ == "__main__":
     run([n for n in sorted(globals()) if n.startswith("test_")], globals())
