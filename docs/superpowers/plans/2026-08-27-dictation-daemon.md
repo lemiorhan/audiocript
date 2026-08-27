@@ -320,7 +320,9 @@ EMPTY       = "empty"          # nothing was said; the clipboard was not touched
 MAX_GROWTH = 2.0               # a reply longer than this multiple of the input is refused
 MIN_SHRINK = 0.4               # a reply shorter than this fraction of the input is refused
 
-PROMPT_PATH = <repo root> / "prompts" / "dictation_prompt.md"
+PROMPT_PATH = pathlib.Path(__file__).resolve().parent / "prompts" / "dictation_prompt.md"
+                               # dictation.py sits at the repo root, so this is the
+                               # same anchoring publish.ROOT already uses. Never cwd.
 
 class Delivery:
     status: str                # one of the four above
@@ -739,7 +741,7 @@ Expected: the new tests FAIL with `AttributeError` on `dictate.check_listener` a
 - `write_pid` refuses when the file names a live process and overwrites when it does not. `read_pid` returns `None` for absent, unparseable or stale. Probe with `os.kill(pid, 0)`: `ProcessLookupError` means stale, `PermissionError` means alive.
 - `signal_daemon` sends `SIGUSR1` for `"toggle"`, `SIGTERM` for `"stop"`. With no live daemon it prints that and returns non-zero.
 - `main(argv)` handles no arguments (run the daemon), `--toggle`, `--stop`. The daemon path:
-  1. `audiocript.load_config()`, then `dictation.resolve_config`. A `ConfigError` prints its message — which already names the offending value — and returns non-zero.
+  1. `audiocript.load_config()` → the raw `cfg` dict, then `dictation.resolve_config(cfg)`. A `ConfigError` prints its message — which already names the offending value — and returns non-zero. **Both are needed downstream:** the resolved `DictationConfig` goes to `Daemon(config, ...)`, and the raw dict goes to `Daemon(cfg=cfg)`, because `MicCapture` passes it to `audiocript._resolve_mic_index` to find the configured microphone by name.
   2. `write_pid`; a refusal prints why and returns non-zero.
   3. `audiocript._ensure_model(config.language)`, so the first dictation is not the one paying for the model load. Say so on the way in; it takes a while.
   4. Install `SIGUSR1` → `daemon.toggle`, and `SIGTERM`/`SIGINT` → shutdown. `signal.signal` only works on the main thread, which is where `main` runs.
@@ -868,8 +870,10 @@ Expected: no pid file once the daemon has exited, no temporary directories, and 
 
 - [ ] **Step 8: Commit the settled assumptions**
 
+`docs/superpowers/` is in `.gitignore`, so this one needs `-f` — a plain `git add` prints an "ignored by one of your .gitignore files" hint and stages nothing, and the commit then reports a clean tree.
+
 ```bash
-git add docs/superpowers/specs/2026-08-27-dictation-daemon-design.md
+git add -f docs/superpowers/specs/2026-08-27-dictation-daemon-design.md
 git commit -m "docs: record what dictation's open questions turned out to be"
 ```
 
