@@ -13,11 +13,21 @@ recordings folder.
 
 ## Scope
 
-A new long-lived process (`dictate.py`) that reuses Audiocript's existing capture and
-transcription code by importing it. The full-screen TUI in `audiocript.py` is not
-changed; only `run.sh` gains a `--dictate` switch so the daemon can be launched
-without naming the virtualenv's interpreter. `config.json` gains keys the daemon reads
-and the TUI ignores.
+A new long-lived process, split across two modules that reuse Audiocript's existing
+capture and transcription code by importing it:
+
+- `dictation.py` — no threads, no global state: configuration resolution and
+  validation, the clipboard, the status sinks, the correction and delivery pipeline.
+- `dictate.py` — the state machine, the capture, the hotkey listener, the signal
+  handling and the CLI.
+
+The line between them is testability: everything in `dictation.py` can be exercised
+without audio hardware, a loaded model, or a running daemon, which is where most of
+this feature's rules live. `dictate.py` imports `dictation.py`; not the reverse.
+
+The full-screen TUI in `audiocript.py` is not changed; only `run.sh` gains a
+`--dictate` switch so the daemon can be launched without naming the virtualenv's
+interpreter. `config.json` gains keys the daemon reads and the TUI ignores.
 
 **One language at a time.** The daemon reads the language from the existing
 `language` key in `config.json` and warms exactly one model. There is no per-hotkey
@@ -200,6 +210,12 @@ A new `prompts/dictation_prompt.md`, written in Turkish to match the two existin
 prompts, ending in a bracketed placeholder line so `publish.render_prompt` can inline
 the transcript.
 
+**One prompt serves both languages.** The rules it states are about punctuation,
+fillers and stutters, which do not differ by language, and a model given Turkish
+instructions corrects English text correctly. The configured language selects the
+Whisper model, not the prompt. A second prompt would be two things to keep in step for
+no gain.
+
 The prompt instructs the model to add punctuation and capitalisation, drop meaningless
 fillers, remove stutters and repetitions, and fix technical terms Whisper mishears. It
 forbids changing word choice, reordering sentences, summarising, shortening, adding
@@ -307,7 +323,7 @@ Each of these must fail if the line it protects is removed:
 6. `dictation_config()` works with no GitHub variables set, where `publish.config()`
    returns `None`.
 7. `IS_TRUSTED` false produces the startup warning.
-8. The language is read from `config.json`, and it selects the matching model and prompt.
+8. The language is read from `config.json` and selects the matching Whisper model.
 9. A completed dictation leaves no temporary directory.
 10. A `language` value outside `LANGUAGES` is refused at startup.
 11. Reaching the duration bound stops the capture and processes what was captured.
