@@ -205,8 +205,8 @@ class Daemon:
     # and every sink call inside dictation.deliver run with no lock held, so a
     # "still working" from toggle can interleave with a worker's report.
     #
-    # The hold is not bounded by dictation.NOTIFY_TIMEOUT_SECONDS — a sink call is
-    # the smallest part of it. _begin_processing holds the lock across
+    # The hold is not bounded by dictation.NOTIFY_TIMEOUT_SECONDS.
+    # _begin_processing holds the lock across
     # capture.stop()'s WAV conversion, whose cost scales with how long the
     # recording ran (measured on this machine: roughly 0.1-1.1s for a synthetic
     # 300s recording, the low end once torchaudio's one-time import has already
@@ -338,12 +338,10 @@ def _deferred(action, name):
       no other reference to it — so a tap the system disables is never switched
       back on, while IS_TRUSTED stays true and the listener stays alive. `toggle`
       can hold the daemon's lock for as long as the transition in progress takes
-      — not bounded by dictation.NOTIFY_TIMEOUT_SECONDS, since what dominates is
-      capture.stop()'s WAV conversion (scales with recording length) or
-      audiocript._start_mic's retry backoff, not a sink call.
+      — not bounded by dictation.NOTIFY_TIMEOUT_SECONDS.
     - `_emitter` calls `listener.stop()` on any exception the callback lets
       through, which ends the listener for good. Daemon._begin_recording's
-      trailing sink.recording() is outside its guard by design, so `toggle` can
+      trailing sink.recording() is outside its try/except by design, so `toggle` can
       raise on the recording path.
     - the SIGUSR1 handler runs on the main thread and is not re-entrant: a second
       --toggle arriving while the first one is inside `toggle` would deadlock on a

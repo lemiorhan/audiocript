@@ -282,9 +282,9 @@ def deliver(transcript, config, clipboard, sink, complete=None):
     if not MIN_SHRINK <= ratio <= MAX_GROWTH:
         # A reply this short from the real provider never reaches here:
         # publish.openai_complete itself raises on an empty or whitespace reply,
-        # which takes the UNCORRECTED path above instead (see
-        # test_a_whitespace_reply_is_refused). Only a too-short-but-nonempty
-        # reply, or an empty one from a test's injected `complete`, lands here.
+        # which takes the UNCORRECTED path above instead. Only a
+        # too-short-but-nonempty reply, or an empty one from a test's injected
+        # `complete`, lands here.
         return raw(SKIPPED, f"the correction came back {ratio:.2f}x the length of "
                             "the dictation, so it was not used")
     clipboard.copy(corrected)
