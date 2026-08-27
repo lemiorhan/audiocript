@@ -28,7 +28,14 @@ def _announce(_message):
     in them worth keeping is already kept — _start_mic itself sends every refused
     attempt, with its traceback and the device index, to _log_problem. Routing
     these here as well would add a line to the log for every dictation ever made
-    and say nothing new."""
+    and say nothing new.
+
+    Dropping them here does not make them free: _start_mic builds the first note's
+    text before it calls this, and that text holds device_name(index), which asks
+    PortAudio for the device. So every dictation pays one exception-safe device
+    lookup for a string thrown away here. Nothing this side of the call can avoid
+    it — the f-string is evaluated inside audiocript, which this plan does not
+    modify — and the cost is a read of a device table built at import."""
 
 
 class _MicState:
@@ -67,7 +74,15 @@ class MicCapture:
 
     def stop(self):
         """Stop the recorder and return the path of a 16 kHz mono WAV of what it
-        captured, converted a block at a time straight off disk."""
+        captured, converted a block at a time straight off disk.
+
+        Valid only after a start() that returned. Unlike discard, this one does
+        raise — the state machine puts whatever it raises in front of the user, and
+        `RuntimeError: stop() without ...` is something a reader can act on where
+        `AttributeError: 'NoneType' object has no attribute 'stop'` is not."""
+        if self._recorder is None:
+            raise RuntimeError("stop() without a recorder: start() has to have "
+                               "returned first")
         recorder, self._recorder = self._recorder, None
         recorder.stop()
         # manifest() already describes the raw file the way it has to be re-read;
@@ -154,10 +169,16 @@ class Daemon:
             worker.join(timeout)
 
     # --------------------------- the transitions ---------------------------
-    # All three run with `_lock` held. The status sink is called from inside it so
-    # the reports cannot arrive out of order; it is safe to hold the lock across
-    # them because every call a sink makes to the outside is bounded (see
-    # dictation.NOTIFY_TIMEOUT_SECONDS).
+    # All three run with `_lock` held, so the *transitions* serialise: no two
+    # threads can read the same state and both act on it. That is the whole
+    # guarantee. The reports are not ordered by it — the worker's own sink.failed
+    # and every sink call inside dictation.deliver run with no lock held, so a
+    # "still working" from toggle can interleave with a worker's report.
+    #
+    # Holding the lock across a sink call is safe only because a sink cannot block
+    # indefinitely: NotifySink.recording() and processing() each run *two* bounded
+    # subprocesses, the notification and the sound cue, so the worst case in here
+    # is 2 x dictation.NOTIFY_TIMEOUT_SECONDS, not one.
 
     def _begin_recording(self):
         capture = self._capture_factory(self._cfg)
@@ -181,25 +202,35 @@ class Daemon:
         self._sink.recording()
 
     def _begin_processing(self):
-        """Stop the recording and hand the WAV to a worker."""
+        """Stop the recording and hand the WAV to a worker.
+
+        Every step is inside the guard, not just the stop(): once the state says
+        PROCESSING, only the worker can move it, so anything that goes wrong
+        before the worker is running strands the daemon exactly the way _work's
+        `finally` exists to prevent — one step earlier, where nothing catches it.
+        Thread.start() raising under thread exhaustion is the live case; a status
+        sink that does not swallow its own failures the way NotifySink does is the
+        other."""
         capture = self._capture
         self._leave_recording()
         try:
             wav_path = capture.stop()
+            self.state = PROCESSING
+            self._sink.processing()
+            # Published only once it is actually running: join()ing a thread that
+            # never started raises, and join_worker is what the tests wait on.
+            worker = threading.Thread(target=self._work, args=(wav_path, capture),
+                                      name="dictation-worker", daemon=True)
+            worker.start()
+            self._worker = worker
         except Exception as e:
-            # Staying in RECORDING here would be a dead end: only another toggle
-            # could move the daemon, and it would call this same stop() again.
-            A._log_problem("dictation capture could not be finished", e)
+            A._log_problem("dictation could not be handed to a worker", e)
+            # The state is put right before the user is told, so even a sink that
+            # raises in here cannot leave the daemon in PROCESSING.
             capture.discard()
             self._capture = None
             self.state = IDLE
-            self._sink.failed(f"the recording could not be finished: {e}")
-            return
-        self.state = PROCESSING
-        self._sink.processing()
-        self._worker = threading.Thread(target=self._work, args=(wav_path, capture),
-                                        name="dictation-worker", daemon=True)
-        self._worker.start()
+            self._sink.failed(f"the dictation could not be finished: {e}")
 
     def _leave_recording(self):
         """Close the recording window: cancel the duration timer and make sure a

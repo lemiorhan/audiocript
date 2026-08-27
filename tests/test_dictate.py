@@ -50,10 +50,10 @@ class StopFailsCapture(FakeCapture):
 
 
 def build(transcript="bir cumle", deliver=None, capture=None, max_seconds=300,
-          transcribe=None):
+          transcribe=None, sink=None):
     """A daemon with every edge faked. Returns (daemon, clipboard, sink, delivered)."""
     FakeCapture.instances = []
-    clip, sink, delivered = FakeClipboard(), RecordingSink(), []
+    clip, sink, delivered = FakeClipboard(), sink or RecordingSink(), []
     config = dictation.resolve_config(
         {"dictation_max_seconds": max_seconds},
         fake_env(OPENAI_API_KEY="sk-test", OPENAI_API_BASE="http://127.0.0.1:1"))
@@ -74,8 +74,11 @@ def build(transcript="bir cumle", deliver=None, capture=None, max_seconds=300,
 @contextlib.contextmanager
 def _stubbed(**attrs):
     """Swap audiocript module attributes for the duration of a block, the way
-    tests/test_recording_start.py does: no microphone is opened and no device list
-    is queried, but everything between MicCapture and the recorder runs for real."""
+    tests/test_recording_start.py does. No microphone is opened and no device list
+    is enumerated, but everything between MicCapture and the recorder runs for
+    real — including _start_mic's own device_name(index) lookup, which asks
+    PortAudio about index 7 and, since that need not exist, gets "7" back from its
+    own except branch."""
     saved = {name: getattr(A, name) for name in attrs}
     for name, value in attrs.items():
         setattr(A, name, value)
@@ -221,6 +224,51 @@ def test_a_capture_that_cannot_be_finished_returns_to_idle():
     assert clip.writes == 0, f"the clipboard was written {clip.writes} times"
     assert "discard" in FakeCapture.instances[-1].events, \
         f"events {FakeCapture.instances[-1].events!r}"
+    print(f"  {sink.calls}")
+
+
+def test_stop_without_a_started_recorder_says_which_call_is_missing():
+    """MicCapture.stop is public and the state machine shows what it raises to the
+    user, so it names the precondition instead of leaving an AttributeError about
+    NoneType to stand for it. discard() is the one that must never raise."""
+    capture = dictate.MicCapture({})
+    try:
+        capture.stop()
+    except Exception as e:
+        assert isinstance(e, RuntimeError), f"stop() raised {e!r}"
+        assert "start()" in str(e), f"the message does not name start(): {e}"
+        print(f"  {e}")
+        return
+    raise AssertionError("stop() without a start() did not raise")
+
+
+def test_a_report_between_the_two_states_cannot_strand_the_daemon():
+    """The window between `state = PROCESSING` and a running worker: from there
+    only the worker can move the state, so anything raising in it would leave the
+    daemon answering "still working" to every hotkey press for the rest of the
+    session. Thread.start() under thread exhaustion is the live case; a sink that
+    does not swallow its own failures — as NotifySink does — stands in for it."""
+    class ExplodingSink(RecordingSink):
+        def processing(self):
+            RecordingSink.processing(self)
+            raise RuntimeError("the notification blew up")
+
+    d, clip, sink, delivered = build(sink=ExplodingSink())
+    d.toggle()
+    try:
+        d.toggle()
+    except Exception as e:
+        # toggle runs on the thread that carries the hotkey; an exception reaching
+        # that caller takes the listener with it.
+        raise AssertionError(f"toggle() let {e!r} reach its caller") from None
+    d.join_worker(timeout=5)
+    assert d.state == dictate.IDLE, f"state {d.state!r} after a report blew up"
+    assert "discard" in FakeCapture.instances[-1].events, \
+        f"the capture was left behind: {FakeCapture.instances[-1].events!r}"
+    assert delivered == [], f"delivered {delivered!r} with no worker running"
+    assert clip.writes == 0, f"the clipboard was written {clip.writes} times"
+    assert any(kind == "failed" for kind, _ in sink.calls), \
+        f"the user was not told: {sink.calls!r}"
     print(f"  {sink.calls}")
 
 
