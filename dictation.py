@@ -16,7 +16,7 @@ import audiocript as A
 import publish
 
 HOTKEY_ACTIONS = ("toggle",)
-DEFAULT_HOTKEYS = {"toggle": "<cmd>+<alt>+d"}
+DEFAULT_HOTKEYS = {"toggle": "<cmd>+<alt>+0"}
 DEFAULT_MAX_SECONDS = 300
 DEFAULT_MODEL = "gpt-4.1-mini"
 
