@@ -23,6 +23,7 @@ Metin Türkçe ya da İngilizce olabilir; kurallar ikisinde de aynı. Metin hang
 
 - Kelime seçimini değiştirme; eş anlamlı bir kelime bile koyma.
 - Cümle sırasını değiştirme.
+- Dilbilgisi bozuk, yarım ya da devrik bir cümleyi onarma. Kullanıcı nasıl söylediyse öyle kalsın; sen yalnızca noktalamasını ekle.
 - Özetleme, kısaltma.
 - Bir şey ekleme: açıklama, selamlama, bağlaç, örnek, hiçbir şey.
 - Başlık, madde işareti, markdown, kod bloğu ya da tırnak koyma.

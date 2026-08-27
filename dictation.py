@@ -131,8 +131,11 @@ class StatusSink:
         """The hotkey fired again: recording stopped, transcription and
         correction are running."""
 
-    def done(self, text):
-        """`text` is corrected and already on the clipboard, ready to paste."""
+    def done(self, text, note=""):
+        """`text` is already on the clipboard, ready to paste. `note` says why it
+        is not the corrected text — the provider failed, or the reply broke the
+        length contract — and is empty when the correction went through, which is
+        the only case where `text` is a corrected text."""
 
     def failed(self, reason):
         """The attempt produced no text; `reason` explains why, for the user."""
@@ -196,9 +199,13 @@ class NotifySink(StatusSink):
         self._report("Processing…")
         self._cue()
 
-    def done(self, text):
+    def done(self, text, note=""):
         preview = text if len(text) <= PREVIEW_CHARS else text[:PREVIEW_CHARS] + "…"
-        self._report(f"Copied to clipboard: {preview}")
+        # The note is not truncated the way the preview is: a correction that was
+        # refused has to be able to say so, or the guard is invisible to the only
+        # person who can act on it — the user about to paste.
+        self._report(f"Copied to clipboard: {preview}"
+                     + (f" — {note}" if note else ""))
 
     def failed(self, reason):
         self._report(f"Dictation failed: {reason}")
@@ -256,7 +263,7 @@ def deliver(transcript, config, clipboard, sink, complete=None):
     def raw(status, detail):
         """The transcript itself on the clipboard, unpunctuated but pasteable."""
         clipboard.copy(transcript)
-        sink.done(transcript)
+        sink.done(transcript, detail)
         return Delivery(status, transcript, detail)
 
     # Built here as a local and never logged, returned or put in a message: it

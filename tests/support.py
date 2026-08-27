@@ -178,10 +178,16 @@ class FakeClipboard:
 
 
 class RecordingSink:
+    """`calls` stays a list of (kind, text) pairs so callers can unpack it; the
+    note done() was given is recorded alongside, one entry per done() call."""
+
     def __init__(self):
-        self.calls = []
+        self.calls, self.notes = [], []
 
     def recording(self): self.calls.append(("recording", None))
     def processing(self): self.calls.append(("processing", None))
-    def done(self, text): self.calls.append(("done", text))
     def failed(self, reason): self.calls.append(("failed", reason))
+
+    def done(self, text, note=""):
+        self.calls.append(("done", text))
+        self.notes.append(note)

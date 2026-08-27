@@ -279,28 +279,29 @@ def _config(base):
         {}, fake_env(OPENAI_API_KEY="sk-test", OPENAI_API_BASE=base))
 
 
-def _bases():
-    """Both ways the provider can fail: a 500, and nothing listening at all."""
-    api = FakeAPI({ROUTE: [(500, {})]})
-    yield api.url, api
-    api.close()
-    yield "http://127.0.0.1:1", None
-
-
 def test_a_failing_provider_still_delivers_the_raw_transcript():
-    # The user has already spoken and is waiting. Unpunctuated Turkish beats nothing.
-    for base, api in _bases():
-        try:
+    """Both ways the provider can fail: a 500, and nothing listening at all. The
+    user has already spoken and is waiting, so unpunctuated Turkish beats nothing.
+
+    publish.RETRIES is 0 for the duration: the retry backoff sleeps ~3s per base
+    and belongs to publish, which tests/test_publish.py already covers. The seam
+    under test here is deliver's except clause, and the call still goes through
+    the real publish.openai_complete."""
+    api = FakeAPI({ROUTE: [(500, {})]})
+    saved_retries, publish.RETRIES = publish.RETRIES, 0
+    try:
+        for base in (api.url, "http://127.0.0.1:1"):
             clip, sink = FakeClipboard(), RecordingSink()
             d = dictation.deliver(RAW, _config(base), clip, sink)
             assert d.status == dictation.UNCORRECTED, f"{base}: status {d.status!r}"
-            assert clip.text == RAW, f"{base}: clipboard {clip.text!r} != the raw transcript"
+            assert clip.text == RAW, f"{base}: clipboard {clip.text!r} != the raw text"
             assert clip.writes == 1, f"{base}: clipboard written {clip.writes} times"
             assert d.detail, f"{base}: no reason was recorded"
             assert any(k == "done" for k, _ in sink.calls), f"{base}: {sink.calls!r}"
-        finally:
-            if api:
-                api.close()
+            assert sink.notes == [d.detail], f"{base}: notes {sink.notes!r}"
+    finally:
+        publish.RETRIES = saved_retries
+        api.close()
     print("  a 500 and an unreachable provider both delivered the raw transcript")
 
 
@@ -379,12 +380,18 @@ def test_a_reply_that_shrinks_too_much_is_refused():
     print(f"  refused a summary: {d.detail}")
 
 
-def test_an_empty_reply_is_refused():
-    """The reply is injected rather than served: publish.openai_complete turns an
-    empty message into a RuntimeError of its own, so a FakeAPI serving one would
-    exercise the provider-failure path instead of deliver's length guard."""
-    d = _refused("   ", complete=lambda prompt, cfg: "   ")
-    print(f"  refused a blank reply: {d.detail}")
+def test_a_whitespace_reply_is_refused():
+    """The reply is as long as the transcript on purpose. A shorter one would be
+    refused by the length guard whether or not deliver strips the reply, leaving
+    the .strip() unpinned — and a whitespace reply that passes the guard means the
+    clipboard is overwritten with nothing, the worst outcome this feature has.
+
+    The reply is injected rather than served because publish.openai_complete turns
+    a blank message into a RuntimeError of its own, which would exercise the
+    provider-failure path instead of deliver's own handling."""
+    blanks = " " * len(RAW)
+    d = _refused(blanks, complete=lambda prompt, cfg: blanks)
+    print(f"  refused {len(blanks)} spaces against {len(RAW)} chars: {d.detail}")
 
 
 def test_a_provider_failure_is_logged():
@@ -435,6 +442,40 @@ def test_the_api_key_reaches_nothing_but_the_provider():
                         ("the sink", repr(sink.calls)), ("the log", " ".join(logged))):
         assert "SECRET-CANARY" not in text, f"the API key reached {where}: {text!r}"
     print("  the key reached the provider call and nothing else")
+
+
+def test_a_refused_correction_says_why_in_the_notification():
+    """Without this the user sees a plain success notification, pastes
+    unpunctuated Turkish, and has nothing anywhere saying the correction was
+    refused. Driven end to end — deliver -> sink.done(text, note) -> the
+    message NotifySink builds — because the gap can open at either step."""
+    notified = []
+    sink = dictation.NotifySink(notify=notified.append, sound=lambda: None)
+    api = FakeAPI({ROUTE: [(200, completion(RAW * 5))]})
+    clip = FakeClipboard()
+    try:
+        d = dictation.deliver(RAW, _config(api.url), clip, sink)
+    finally:
+        api.close()
+    assert d.status == dictation.SKIPPED, f"status {d.status!r}"
+    assert clip.text == RAW, f"clipboard {clip.text!r}"
+    assert len(notified) == 1, f"notified {notified!r}"
+    assert d.detail in notified[0], \
+        f"the reason {d.detail!r} did not reach the notification {notified[0]!r}"
+    print(f"  {notified[0]}")
+
+
+def test_a_correction_that_went_through_says_nothing_extra():
+    """The note is for the paths that need explaining. A plain correction must
+    not acquire one, or every successful dictation reads like a warning."""
+    api = FakeAPI({ROUTE: [(200, completion(FIXED))]})
+    clip, sink = FakeClipboard(), RecordingSink()
+    try:
+        dictation.deliver(RAW, _config(api.url), clip, sink)
+    finally:
+        api.close()
+    assert sink.notes == [""], f"a corrected dictation carried a note: {sink.notes!r}"
+    print("  no note on the corrected path")
 
 
 def test_the_fixture_exercises_the_guards_middle():
