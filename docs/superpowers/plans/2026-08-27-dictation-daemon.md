@@ -18,6 +18,19 @@
 
 If a step leaves you genuinely unable to proceed, that is a plan defect. Say so rather than guessing.
 
+## Assumption audit
+
+Run against the code before this plan was dispatched: **32 assumptions checked, 4 wrong.** All four were corrected in the text below rather than noted beside it, because an implementer reads the brief, not the errata.
+
+| # | Assumption | Verdict |
+|---|---|---|
+| A4 | `_stream_source_to_wav` takes a raw file path | **Wrong** — it takes an `_RawPcmReader` and calls `len()` on it. Corrected in Task 4. |
+| A23 | The fake provider must be copied from `test_publish.py` and modified to capture the prompt | **Wrong** — `FakeAPI` already records parsed request bodies, so it is reused unchanged. Corrected in Task 3. |
+| A24 | The shared test doubles can live in `test_dictation.py` and be imported by `test_dictate.py` | **Wrong, and it would have passed.** `support.run` ends in `sys.exit`, so the import runs the other file's whole suite and exits 0 first. Doubles moved to `support.py`; every runner guarded. |
+| A25 | `run.sh` can grow a `--dictate` switch by following its structure | **Wrong as stated** — its final `exec "$VPY" audiocript.py "$@"` forwards the switch to a program that ignores arguments, silently launching the TUI. Corrected in Task 6. |
+
+The other 28 were confirmed against the code, including every `audiocript` and `publish` symbol this plan calls, `GlobalHotKeys`'s constructor and attributes, `HotKey.parse`'s `ValueError` and its `Key`-membership behaviour, `publish.config()` returning `None` without GitHub credentials, `render_prompt`'s placeholder handling, `os.kill(pid, 0)`'s two exceptions, and that importing `audiocript` neither starts the TUI nor costs more than a second.
+
 ## Global Constraints
 
 - **Platform:** macOS 14.4+ only. `pbcopy`, `osascript`, `afplay` and the CoreGraphics event tap are macOS-specific.
@@ -29,7 +42,10 @@ If a step leaves you genuinely unable to proceed, that is a plan defect. Say so 
 - **Dependency direction is one-way.** `dictate.py` → `dictation.py`, `audiocript.py`, `publish.py`. None of those three imports either new module.
 - **`audiocript.py` is not modified.** Outside the new files, only `run.sh`, `README.md` and `CHANGELOG.md` are touched.
 - **Clipboard safety rule:** the clipboard is written exactly once per dictation, and not at all when there is nothing to write. Destroying what the user had is the worst available outcome.
-- **Every fake the tests need is defined in `tests/test_dictation.py`** and imported from there by `tests/test_dictate.py`. Do not define the same double twice.
+- **Doubles shared by both test files live in `tests/support.py`** — which already exists to carry what every test needs. Do **not** import them from one test file into another: `support.run` ends in `sys.exit`, so importing a test file executes its whole suite and exits before the importing file runs anything, with status 0. It would look like a pass.
+- **Every test file ends with `if __name__ == "__main__":` before its `run(...)` call**, matching `tests/test_publish.py` and `tests/test_stream_resample.py`. This is what makes a file importable at all.
+- **`tests/test_publish.py` is safe to import from** — it guards its own `run(...)`, verified by importing it. Its `FakeAPI` and `completion` helpers are reused rather than reimplemented.
+- Python puts a script's own directory at `sys.path[0]` regardless of the working directory, so `from support import …` works whether a test is run directly or through `run_all.py`. Verified.
 
 ---
 
@@ -84,9 +100,7 @@ If it answers, `DEFAULT_MODEL` stays. If the model id is rejected, pick the chea
 
 - [ ] **Step 2: Write the failing tests**
 
-Create `tests/test_dictation.py` with a docstring saying nothing here may reach a real API or read a developer's `.env` — every test passes an explicit `env`, so `publish.env_value` is never consulted.
-
-Two helpers the rest of the plan imports from this file:
+First add the three doubles both test files need to `tests/support.py`, beside the helpers already there — `FakeClipboard` and `RecordingSink` are used by Tasks 2–4, `fake_env` by Tasks 1–5. They must not live in a test file; see the Global Constraints.
 
 ```python
 def fake_env(**values):
@@ -96,6 +110,28 @@ def fake_env(**values):
     return env
 
 
+class FakeClipboard:
+    def __init__(self, initial="ONCEKI ICERIK"):
+        self.text, self.writes = initial, 0
+
+    def copy(self, text):
+        self.text = text
+        self.writes += 1
+
+
+class RecordingSink:
+    def __init__(self):
+        self.calls = []
+
+    def recording(self): self.calls.append(("recording", None))
+    def processing(self): self.calls.append(("processing", None))
+    def done(self, text): self.calls.append(("done", text))
+    def failed(self, reason): self.calls.append(("failed", reason))
+```
+
+Then create `tests/test_dictation.py`, its docstring saying nothing here may reach a real API or read a developer's `.env` — every test passes an explicit `env`, so `publish.env_value` is never consulted. Its one local helper:
+
+```python
 BASE_ENV = dict(OPENAI_API_KEY="sk-test")
 
 
@@ -126,10 +162,14 @@ def _refuses(cfg, env, because):
 | `test_bad_max_seconds_is_refused` | `_refuses` for `"soon"` and for `0` |
 | `test_it_resolves_where_publish_config_would_not` | with only `OPENAI_API_KEY` set and `publish.ROOT` pointed at an empty directory, `publish.config()` is `None` while `resolve_config` succeeds — dictation must not inherit publishing's requirement for GitHub credentials |
 
-The file needs `from support import A, run` (for `A.LANGUAGES`), `import dictation`, and
-`import publish` for the last row.
+The file needs `from support import A, run, fake_env`, `import dictation`, and `import publish` for the last row.
 
-End the file with `run([n for n in sorted(globals()) if n.startswith("test_")], globals())`.
+End the file with the guarded runner. The name scan is a deliberate divergence from the explicit lists the existing test files use: an enumerated list lets a newly written test be silently never run.
+
+```python
+if __name__ == "__main__":
+    run([n for n in sorted(globals()) if n.startswith("test_")], globals())
+```
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -201,27 +241,7 @@ class NotifySink(StatusSink):
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/test_dictation.py`, above the final `run(...)`. Two doubles that later tasks import from here:
-
-```python
-class FakeClipboard:
-    def __init__(self, initial="ONCEKI ICERIK"):
-        self.text, self.writes = initial, 0
-
-    def copy(self, text):
-        self.text = text
-        self.writes += 1
-
-
-class RecordingSink:
-    def __init__(self):
-        self.calls = []
-
-    def recording(self): self.calls.append(("recording", None))
-    def processing(self): self.calls.append(("processing", None))
-    def done(self, text): self.calls.append(("done", text))
-    def failed(self, reason): self.calls.append(("failed", reason))
-```
+Append to `tests/test_dictation.py`, above the guarded `run(...)`. `FakeClipboard` and `RecordingSink` already exist in `support.py` from Task 1 — import them, do not redefine them.
 
 The one test worth writing out, because the encoding is the thing under test and a developer's clipboard must survive the suite:
 
@@ -327,7 +347,11 @@ Close with: the reply is the corrected text and nothing else.
 
 Append to `tests/test_dictation.py`, above the final `run(...)`.
 
-The provider double: copy the local-`HTTPServer` fake from `tests/test_publish.py` rather than writing a new one, with one change — its handler must accept a `reply` that is either a string or a `callable(prompt) -> str`, so one test can capture the prompt it was sent. Expose it as `fake_provider(reply, status=200)`, a context manager yielding the base URL, and a `_config(base)` helper returning `resolve_config({}, fake_env(OPENAI_API_KEY="sk-test", OPENAI_API_BASE=base))`.
+The provider double already exists and needs no changes: `from test_publish import FakeAPI, completion`. `FakeAPI(routes)` takes a dict keyed by `(method, path_prefix)` whose values are lists of `(status, payload)` replies, serves on `127.0.0.1` on a free port, exposes `.url` and `.close()`, and **records every request in `.requests` as `{"method", "path", "body", "headers"}` with `body` already parsed from JSON**. So the prompt that was sent is `api.requests[0]["body"]["messages"][0]["content"]` — no callable reply is needed. `completion(text)` builds the response payload.
+
+One local helper: `_config(base)` returning `resolve_config({}, fake_env(OPENAI_API_KEY="sk-test", OPENAI_API_BASE=base))`.
+
+A provider failure is `FakeAPI` with a `(500, {})` reply; an unreachable provider is `_config("http://127.0.0.1:1")` with no server at all. Close every `FakeAPI` in a `finally`.
 
 Fixtures, shared by the tests below:
 
@@ -339,17 +363,31 @@ FIXED = "Bu PR'ı bugün merge edemeyiz, çünkü o repo'daki testler geçmiyor.
 The three tests written out, because each pins a rule the spec states and prose cannot enforce:
 
 ```python
+ROUTE = ("POST", "/v1/chat/completions")
+
+
+def _bases():
+    """Both ways the provider can fail: a 500, and nothing listening at all."""
+    api = FakeAPI({ROUTE: [(500, {})]})
+    yield api.url, api
+    api.close()
+    yield "http://127.0.0.1:1", None
+
+
 def test_a_failing_provider_still_delivers_the_raw_transcript():
     # The user has already spoken and is waiting. Unpunctuated Turkish beats nothing.
-    for base_ctx in (fake_provider("ignored", status=500), _unreachable()):
-        clip, sink = FakeClipboard(), RecordingSink()
-        with base_ctx as base:
+    for base, api in _bases():
+        try:
+            clip, sink = FakeClipboard(), RecordingSink()
             d = dictation.deliver(RAW, _config(base), clip, sink)
-        assert d.status == dictation.UNCORRECTED, f"status {d.status!r}"
-        assert clip.text == RAW, f"clipboard {clip.text!r} != the raw transcript"
-        assert clip.writes == 1, f"clipboard written {clip.writes} times"
-        assert d.detail, "no reason was recorded"
-        assert any(k == "done" for k, _ in sink.calls), f"sink {sink.calls!r}"
+            assert d.status == dictation.UNCORRECTED, f"{base}: status {d.status!r}"
+            assert clip.text == RAW, f"{base}: clipboard {clip.text!r} != the raw transcript"
+            assert clip.writes == 1, f"{base}: clipboard written {clip.writes} times"
+            assert d.detail, f"{base}: no reason was recorded"
+            assert any(k == "done" for k, _ in sink.calls), f"{base}: {sink.calls!r}"
+        finally:
+            if api:
+                api.close()
 
 
 def test_an_empty_transcript_leaves_the_clipboard_alone():
@@ -365,24 +403,25 @@ def test_an_empty_transcript_leaves_the_clipboard_alone():
 def test_the_transcript_is_inlined_into_the_prompt():
     # A prompt file edited into a shape with no placeholder would append the
     # transcript instead, and the model would read the rules as the text.
-    seen = []
-    with fake_provider(lambda prompt: seen.append(prompt) or FIXED) as base:
-        dictation.deliver(RAW, _config(base), FakeClipboard(), RecordingSink())
-    assert RAW in seen[0], "the transcript did not reach the prompt"
-    assert not seen[0].rstrip().endswith(RAW), (
+    api = FakeAPI({ROUTE: [(200, completion(FIXED))]})
+    try:
+        dictation.deliver(RAW, _config(api.url), FakeClipboard(), RecordingSink())
+    finally:
+        api.close()
+    sent = api.requests[0]["body"]["messages"][0]["content"]
+    assert RAW in sent, "the transcript did not reach the prompt"
+    assert not sent.rstrip().endswith(RAW), (
         "the transcript landed at the end — the placeholder was not found")
 ```
-
-`_unreachable()` is a trivial context manager yielding `"http://127.0.0.1:1"`, so both provider failures run the same assertions.
 
 The remaining tests:
 
 | Test | Asserts |
 |---|---|
-| `test_corrected_text_reaches_the_clipboard` | reply `FIXED` → `status == CORRECTED`, `clip.text == FIXED`, `clip.writes == 1`, `("done", FIXED)` in the sink's calls |
-| `test_a_reply_that_grows_too_much_is_refused` | reply `RAW * 5` → `SKIPPED`, `clip.text == RAW` |
-| `test_a_reply_that_shrinks_too_much_is_refused` | reply `"Testler geçmiyor."` → `SKIPPED`, `clip.text == RAW` |
-| `test_an_empty_reply_is_refused` | reply `"   "` → `SKIPPED`, `clip.text == RAW` |
+| `test_corrected_text_reaches_the_clipboard` | `completion(FIXED)` → `status == CORRECTED`, `clip.text == FIXED`, `clip.writes == 1`, `("done", FIXED)` in the sink's calls |
+| `test_a_reply_that_grows_too_much_is_refused` | `completion(RAW * 5)` → `SKIPPED`, `clip.text == RAW` |
+| `test_a_reply_that_shrinks_too_much_is_refused` | `completion("Testler geçmiyor.")` → `SKIPPED`, `clip.text == RAW` |
+| `test_an_empty_reply_is_refused` | `completion("   ")` → `SKIPPED`, `clip.text == RAW` |
 | `test_the_fixture_exercises_the_guards_middle` | `MIN_SHRINK < len(FIXED)/len(RAW) < MAX_GROWTH` — otherwise the happy-path test is silently testing a guard breach |
 | `test_the_prompt_file_carries_a_placeholder` | `re.search(r"^\[[^\]\n]*\]\s*$", PROMPT_PATH.read_text(), re.MULTILINE)` matches |
 
@@ -464,7 +503,9 @@ class Daemon:
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `tests/test_dictate.py`. Docstring: no test here opens a microphone, loads a model, or reaches a provider — the daemon takes its capture, transcription and delivery as parameters for exactly that reason. Import `FakeClipboard`, `RecordingSink` and `fake_env` from `test_dictation`.
+Create `tests/test_dictate.py`. Docstring: no test here opens a microphone, loads a model, or reaches a provider — the daemon takes its capture, transcription and delivery as parameters for exactly that reason.
+
+It needs `from support import run, fake_env, FakeClipboard, RecordingSink`, plus `pathlib`, `threading`, `time`, `dictate` and `dictation`. **Import the doubles from `support`, never from `test_dictation`** — see the Global Constraints for why that would silently pass.
 
 Two pieces of scaffolding the tests share:
 
@@ -551,7 +592,12 @@ The rest. Each drives `build(...)`, calls `toggle()` as described, and waits wit
 | `test_the_capture_is_always_discarded` | toggle, toggle, join | `"discard"` in the last capture's events |
 | `test_the_duration_bound_stops_the_recording_by_itself` | `max_seconds=1`; one toggle; poll for `IDLE` up to 10s | reaches `IDLE` on its own; something was delivered; a sink message contains `sınır` |
 
-End with `run([n for n in sorted(globals()) if n.startswith("test_")], globals())`.
+End with the same guarded runner Task 1 used:
+
+```python
+if __name__ == "__main__":
+    run([n for n in sorted(globals()) if n.startswith("test_")], globals())
+```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -567,7 +613,7 @@ Module docstring: this module holds the threads and the state; `dictation.py` ho
 
 - `start` makes a directory with `tempfile.mkdtemp`, then opens the microphone through `audiocript._start_mic(shim, raw_path, announce)`. The shim exposes only `.mic_index` — from `audiocript._resolve_mic_index(cfg)` — and `.cfg`; that is all `_start_mic` reads, and building a `_TuiState` would drag the whole TUI into the daemon. Going through `_start_mic` rather than `DeviceRecorder` directly is deliberate: its retry loop exists because refused microphone opens cost two real recordings.
 - `announce` routes to `audiocript._log_problem` or drops the message — the daemon has no status line.
-- `stop` stops the recorder and writes a 16 kHz mono WAV inside the temporary directory with `audiocript._stream_source_to_wav`, returning its path. Re-resolve that function's exact argument list from the source at implementation time.
+- `stop` stops the recorder, then converts the raw capture to a 16 kHz mono WAV inside the temporary directory. **`_stream_source_to_wav` does not take a path** — its signature is `_stream_source_to_wav(reader, rate, out_path, target_fs=16000, on_progress=None)`, and the reader is an `audiocript._RawPcmReader(path, dtype, channels)` used as a context manager (`__len__`, `__enter__`, `__exit__`, `read(start, stop)`). The chain is: build the reader from the raw file with `DeviceRecorder.RAW_DTYPE` and the recorder's `.channels`, enter it, and pass it with the recorder's native `.rate`. `DeviceRecorder.manifest()` already returns exactly `{"kind", "file", "rate", "channels", "dtype"}`, so read the three values from there rather than assembling them by hand. Return the WAV's path.
 - `discard` stops a running recorder and removes the directory with `shutil.rmtree(..., ignore_errors=True)`. **It must never raise** — every failure path calls it.
 
 - [ ] **Step 4: Implement `Daemon`**
@@ -665,7 +711,7 @@ class SpyHotKeys:
 | `test_the_configured_hotkey_is_the_one_registered` | with `{"dictation_hotkeys": {"toggle": "<cmd>+<shift>+<alt>+k"}}`, that combination is a key of `SpyHotKeys.registered` |
 | `test_the_default_hotkey_is_registered_when_config_is_silent` | with `{}`, `DEFAULT_HOTKEYS["toggle"]` is a key of `SpyHotKeys.registered` |
 
-The pid-file tests each run inside `support.workdir("pid")` against `d / "dictate.pid"`:
+The pid-file tests each run inside `workdir("pid")` — add it to the file's `support` import — against `d / "dictate.pid"`, and need `os`:
 
 | Test | Asserts |
 |---|---|
@@ -730,6 +776,8 @@ git commit -m "feat: bind the dictation hotkey and manage the daemon's lifecycle
 - [ ] **Step 1: Add the `--dictate` switch to `run.sh`**
 
 Read `run.sh` first and follow its structure. The switch reuses the dependency and virtualenv setup the script already performs, then runs `dictate.py` instead of `audiocript.py` as the final step. Do not duplicate the setup.
+
+**The trap:** the script's last line is `exec "$VPY" audiocript.py "$@"`, so an unhandled `--dictate` is forwarded to `audiocript.py` — which reads no arguments at all and would launch the TUI as if nothing had been asked for. Consume the switch before that line: read it off `$1`, `shift`, and swap the script the `exec` targets, leaving the remaining arguments to pass through as they do today.
 
 - [ ] **Step 2: Verify the switch reaches the daemon**
 
