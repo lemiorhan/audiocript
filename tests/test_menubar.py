@@ -1,13 +1,16 @@
 """menubar: turning the menu model into NSMenu objects, and back into actions.
 
 More of this is testable than the plan expected. MenuBar takes the status bar as a
-parameter, so a fake one keeps the two icons out of the real menu bar; NSMenu and
+parameter, so a fake one keeps the test's icon out of the real menu bar; NSMenu and
 NSMenuItem need no window; and AppKit's own action dispatch can be driven directly
 through NSApp.sendAction_to_from_, which is how every click below is delivered.
 
-What is left for a human: whether a dimmed icon looks dimmed, whether a tooltip
-appears on hover, and whether a menu opens where the pointer is. Those are in the
-spec's acceptance criteria, not here.
+There is one status item. Two were built first, and a menu bar manager (Ice) moved the
+second one's window to x=-4577 on a 1920-wide screen — off screen, while isVisible()
+still reported true — so half the feature was invisible and looked absent.
+
+What is left for a human: whether a tooltip appears on hover, and whether the menu
+opens where the pointer is.
 
 No test here runs the loop. NSApplication.sharedApplication() is created because
 sendAction_to_from_ needs an application object, but app.run() is never called.
@@ -28,13 +31,10 @@ AppKit.NSApplication.sharedApplication().setActivationPolicy_(
 
 class FakeButton:
     def __init__(self):
-        self.title, self.dimmed = None, None
+        self.title = None
 
     def setTitle_(self, title):
         self.title = title
-
-    def setAppearsDisabled_(self, dimmed):
-        self.dimmed = dimmed
 
 
 class FakeStatusItem:
@@ -49,7 +49,7 @@ class FakeStatusItem:
 
 
 class FakeStatusBar:
-    """Keeps the test's icons out of the real menu bar."""
+    """Keeps the test's icon out of the real menu bar."""
 
     def __init__(self):
         self.items = []
@@ -172,19 +172,19 @@ def test_every_click_reaches_the_daemon():
     selector name, the target, the tag — is the part that can silently be wrong."""
     with workdir("menubar-clicks") as home:
         bar, daemon, history, clipboard, _ = _bar(home)
-        _click(bar._power_menu, bar._power_table, "power_on")
+        _click(bar._menu, bar._table, "power_on")
         assert daemon.calls == ["enable"], daemon.calls
 
         bar._daemon.power, bar._daemon.state = dictation.POWER_ON, dictation.IDLE
         bar.refresh()
-        _click(bar._dictation_menu, bar._dictation_table, "record_toggle")
+        _click(bar._menu, bar._table, "record_toggle")
         assert daemon.calls == ["enable", "toggle"], daemon.calls
-        _click(bar._power_menu, bar._power_table, "power_off")
+        _click(bar._menu, bar._table, "power_off")
         assert daemon.calls == ["enable", "toggle", "disable"], daemon.calls
 
         history.append("Toplantıyı yarına alalım.", dictation.CORRECTED)
         bar.refresh()
-        _click(bar._dictation_menu, bar._dictation_table, "copy")
+        _click(bar._menu, bar._table, "copy")
         assert clipboard.text == "Toplantıyı yarına alalım.", clipboard.text
         print(f"  {daemon.calls}, clipboard={clipboard.text!r}")
 
@@ -199,7 +199,7 @@ def test_quit_stops_the_loop_instead_of_the_process():
     try:
         with workdir("menubar-quit") as home:
             bar, daemon, _h, _c, _b = _bar(home)
-            _click(bar._power_menu, bar._power_table, "quit")
+            _click(bar._menu, bar._table, "quit")
     finally:
         menubar.stop_the_loop = saved
     assert stopped == [True], "the quit row did not stop the loop"
@@ -216,7 +216,7 @@ def test_a_stale_tag_is_logged_rather_than_raised():
     try:
         with workdir("menubar-stale") as home:
             bar, _d, _h, _c, _b = _bar(home)
-            bar._invoke([], 3)
+            bar._invoke(3)
     finally:
         A._log_problem = saved
     assert logged and "tag" in logged[0], f"nothing useful was logged: {logged!r}"
@@ -233,49 +233,29 @@ def test_an_action_that_raises_does_not_escape():
             def angry():
                 raise OSError("the microphone is on fire")
             daemon.enable = angry
-            bar._invoke([("power_on", None)], 0)
+            bar._table = [("power_on", None)]
+            bar._invoke(0)
     finally:
         A._log_problem = saved
     assert logged and "power_on" in logged[0], f"nothing useful was logged: {logged!r}"
 
 
-def test_the_icons_follow_the_daemon():
+def test_the_icon_follows_the_daemon():
     with workdir("menubar-icons") as home:
         bar, daemon, _h, _c, status_bar = _bar(home)
-        power_button = bar._power_item.button()
-        dictation_button = bar._dictation_item.button()
+        assert len(status_bar.items) == 1, \
+            f"{len(status_bar.items)} status items were created; there is one icon"
+        button = bar._item.button()
         seen = {}
         for power in dictation.POWERS:
             for state in dictation.STATES:
                 daemon.power, daemon.state = power, state
                 bar.refresh()
-                seen[(power, state)] = (power_button.title,
-                                        dictation_button.title,
-                                        dictation_button.dimmed)
-        for (power, state), (power_title, dictation_title, dimmed) in seen.items():
-            assert power_title == dictation.power_icon(power), \
-                f"({power}, {state}) drew {power_title!r} for the power icon"
-            expected_title, expected_dim = dictation.dictation_icon(power, state)
-            assert dictation_title == expected_title, \
-                f"({power}, {state}) drew {dictation_title!r}"
-            assert dimmed is expected_dim, f"({power}, {state}) dimmed={dimmed}"
+                seen[(power, state)] = button.title
+        for (power, state), title in seen.items():
+            assert title == dictation.icon(power, state), \
+                f"({power}, {state}) drew {title!r}"
         print(f"  {len(seen)} combinations, all drawn from the model")
-
-
-def test_the_dictation_icon_is_created_first():
-    """Creation order is position, and position decides which icon a menu bar manager
-    swallows. NSStatusBar puts the first item created rightmost, nearest the clock,
-    and every later one to its left: measured, the first item's window sat at x=1054
-    on a 1920-wide screen while the second sat at x=-4577, where Ice had moved it.
-
-    The dictation icon is the one used constantly, so it is created first and takes
-    the position least likely to be hidden."""
-    with workdir("menubar-order") as home:
-        bar, _d, _h, _c, status_bar = _bar(home)
-        assert status_bar.items[0] is bar._dictation_item, (
-            "the power icon was created first, which gives the dictation icon the "
-            "position a menu bar manager hides")
-        assert status_bar.items[1] is bar._power_item, "only two items belong here"
 
 
 def test_refresh_redraws_only_when_something_changed():
@@ -310,7 +290,7 @@ def test_an_unreadable_history_does_not_look_empty():
             bar, _d, _h, _c, _b = _bar(home, history=dictation.History(path))
         finally:
             A._log_problem = saved
-        titles = _titles(bar._dictation_menu)
+        titles = _titles(bar._menu)
         assert "Geçmiş okunamadı" in titles, titles
         assert "Henüz dictation yok" not in titles, titles
         assert logged, "the unreadable log was not reported anywhere"

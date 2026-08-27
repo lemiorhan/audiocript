@@ -1,4 +1,4 @@
-"""The menu bar: two status items, their menus, and the run loop that owns the main
+"""The menu bar: one status item, its menu, and the run loop that owns the main
 thread.
 
 Nothing here decides what the user sees. Which glyph an icon shows and what a menu
@@ -10,14 +10,18 @@ where it can be tested — there is no headless AppKit.
 Every AppKit behaviour this module relies on was measured on this machine before it
 was written, because none of it is checkable from a test that does not click:
 
-- A non-bundled Python process can own two NSStatusItems, both visible, with emoji
-  titles, under NSApplicationActivationPolicyAccessory (no Dock icon).
+- A non-bundled Python process can own an NSStatusItem with an emoji title under
+  NSApplicationActivationPolicyAccessory (no Dock icon).
+- There is exactly one item, and that is a decision rather than a simplification. Two
+  were built first; a menu bar manager (Ice) moved the second one's window to x=-4577
+  on a 1920-wide screen — off screen, while isVisible() still reported true — so half
+  the feature was invisible and looked absent. One item cannot be half-hidden.
 - A PyObjC subclass instance carries a plain Python attribute, which is how the click
   target reaches its handler.
 - NSApp.sendAction_to_from_ delivers a menu item's action to that target with the
   item's tag intact.
-- setAppearsDisabled_ and setToolTip_ both round-trip. Whether they *look* right is
-  the one thing left for a human to check.
+- setToolTip_ round-trips. Whether it *appears* on hover is the one thing left for a
+  human to check.
 - app.stop_(None) does NOT end the run loop on its own; paired with a posted
   application-defined event it does, and app.run() returns to its caller — measured
   at 804 ms from a signal handler, with the caller's `finally` reached. NSApp's
@@ -131,9 +135,9 @@ def stop_the_loop():
 
 
 class MenuBar:
-    """Both status items, and the refresh that keeps them true.
+    """The status item, and the refresh that keeps it true.
 
-    The icons and menus are derived from the daemon's own two attributes on every
+    The icon and the menu are derived from the daemon's own two attributes on every
     heartbeat, not pushed by a status sink. That is deliberate: the sink's moments are
     content reports, not state transitions, and an icon drawn from them goes stale
     three different ways —
@@ -157,38 +161,19 @@ class MenuBar:
         self._history = history
         self._clipboard = clipboard
         bar = bar or AppKit.NSStatusBar.systemStatusBar()
-        # Creation order is position, and position decides which of the two a menu
-        # bar manager swallows. NSStatusBar puts the first item created rightmost,
-        # nearest the clock, and every later one to its left — measured on this
-        # machine, where the first item's window sat at x=1054 on a 1920-wide screen
-        # and the second at x=-4577, which is where Ice had moved it out of sight.
-        #
-        # So the dictation icon is created first. It is the one used constantly; the
-        # power icon is clicked twice a day, and it is the one that can afford to be
-        # the one hidden.
-        self._dictation_item = bar.statusItemWithLength_(
-            AppKit.NSVariableStatusItemLength)
-        self._power_item = bar.statusItemWithLength_(
-            AppKit.NSVariableStatusItemLength)
-        self._power_menu = AppKit.NSMenu.alloc().init()
-        self._dictation_menu = AppKit.NSMenu.alloc().init()
-        self._power_item.setMenu_(self._power_menu)
-        self._dictation_item.setMenu_(self._dictation_menu)
-        # One target per menu, so a tag is unambiguous: the two tables are rebuilt
-        # independently and a tag means nothing without knowing which one it indexes.
-        self._power_table, self._dictation_table = [], []
-        self._power_target = _Clicks.alloc().init()
-        self._power_target.handler = lambda tag: self._invoke(self._power_table, tag)
-        self._dictation_target = _Clicks.alloc().init()
-        self._dictation_target.handler = \
-            lambda tag: self._invoke(self._dictation_table, tag)
+        self._item = bar.statusItemWithLength_(AppKit.NSVariableStatusItemLength)
+        self._menu = AppKit.NSMenu.alloc().init()
+        self._item.setMenu_(self._menu)
+        self._table = []
+        self._target = _Clicks.alloc().init()
+        self._target.handler = self._invoke
         self._drawn = None
         self.refresh()
 
     # --------------------------------- drawing ---------------------------------
 
     def refresh(self):
-        """Redraw both icons and both menus if anything they show has changed.
+        """Redraw the icon and the menu if anything they show has changed.
 
         Called on every heartbeat and after every menu action, always on the main
         thread. The fingerprint comparison is what keeps five wake-ups a second from
@@ -199,18 +184,10 @@ class MenuBar:
         if current == self._drawn:
             return
         self._drawn = current
-        self._power_item.button().setTitle_(dictation.power_icon(power))
-        title, dimmed = dictation.dictation_icon(power, state)
-        button = self._dictation_item.button()
-        button.setTitle_(title)
-        button.setAppearsDisabled_(dimmed)
-        self._power_table = render(self._power_menu,
-                                   dictation.power_menu(power, state),
-                                   self._power_target)
-        self._dictation_table = render(
-            self._dictation_menu,
-            dictation.dictation_menu(power, state, self._entries()),
-            self._dictation_target)
+        self._item.button().setTitle_(dictation.icon(power, state))
+        self._table = render(self._menu,
+                             dictation.menu(power, state, self._entries()),
+                             self._target)
 
     def _entries(self):
         """The newest dictations, or None when the log could not be read.
@@ -227,7 +204,7 @@ class MenuBar:
 
     # -------------------------------- the actions --------------------------------
 
-    def _invoke(self, table, tag):
+    def _invoke(self, tag):
         """Run what a clicked row carried.
 
         Guarded twice over. An exception here would escape into AppKit's own action
@@ -236,7 +213,7 @@ class MenuBar:
         rebuilt, which is a thing to log rather than to crash on.
         """
         try:
-            action, payload = table[tag]
+            action, payload = self._table[tag]
         except IndexError:
             A._log_problem(f"a menu row's tag ({tag}) outlived its table", None)
             return
@@ -282,7 +259,7 @@ class MenuBar:
 
 
 def run(daemon, history, clipboard):
-    """Put both icons in the menu bar and run the loop until something stops it.
+    """Put the icon in the menu bar and run the loop until something stops it.
 
     Returns when the loop does, so the caller's shutdown runs — see stop_the_loop.
     """

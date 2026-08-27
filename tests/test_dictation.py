@@ -794,6 +794,11 @@ def test_concurrent_appends_do_not_interleave():
 # Every case below iterates dictation.POWERS and dictation.STATES rather than naming
 # the values: a fourth value added to either tuple widens all of these at once, where
 # a listed pair would leave it unguarded and silent.
+#
+# There is one icon and one menu. Two were built first, and a menu bar manager moved
+# the second item's window off screen (measured at x=-4577 on a 1920-wide display)
+# while isVisible() still reported true — half the feature invisible and indist-
+# inguishable from absent. One item cannot be half-hidden.
 
 
 def _entry(text, status=None):
@@ -806,52 +811,51 @@ def _all_pairs():
             for state in dictation.STATES]
 
 
-def _titled(items):
-    """The items that are not separators, as (title, action, enabled) triples."""
-    return [(i.title, i.action, i.enabled) for i in items if not i.separator]
+def _rows(power, state, entries=()):
+    """The menu as (title, action, enabled) triples, separators dropped."""
+    return [(i.title, i.action, i.enabled)
+            for i in dictation.menu(power, state, entries) if not i.separator]
+
+
+def _actions(power, state, entries=()):
+    return {action: enabled for _title, action, enabled in _rows(power, state, entries)
+            if action}
 
 
 def test_every_power_and_state_has_an_icon():
-    for power in dictation.POWERS:
-        assert dictation.power_icon(power), f"no icon for power {power!r}"
     for power, state in _all_pairs():
-        title, _dimmed = dictation.dictation_icon(power, state)
-        assert title, f"no icon for ({power!r}, {state!r})"
-    icons = {dictation.power_icon(p) for p in dictation.POWERS}
-    assert len(icons) == len(dictation.POWERS), \
-        f"two power values draw the same icon: {icons}"
-    print(f"  power icons {sorted(icons)}")
-
-
-def test_the_dimmed_flag_follows_power():
-    """Icon 2 is not clickable for anything while the daemon is down, and has to look
-    that way — an icon that looks live and does nothing is worse than a dim one."""
-    for power, state in _all_pairs():
-        _title, dimmed = dictation.dictation_icon(power, state)
-        expected = power != dictation.POWER_ON
-        assert dimmed is expected, \
-            f"({power!r}, {state!r}) dimmed={dimmed}, expected {expected}"
-
-
-def test_the_recording_stage_reaches_icon_two():
-    """The three stages have to be distinguishable at a glance: this is the whole
-    replacement for the sound cue when the user is looking at the screen."""
-    live = {state: dictation.dictation_icon(dictation.POWER_ON, state)[0]
+        assert dictation.icon(power, state), f"no icon for ({power!r}, {state!r})"
+    live = {state: dictation.icon(dictation.POWER_ON, state)
             for state in dictation.STATES}
     assert len(set(live.values())) == len(dictation.STATES), \
         f"two stages draw the same icon: {live}"
-    print(f"  {live}")
+    down = {power: dictation.icon(power, dictation.IDLE)
+            for power in dictation.POWERS}
+    assert len(set(down.values())) == len(dictation.POWERS), \
+        f"two powers draw the same icon while idle: {down}"
+    print(f"  down={down}  live={live}")
+
+
+def test_the_icon_says_the_daemon_is_down_before_it_says_anything_else():
+    """One glyph carries both axes, so the power axis has to win while the daemon is
+    not up: a microphone over a daemon that cannot record is a lie, and the states
+    below ON are unreachable anyway (power OFF implies state IDLE)."""
+    for power in dictation.POWERS:
+        if power == dictation.POWER_ON:
+            continue
+        icons = {dictation.icon(power, state) for state in dictation.STATES}
+        assert len(icons) == 1, \
+            f"power {power!r} draws {icons} depending on a state it cannot be in"
 
 
 def test_stop_and_quit_are_refused_while_busy():
-    """The rule the user asked for: the daemon cannot be stopped before the recording
-    ends. The invariant lives in Daemon.disable; this is the menu telling the truth
-    about it in advance, instead of offering an item that would be refused."""
+    """The rule the user asked for by name: the daemon cannot be stopped before the
+    recording ends. The invariant lives in Daemon.disable; this is the menu telling the
+    truth about it in advance instead of offering a row that would be refused."""
     for state in dictation.STATES:
-        items = _titled(dictation.power_menu(dictation.POWER_ON, state))
-        actions = {action: enabled for _title, action, enabled in items}
-        assert "power_off" in actions, f"no stop item in state {state!r}: {items}"
-        assert "quit" in actions, f"no quit item in state {state!r}: {items}"
+        actions = _actions(dictation.POWER_ON, state)
+        assert "power_off" in actions, f"no stop row in state {state!r}"
+        assert "quit" in actions, f"no quit row in state {state!r}"
         expected = state == dictation.IDLE
         assert actions["power_off"] is expected, \
             f"stop enabled={actions['power_off']} in state {state!r}"
@@ -862,56 +866,77 @@ def test_stop_and_quit_are_refused_while_busy():
 
 def test_start_and_stop_never_both_appear():
     for power, state in _all_pairs():
-        actions = [action for _t, action, _e in
-                   _titled(dictation.power_menu(power, state))]
-        both = "power_on" in actions and "power_off" in actions
-        assert not both, f"({power!r}, {state!r}) offers both start and stop: {actions}"
+        actions = _actions(power, state)
+        assert not ("power_on" in actions and "power_off" in actions), \
+            f"({power!r}, {state!r}) offers both start and stop: {sorted(actions)}"
 
 
-def test_the_record_item_says_the_stage():
-    """Four different situations, four different words. "Kaydı başlat" while a
-    recording is running would be a lie, and a bare disabled item would not say why."""
+def test_a_load_can_be_called_off_while_it_runs():
+    """The only way out of an 11.3s load started by mistake. disable() accepts it and
+    _load's stale path drops what the load produced, so offering it here is honest."""
+    actions = _actions(dictation.POWER_LOADING, dictation.IDLE)
+    assert actions.get("power_off") is True, \
+        f"a load cannot be called off: {actions}"
+
+
+def test_no_two_rows_say_the_same_thing():
+    """The first version of this menu said "Model yükleniyor…" in both the dictation
+    row and the daemon row while loading. Two rows with one message is a menu that
+    looks broken."""
+    for power, state in _all_pairs():
+        titles = [title for title, _a, _e in _rows(power, state)]
+        assert len(titles) == len(set(titles)), \
+            f"({power!r}, {state!r}) repeats a row: {titles}"
+
+
+def test_the_dictation_row_says_the_stage():
+    """Four situations, four different words. "Kaydı başlat" while a recording is
+    running would be a lie, and a bare greyed row would not say why."""
     titles = {}
     for power, state in _all_pairs():
-        items = _titled(dictation.dictation_menu(power, state, []))
-        toggle = [(t, a, e) for t, a, e in items if a == "record_toggle"]
-        disabled = [(t, a, e) for t, a, e in items if a is None and not e]
-        assert toggle or disabled, f"({power!r}, {state!r}) offers no stage item"
-        first = (toggle or disabled)[0]
-        titles[(power, state)] = first[0]
-        clickable = power == dictation.POWER_ON and state in (dictation.IDLE,
-                                                              dictation.RECORDING)
-        assert bool(toggle) is clickable, \
-            f"({power!r}, {state!r}) clickable={bool(toggle)}, expected {clickable}"
+        first = dictation.menu(power, state, [])[0]
+        titles[(power, state)] = first.title
+        clickable = (power == dictation.POWER_ON
+                     and state in (dictation.IDLE, dictation.RECORDING))
+        assert (first.action == "record_toggle") is clickable, \
+            f"({power!r}, {state!r}) clickable={first.action!r}, expected {clickable}"
     assert len(set(titles.values())) >= 4, \
-        f"the stage items do not distinguish the situations: {set(titles.values())}"
+        f"the stage rows do not distinguish the situations: {set(titles.values())}"
     print(f"  {len(set(titles.values()))} distinct stage titles")
 
 
-def test_history_entries_become_copy_items():
+def test_the_dictation_row_comes_first():
+    """It is why the menu is opened. Fixed position, not rearranged per state: a row
+    that moves in a menu opened many times a day costs more than a dead row saves."""
+    for power, state in _all_pairs():
+        rows = dictation.menu(power, state, [_entry("Bir.")])
+        assert not rows[0].separator, f"({power!r}, {state!r}) opens with a separator"
+        assert rows[1].action in ("power_on", "power_off"), \
+            f"({power!r}, {state!r}) does not put the daemon row second: {rows[1]}"
+
+
+def test_history_entries_become_copy_rows():
     entries = [_entry(f"dictation {i}") for i in reversed(range(10))]
-    items = _titled(dictation.dictation_menu(dictation.POWER_ON, dictation.IDLE,
-                                             entries))
-    copies = [i for i in dictation.dictation_menu(dictation.POWER_ON, dictation.IDLE,
-                                                  entries) if i.action == "copy"]
-    assert len(copies) == 10, f"{len(copies)} copy items for 10 entries"
+    copies = [i for i in dictation.menu(dictation.POWER_ON, dictation.IDLE, entries)
+              if i.action == "copy"]
+    assert len(copies) == 10, f"{len(copies)} copy rows for 10 entries"
     assert [i.payload for i in copies] == [e.text for e in entries], \
-        "the copy items are not in the order they were given"
+        "the copy rows are not in the order they were given"
     assert copies[0].payload == "dictation 9", \
         f"the newest entry is not first: {copies[0].payload!r}"
-    print(f"  {len(copies)} copy items, newest first, from {len(items)} menu items")
+    print(f"  {len(copies)} copy rows, newest first")
 
 
-def test_a_copy_item_carries_the_whole_text():
+def test_a_copy_row_carries_the_whole_text():
     """The title is cut for reading; the click has to put back everything that was on
     the clipboard, or the history quietly truncates the user's dictations."""
     spoken = "Söz " * 400
-    items = [i for i in dictation.dictation_menu(
-        dictation.POWER_ON, dictation.IDLE, [_entry(spoken)]) if i.action == "copy"]
-    assert len(items) == 1, items
-    assert items[0].payload == spoken, "the payload is not the original text"
-    assert len(items[0].title) < len(spoken), "the title was not cut at all"
-    print(f"  title {len(items[0].title)} chars, payload {len(spoken)} chars")
+    rows = [i for i in dictation.menu(dictation.POWER_ON, dictation.IDLE,
+                                      [_entry(spoken)]) if i.action == "copy"]
+    assert len(rows) == 1, rows
+    assert rows[0].payload == spoken, "the payload is not the original text"
+    assert len(rows[0].title) < len(spoken), "the title was not cut at all"
+    print(f"  title {len(rows[0].title)} chars, payload {len(spoken)} chars")
 
 
 def test_the_preview_cuts_at_the_limit():
@@ -927,66 +952,60 @@ def test_the_preview_cuts_at_the_limit():
 
 
 def test_the_preview_collapses_whitespace():
-    """A menu item is one line. A newline in a title renders as a box or eats the
-    rest of the item, and the text a dictation produces has newlines in it."""
+    """A menu row is one line. A newline in a title renders as a box or eats the rest
+    of the row, and the text a dictation produces has newlines in it."""
     preview = dictation.menu_preview("Bir\n\nsatır   ve\tbir\r\nbaşka")
     assert preview == "Bir satır ve bir başka", repr(preview)
-    assert "\n" not in preview and "\t" not in preview, repr(preview)
     print(f"  {preview!r}")
 
 
 def test_an_empty_history_says_so():
     for power, state in _all_pairs():
-        items = dictation.dictation_menu(power, state, [])
-        copies = [i for i in items if i.action == "copy"]
-        assert not copies, f"({power!r}, {state!r}) invented {len(copies)} copy items"
-        placeholders = [i for i in items
-                        if i.action is None and not i.enabled and not i.separator]
-        assert placeholders, f"({power!r}, {state!r}) says nothing about an empty log"
+        rows = dictation.menu(power, state, [])
+        assert not [i for i in rows if i.action == "copy"], \
+            f"({power!r}, {state!r}) invented copy rows"
+        assert any(i.action is None and not i.enabled and not i.separator
+                   for i in rows), \
+            f"({power!r}, {state!r}) says nothing about an empty log"
 
 
 def test_an_unreadable_history_says_something_else():
     """"Henüz dictation yok" over a log that could not be read would send the user
-    looking for a bug in the recording. The two have to look different, and neither
-    may offer a copy row."""
+    looking for a bug in the recording. The two have to look different, and neither may
+    offer a copy row."""
     for power, state in _all_pairs():
-        items = dictation.dictation_menu(power, state, None)
-        titles = [i.title for i in items if i.action is None and not i.separator]
-        empty = [i.title for i in dictation.dictation_menu(power, state, [])
+        unreadable = [i.title for i in dictation.menu(power, state, None)
+                      if i.action is None and not i.separator]
+        empty = [i.title for i in dictation.menu(power, state, [])
                  if i.action is None and not i.separator]
-        assert titles != empty, \
-            f"({power!r}, {state!r}) says the same for unreadable and empty: {titles}"
-        assert not [i for i in items if i.action == "copy"], \
-            "an unreadable log produced copy rows"
+        assert unreadable != empty, \
+            f"({power!r}, {state!r}) says the same for unreadable and empty"
+        assert not [i for i in dictation.menu(power, state, None)
+                    if i.action == "copy"], "an unreadable log produced copy rows"
     print("  an unreadable log and an empty one read differently")
 
 
-def test_the_reveal_item_is_always_offered():
+def test_the_reveal_row_is_always_offered():
     """The file is the interface for anything the menu does not do — reading further
     back, editing, deleting — so it must be reachable whatever the daemon is doing."""
     for power, state in _all_pairs():
-        for entries in ([], [_entry("Bir.")]):
-            actions = [i.action for i in
-                       dictation.dictation_menu(power, state, entries)]
-            assert "reveal" in actions, \
-                f"({power!r}, {state!r}, {len(entries)} entries) hides the log"
+        for entries in ([], None, [_entry("Bir.")]):
+            assert "reveal" in _actions(power, state, entries), \
+                f"({power!r}, {state!r}, {entries!r}) hides the log"
 
 
 def test_every_action_is_a_known_one():
-    """A typo in an action name would produce a menu item that silently does nothing:
+    """A typo in an action name would produce a row that silently does nothing:
     menubar.py dispatches on these strings and has no reason to recognise a fourth
     spelling of "copy"."""
     seen = set()
     for power, state in _all_pairs():
         for entries in ([], None, [_entry("Bir."), _entry("İki.")]):
-            for builder in (dictation.power_menu, dictation.dictation_menu):
-                items = (builder(power, state) if builder is dictation.power_menu
-                         else builder(power, state, entries))
-                for item in items:
-                    assert item.action is None or item.action in dictation.MENU_ACTIONS, \
-                        f"unknown action {item.action!r} in {item.title!r}"
-                    if item.action:
-                        seen.add(item.action)
+            for item in dictation.menu(power, state, entries):
+                assert item.action is None or item.action in dictation.MENU_ACTIONS, \
+                    f"unknown action {item.action!r} in {item.title!r}"
+                if item.action:
+                    seen.add(item.action)
     assert seen == set(dictation.MENU_ACTIONS), (
         f"MENU_ACTIONS declares {sorted(set(dictation.MENU_ACTIONS) - seen)} that no "
         "menu ever offers")

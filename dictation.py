@@ -473,12 +473,14 @@ MENU_PREVIEW_CHARS = 250
 # does nothing, and a test scans this against what the builders below actually offer.
 MENU_ACTIONS = ("power_on", "power_off", "record_toggle", "copy", "reveal", "quit")
 
-# Icon 1 draws the power axis. Three glyphs rather than three colours: the menu bar is
-# monochrome in both appearances, and a filled/hollow distinction survives that.
-POWER_ICONS = {POWER_OFF: "◯", POWER_LOADING: "◌", POWER_ON: "●"}
-
-# Icon 2 draws one dictation's stage, and is dimmed whenever the daemon is not up.
-DICTATION_ICONS = {IDLE: "🎙", RECORDING: "🔴", PROCESSING: "⏳"}
+# One icon carries both axes, because one icon is all there is. While the daemon is not
+# up its power is the whole story — a microphone glyph over a daemon that cannot record
+# is a lie — and once it is up, the glyph is the dictation's stage.
+#
+# Glyphs rather than colours: the menu bar is monochrome in both appearances, so a
+# hollow/dotted distinction survives where a red/grey one would not.
+POWER_ICONS = {POWER_OFF: "◯", POWER_LOADING: "◌"}
+STAGE_ICONS = {IDLE: "🎙", RECORDING: "🔴", PROCESSING: "⏳"}
 
 # Said by both menus while the model loads, in the same words on purpose: one name per
 # thing the user is waiting for.
@@ -513,69 +515,79 @@ def menu_preview(text, limit=MENU_PREVIEW_CHARS):
     return one_line[:limit] + "…"
 
 
-def power_icon(power):
-    """Icon 1's title. An unexpected value draws the off glyph rather than raising:
-    this is called from a menu callback, where an exception is a wedged menu."""
-    return POWER_ICONS.get(power, POWER_ICONS[POWER_OFF])
+def icon(power, state):
+    """The status item's title: one glyph for both axes.
 
-
-def dictation_icon(power, state):
-    """Icon 2's title, and whether it is dimmed.
-
-    Dimmed for every power but ON, whatever the state. An icon that looks live and
-    does nothing is worse than one that says it is asleep."""
+    An unexpected value draws the off glyph rather than raising. This is called from a
+    menu callback, where an exception is a wedged menu bar."""
     if power != POWER_ON:
-        return DICTATION_ICONS[IDLE], True
-    return DICTATION_ICONS.get(state, DICTATION_ICONS[IDLE]), False
+        return POWER_ICONS.get(power, POWER_ICONS[POWER_OFF])
+    return STAGE_ICONS.get(state, STAGE_ICONS[IDLE])
 
 
-def power_menu(power, state):
-    """Icon 1's menu: start or stop the daemon, and quit.
-
-    Stop and quit are refused while a dictation is running. The invariant itself is in
-    dictate.Daemon.disable — this is the menu saying so in advance rather than
-    offering an item whose click would be turned down."""
-    idle = state == IDLE
-    if power == POWER_OFF:
-        first = MenuItem("Daemon'ı başlat", "power_on")
-    elif power == POWER_ON:
-        first = MenuItem("Daemon'ı durdur", "power_off", enabled=idle)
-    else:
-        first = MenuItem(LOADING_TITLE, enabled=False)
-    return [first, _separator(), MenuItem("Çıkış", "quit", enabled=idle)]
-
-
-
-def dictation_menu(power, state, entries):
-    """Icon 2's menu: the stage, the last dictations, and the log itself.
-
-    `entries` are HistoryEntry objects, newest first — the order History.recent
-    returns and the order the menu shows; `None` means the log could not be read. The
-    builder takes entries rather than a History so it stays pure: reading the file is
-    the caller's job, and the difference between "no dictations yet" and "unreadable"
-    is the caller's to report."""
+def _dictation_row(power, state):
+    """The row that starts and stops a dictation — the reason the menu is opened, so it
+    goes first."""
     if power == POWER_LOADING:
-        stage = MenuItem(LOADING_TITLE, enabled=False)
-    elif power != POWER_ON:
-        stage = MenuItem("Daemon kapalı", enabled=False)
-    elif state == IDLE:
-        stage = MenuItem("Kaydı başlat", "record_toggle")
-    elif state == RECORDING:
-        stage = MenuItem("Kaydı bitir", "record_toggle")
-    else:
-        stage = MenuItem("İşleniyor…", enabled=False)
+        return MenuItem(LOADING_TITLE, enabled=False)
+    if power != POWER_ON:
+        return MenuItem("Daemon kapalı", enabled=False)
+    if state == IDLE:
+        return MenuItem("Kaydı başlat", "record_toggle")
+    if state == RECORDING:
+        return MenuItem("Kaydı bitir", "record_toggle")
+    return MenuItem("İşleniyor…", enabled=False)
 
+
+def _power_row(power, state):
+    """The row that brings the daemon up and down.
+
+    Stopping is refused while a dictation is running. The invariant itself is in
+    dictate.Daemon.disable — this is the menu saying so in advance rather than offering
+    a row whose click would be turned down.
+
+    Stopping is offered while the model is still loading, and on purpose: disable()
+    accepts it (the load's own stale path drops what it produced), so this is the only
+    way to call off a load started by mistake — a wait of 11.3s otherwise. It also
+    keeps this row from repeating what the row above it already says while loading."""
+    if power == POWER_OFF:
+        return MenuItem("Daemon'ı başlat", "power_on")
+    return MenuItem("Daemon'ı durdur", "power_off", enabled=state == IDLE)
+
+
+def _history_rows(entries):
+    """The last dictations, or one row saying why there are none to show.
+
+    `entries` are HistoryEntry objects, newest first — the order History.recent returns
+    and the order the menu shows; `None` means the log could not be read. An unreadable
+    log is not an empty one and the menu must not say the one when the other is true:
+    History.recent raises rather than answering [] for exactly this, because "Henüz
+    dictation yok" over a file that could not be read would send the user looking for a
+    bug in the recording."""
     if entries is None:
-        # Not the same thing as an empty log, and the menu must not say the one when
-        # the other is true. History.recent raises rather than answering [] for
-        # exactly this: "Henüz dictation yok" over an unreadable file would send the
-        # user looking for a bug in the recording.
-        history = [MenuItem("Geçmiş okunamadı", enabled=False)]
-    elif entries:
-        history = [MenuItem(menu_preview(e.text), "copy", payload=e.text)
-                   for e in entries]
-    else:
-        history = [MenuItem("Henüz dictation yok", enabled=False)]
+        return [MenuItem("Geçmiş okunamadı", enabled=False)]
+    if not entries:
+        return [MenuItem("Henüz dictation yok", enabled=False)]
+    return [MenuItem(menu_preview(e.text), "copy", payload=e.text) for e in entries]
 
-    return [stage, _separator(), *history, _separator(),
-            MenuItem("Geçmiş dosyasını aç", "reveal")]
+
+def menu(power, state, entries):
+    """The whole menu, in a fixed order.
+
+    Fixed rather than rearranged for the current state: this menu is opened many times a
+    day, and a row that moves depending on what the daemon is doing costs more than the
+    dead row it would save. The dictation row is first because it is why the menu is
+    opened; the daemon row sits under it because it is clicked twice a day.
+
+    Quit follows the same rule as stopping the daemon — a dictation the user has already
+    spoken is not thrown away by a menu click.
+
+    Takes `entries` rather than a History so it stays pure: reading the file is the
+    caller's job, and so is deciding what an unreadable one means."""
+    return [_dictation_row(power, state),
+            _power_row(power, state),
+            _separator(),
+            *_history_rows(entries),
+            _separator(),
+            MenuItem("Geçmiş dosyasını aç", "reveal"),
+            MenuItem("Çıkış", "quit", enabled=state == IDLE)]
