@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 import wave
 from pathlib import Path
 
@@ -155,6 +156,16 @@ def run(names, namespace):
             print("  PASS")
         except AssertionError as e:
             print(f"  FAIL: {e}")
+            failed.append(name)
+        except Exception:
+            # A test that raises something other than an assertion is that test
+            # failing, not the file: catching it here keeps the tests after it
+            # running and keeps the name of the one that broke. Before this, an
+            # exception escaping the code under test aborted the whole script — twice
+            # during mutation testing that hid which test had caught the mutation,
+            # reporting a crashed file instead. BaseException is deliberately not
+            # caught: Ctrl-C still stops the run.
+            print("  FAIL: " + traceback.format_exc().strip().replace("\n", "\n    "))
             failed.append(name)
     if failed:
         print(f"\n{len(failed)} failed: {', '.join(failed)}")
