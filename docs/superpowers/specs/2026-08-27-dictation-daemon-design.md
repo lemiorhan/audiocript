@@ -141,8 +141,8 @@ because refused microphone opens cost two real recordings, and duplicating the c
 would lose it.
 
 `publish.config` is **not** reused. It returns `None` unless the two GitHub values are
-present alongside `OPENAI_API_KEY`, and dictation needs no GitHub access. `dictate.py`
-defines its own `dictation_config()` built on `publish.env_value`, so `.env` parsing
+present alongside `OPENAI_API_KEY`, and dictation needs no GitHub access. `dictation.py`
+defines its own `resolve_config()` built on `publish.env_value`, so `.env` parsing
 still lives in one place.
 
 ## Configuration
@@ -234,7 +234,8 @@ The daemon never calls `osascript` directly. It talks to a status sink:
 ```
 recording()          # capture started
 processing()         # capture stopped, work started
-done(text)           # clipboard holds text; a short preview is shown
+done(text, note="")  # clipboard holds text; a short preview is shown, with
+                      # note appended when text is not the corrected reply
 failed(reason)       # nothing usable, with the reason
 ```
 
@@ -320,7 +321,7 @@ Each of these must fail if the line it protects is removed:
 4. A response that violates the length guard falls back to the raw transcript.
 5. `publish.render_prompt` finds the dictation prompt's placeholder — a prompt file
    edited into a shape without one would otherwise append the transcript silently.
-6. `dictation_config()` works with no GitHub variables set, where `publish.config()`
+6. `resolve_config()` works with no GitHub variables set, where `publish.config()`
    returns `None`.
 7. `IS_TRUSTED` false produces the startup warning.
 8. The language is read from `config.json` and selects the matching Whisper model.

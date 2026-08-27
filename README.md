@@ -319,9 +319,8 @@ Press **`<cmd>+<alt>+d`** (Cmd+Option+D) anywhere to start a recording; press
 it again to stop, correct, and copy the result — it replaces whatever was
 already on your clipboard. Forgetting to press it again is covered too: a
 recording stops itself after `dictation_max_seconds` (5 minutes by default).
-Nothing is written to disk at any point — the audio and its transcript exist
-only for the duration of one dictation and are discarded once the clipboard is
-written.
+Nothing is saved to disk — the audio and its transcript exist only for the
+duration of one dictation and are discarded once the clipboard is written.
 
 Dictation transcribes in whichever language is set in **Settings → language**
 — the same setting the rest of the app uses, so a session is Turkish or

@@ -205,10 +205,17 @@ class Daemon:
     # and every sink call inside dictation.deliver run with no lock held, so a
     # "still working" from toggle can interleave with a worker's report.
     #
-    # Holding the lock across a sink call is safe only because a sink cannot block
-    # indefinitely: NotifySink.recording() and processing() each run *two* bounded
-    # subprocesses, the notification and the sound cue, so the worst case in here
-    # is 2 x dictation.NOTIFY_TIMEOUT_SECONDS, not one.
+    # The hold is not bounded by dictation.NOTIFY_TIMEOUT_SECONDS — a sink call is
+    # the smallest part of it. _begin_processing holds the lock across
+    # capture.stop()'s WAV conversion, whose cost scales with how long the
+    # recording ran (measured on this machine: roughly 0.1-1.1s for a synthetic
+    # 300s recording, the low end once torchaudio's one-time import has already
+    # run this process) — before either of processing()'s subprocesses even
+    # starts. _begin_recording holds it across audiocript._start_mic's retry
+    # loop: up to audiocript._MIC_OPEN_BACKOFF's 2s of sleep plus two
+    # audiocript._refresh_audio_devices() calls. _on_duration_bound holds it
+    # across both a sink.failed() and a full _begin_processing. None of that is
+    # bounded by the notify timeout.
 
     def _begin_recording(self):
         capture = self._capture_factory(self._cfg)
@@ -330,8 +337,10 @@ def _deferred(action, name):
       `CGEventTapEnable(tap, True)` exactly once, at listener startup, and holds
       no other reference to it — so a tap the system disables is never switched
       back on, while IS_TRUSTED stays true and the listener stays alive. `toggle`
-      can wait 2 x dictation.NOTIFY_TIMEOUT_SECONDS on the daemon's lock, because
-      a status report is made with it held.
+      can hold the daemon's lock for as long as the transition in progress takes
+      — not bounded by dictation.NOTIFY_TIMEOUT_SECONDS, since what dominates is
+      capture.stop()'s WAV conversion (scales with recording length) or
+      audiocript._start_mic's retry backoff, not a sink call.
     - `_emitter` calls `listener.stop()` on any exception the callback lets
       through, which ends the listener for good. Daemon._begin_recording's
       trailing sink.recording() is outside its guard by design, so `toggle` can

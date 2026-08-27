@@ -4,8 +4,11 @@ the hotkey that starts it, and the daemon's lifecycle.
 No test here opens a microphone, loads a model, reaches a provider or creates a
 real event tap — the daemon takes its capture, transcription and delivery as
 parameters, and build_listener takes the hotkeys class, for exactly that reason.
-The doubles come from support, never from test_dictation: importing a test file
-runs its suite and exits, which would look like a pass.
+The doubles come from support, not test_dictation. Importing a test file is
+safe either way: every file here guards its `run(...)` behind
+`if __name__ == "__main__":`, which is what makes it importable without
+running its suite — test_dictation already relies on this, importing FakeAPI
+and completion from test_publish.
 """
 import contextlib
 import io
@@ -639,9 +642,10 @@ def test_the_listener_callback_does_not_wait_for_the_toggle():
     """macOS disables an event tap whose callback is too slow, and pynput never
     switches it back on: CGEventTapEnable(tap, True) is called once, at listener
     startup, and pynput/_util/darwin.py holds no other reference to it. So a toggle
-    run on the callback thread — which can wait 2 x dictation.NOTIFY_TIMEOUT_SECONDS
-    on the daemon's lock — kills the hotkey for the rest of the session, with
-    IS_TRUSTED still true and the listener still alive."""
+    run on the callback thread — which can hold the daemon's lock for as long as a
+    WAV conversion or a microphone retry takes, not bounded by
+    dictation.NOTIFY_TIMEOUT_SECONDS — kills the hotkey for the rest of the
+    session, with IS_TRUSTED still true and the listener still alive."""
     started, release = threading.Event(), threading.Event()
 
     def blocking_toggle():
