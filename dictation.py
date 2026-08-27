@@ -263,52 +263,6 @@ POWER_MESSAGES = {POWER_OFF: "Dictation off",
                   POWER_ON: "Dictation ready"}
 
 
-class FanoutSink(StatusSink):
-    """One report, several destinations: forwards every moment to each sink given.
-
-    The menu bar's icons are added to the notifications rather than substituted for
-    them. An icon is only visible while the user is looking at the menu bar, and
-    NotifySink's message plus its cue is what tells them a dictation reached the
-    clipboard — so the daemon is handed both, behind this.
-
-    Every forward is guarded on its own, one level above the guards already inside
-    NotifySink. Without that, the second sink's reliability would depend on the
-    first one's: a MenuBarSink raising on an icon update would take the notification
-    with it, on exactly the path where the user has already spoken and is waiting to
-    hear that the text is ready.
-
-    The five methods are written out rather than generated through __getattr__: this
-    is a documented contract, and a reader should be able to see that all of it is
-    forwarded. What keeps a sixth moment from being forgotten here is a test that
-    scans the contract, not a clever base class.
-    """
-
-    def __init__(self, *sinks):
-        self._sinks = sinks
-
-    def _forward(self, moment, *args):
-        for sink in self._sinks:
-            try:
-                getattr(sink, moment)(*args)
-            except Exception as e:
-                A._log_problem(f"a dictation status sink failed on {moment}", e)
-
-    def recording(self):
-        self._forward("recording")
-
-    def processing(self):
-        self._forward("processing")
-
-    def done(self, text, note=""):
-        self._forward("done", text, note)
-
-    def failed(self, reason):
-        self._forward("failed", reason)
-
-    def power_changed(self, power):
-        self._forward("power_changed", power)
-
-
 # =========================== The correction pipeline ===========================
 
 CORRECTED = "corrected"        # the provider's text is on the clipboard
@@ -596,9 +550,10 @@ def dictation_menu(power, state, entries):
     """Icon 2's menu: the stage, the last dictations, and the log itself.
 
     `entries` are HistoryEntry objects, newest first — the order History.recent
-    returns and the order the menu shows. The builder takes entries rather than a
-    History so it stays pure: reading the file is the caller's job, and a caller that
-    could not read it has something to say that this cannot guess."""
+    returns and the order the menu shows; `None` means the log could not be read. The
+    builder takes entries rather than a History so it stays pure: reading the file is
+    the caller's job, and the difference between "no dictations yet" and "unreadable"
+    is the caller's to report."""
     if power == POWER_LOADING:
         stage = MenuItem(LOADING_TITLE, enabled=False)
     elif power != POWER_ON:
@@ -610,7 +565,13 @@ def dictation_menu(power, state, entries):
     else:
         stage = MenuItem("İşleniyor…", enabled=False)
 
-    if entries:
+    if entries is None:
+        # Not the same thing as an empty log, and the menu must not say the one when
+        # the other is true. History.recent raises rather than answering [] for
+        # exactly this: "Henüz dictation yok" over an unreadable file would send the
+        # user looking for a bug in the recording.
+        history = [MenuItem("Geçmiş okunamadı", enabled=False)]
+    elif entries:
         history = [MenuItem(menu_preview(e.text), "copy", payload=e.text)
                    for e in entries]
     else:

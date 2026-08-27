@@ -1,6 +1,10 @@
 numpy
 sounddevice
 pynput
+# AppKit, for the menu bar's two status items. It arrives through pynput today
+# (pynput -> pyobjc-framework-Quartz -> Cocoa); menubar.py imports AppKit directly,
+# so depending on that chain would be depending on a coincidence.
+pyobjc-framework-Cocoa
 transformers
 huggingface_hub
 pywhispercpp

@@ -257,18 +257,20 @@ def test_the_sink_contract_is_fully_implemented():
     a subclass implement it, and a moment left out inherits the contract's own empty
     body — a silent no-op that reports nothing and raises nothing.
 
-    Scanned rather than listed, for the reason in _drive_every_moment. MenuBarSink is
-    not checked here because it lives in menubar.py, which this file may not import;
-    its own check belongs with it."""
+    Scanned rather than listed, for the reason in _drive_every_moment. NotifySink is
+    the only implementation: the menu bar draws its icons from the daemon's own power
+    and state on a timer rather than from these reports, because the reports are
+    content and not transitions — menubar.MenuBar's docstring has the three ways an
+    icon drawn from them goes stale."""
     moments = [name for name, value in vars(dictation.StatusSink).items()
                if not name.startswith("_") and callable(value)]
     assert moments, "no moments were discovered on StatusSink"
-    for implementation in (dictation.NotifySink, dictation.FanoutSink):
+    for implementation in (dictation.NotifySink,):
         for moment in moments:
             assert (getattr(implementation, moment)
                     is not getattr(dictation.StatusSink, moment)), \
                 f"{implementation.__name__} inherits {moment}() as a silent no-op"
-    print(f"  {len(moments)} moments implemented by both sinks: {sorted(moments)}")
+    print(f"  {len(moments)} moments implemented by NotifySink: {sorted(moments)}")
 
 
 def test_notify_sink_reports_each_power_change():
@@ -313,59 +315,6 @@ def test_every_moment_survives_a_failing_notifier():
         f"{len(called)} moments were driven ({called}) but {len(logged)} problems "
         "were logged")
     print(f"  survived a failing notifier on every moment: {called}")
-
-
-def test_the_fan_out_forwards_every_moment():
-    """The menu bar's icons are added to the notifications, not substituted for them:
-    an icon is visible only while the user looks at the menu bar, and NotifySink's
-    message with its cue is what says a dictation reached the clipboard. So the daemon
-    is handed both sinks behind a fan-out, and every moment has to reach both with the
-    same arguments."""
-    first, second = RecordingSink(), RecordingSink()
-    called = _drive_every_moment(dictation.FanoutSink(first, second))
-    for sink, which in ((first, "first"), (second, "second")):
-        kinds = sorted(kind for kind, _ in sink.calls)
-        assert kinds == called, f"the {which} sink got {kinds}, not {called}"
-    assert first.calls == second.calls, \
-        f"the two sinks got different arguments:\n{first.calls}\n{second.calls}"
-    print(f"  forwarded to both sinks: {called}")
-
-
-def test_one_failing_sink_does_not_silence_another():
-    """Every forward is guarded on its own. Without that, the second sink's
-    reliability would depend on the first one's: a raising MenuBarSink would take the
-    notification with it, on the one path where the user has already spoken and is
-    waiting to be told the text is on the clipboard."""
-    class Broken:
-        """Raises on every moment, whatever the contract grows to."""
-        def __getattr__(self, name):
-            def raise_it(*_args):
-                raise OSError(f"{name} is broken")
-            return raise_it
-
-    logged = []
-    saved = A._log_problem
-    A._log_problem = lambda what, exc=None: logged.append((what, exc))
-    try:
-        working = RecordingSink()
-        try:
-            called = _drive_every_moment(dictation.FanoutSink(Broken(), working))
-        except AssertionError:
-            raise
-        except Exception as e:
-            # Caught and re-raised as an assertion so the failure names the defect.
-            # Unguarded, the first raising sink escapes the fan-out and support.run
-            # — which catches only AssertionError — reports it as a crashed script
-            # rather than as this test failing.
-            raise AssertionError(
-                f"a raising sink propagated out of the fan-out: {e!r}") from None
-    finally:
-        A._log_problem = saved
-    kinds = sorted(kind for kind, _ in working.calls)
-    assert kinds == called, f"the working sink lost moments: {kinds} != {called}"
-    assert len(logged) == len(called), (
-        f"{len(called)} forwards failed but {len(logged)} were logged")
-    print(f"  the working sink still got every moment: {kinds}")
 
 
 def test_default_notify_and_sound_pass_a_timeout():
@@ -996,6 +945,22 @@ def test_an_empty_history_says_so():
         assert placeholders, f"({power!r}, {state!r}) says nothing about an empty log"
 
 
+def test_an_unreadable_history_says_something_else():
+    """"Henüz dictation yok" over a log that could not be read would send the user
+    looking for a bug in the recording. The two have to look different, and neither
+    may offer a copy row."""
+    for power, state in _all_pairs():
+        items = dictation.dictation_menu(power, state, None)
+        titles = [i.title for i in items if i.action is None and not i.separator]
+        empty = [i.title for i in dictation.dictation_menu(power, state, [])
+                 if i.action is None and not i.separator]
+        assert titles != empty, \
+            f"({power!r}, {state!r}) says the same for unreadable and empty: {titles}"
+        assert not [i for i in items if i.action == "copy"], \
+            "an unreadable log produced copy rows"
+    print("  an unreadable log and an empty one read differently")
+
+
 def test_the_reveal_item_is_always_offered():
     """The file is the interface for anything the menu does not do — reading further
     back, editing, deleting — so it must be reachable whatever the daemon is doing."""
@@ -1013,7 +978,7 @@ def test_every_action_is_a_known_one():
     spelling of "copy"."""
     seen = set()
     for power, state in _all_pairs():
-        for entries in ([], [_entry("Bir."), _entry("İki.")]):
+        for entries in ([], None, [_entry("Bir."), _entry("İki.")]):
             for builder in (dictation.power_menu, dictation.dictation_menu):
                 items = (builder(power, state) if builder is dictation.power_menu
                          else builder(power, state, entries))

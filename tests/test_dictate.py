@@ -1,9 +1,9 @@
 """dictate: the state machine that drives one dictation from hotkey to clipboard,
 the hotkey that starts it, and the daemon's lifecycle.
 
-No test here opens a microphone, loads a model, reaches a provider or creates a
-real event tap — the daemon takes its capture, transcription and delivery as
-parameters, and build_listener takes the hotkeys class, for exactly that reason.
+No test here opens a microphone, loads a model, reaches a provider or draws a menu
+bar — the daemon takes its capture, transcription, delivery, model load and model
+unload as parameters, for exactly that reason.
 The doubles come from support, not test_dictation. Importing a test file is
 safe either way: every file here guards its `run(...)` behind
 `if __name__ == "__main__":`, which is what makes it importable without
@@ -423,83 +423,10 @@ def test_a_stale_duration_timer_cannot_stop_the_next_recording():
 # ================== The hotkey, the permission, the lifecycle ==================
 
 
-class FakeListener:
-    """The two health signals check_listener reads off a started listener, with no
-    event tap behind either of them."""
-
-    def __init__(self, trusted=True, alive=True):
-        self.IS_TRUSTED, self._alive = trusted, alive
-
-    def wait(self): pass
-    def is_alive(self): return self._alive
-
-
-class SpyHotKeys:
-    """Captures the mapping build_listener registered, without creating an event
-    tap. `registered` is a class attribute so a test can read it without holding
-    the listener build_listener returns."""
-    registered = {}
-
-    def __init__(self, mapping):
-        SpyHotKeys.registered = dict(mapping)
-        self.IS_TRUSTED = True
-
-    def start(self): pass
-    def wait(self): pass
-    def is_alive(self): return True
-    def stop(self): pass
-
-
 def _config(**cfg):
     """A resolved DictationConfig from raw config keys, with a fake environment so
     nothing here reads the developer's own .env."""
     return dictation.resolve_config(cfg, fake_env(OPENAI_API_KEY="sk-test"))
-
-
-def _registered_callback(config):
-    """The callback build_listener actually gave pynput for the toggle hotkey."""
-    return SpyHotKeys.registered[config.hotkeys["toggle"]]
-
-
-def test_a_healthy_listener_raises_no_warning():
-    warning = dictate.check_listener(FakeListener())
-    assert warning is None, f"a working listener warned anyway: {warning!r}"
-
-
-def test_a_listener_without_permission_warns_and_names_the_fallback():
-    """Without this the daemon looks like it is working while the hotkey silently
-    does nothing — indistinguishable from a broken install."""
-    warning = dictate.check_listener(FakeListener(trusted=False))
-    assert warning, "an untrusted listener did not warn"
-    assert "Input Monitoring" in warning, \
-        f"the warning does not name the permission: {warning}"
-    assert "--toggle" in warning, f"the warning does not name the fallback: {warning}"
-    print(f"  {warning}")
-
-
-def test_a_dead_listener_warns_too():
-    """_create_event_tap returning None marks the listener ready and then exits its
-    thread, so IS_TRUSTED alone does not cover every failure."""
-    warning = dictate.check_listener(FakeListener(alive=False))
-    assert warning, "a listener whose thread has exited did not warn"
-    print(f"  {warning}")
-
-
-def test_the_configured_hotkey_is_the_one_registered():
-    combination = "<cmd>+<shift>+<alt>+k"
-    config = _config(dictation_hotkeys={"toggle": combination})
-    dictate.build_listener(config, lambda: None, hotkeys_class=SpyHotKeys)
-    assert combination in SpyHotKeys.registered, \
-        f"registered {sorted(SpyHotKeys.registered)!r}"
-    assert len(SpyHotKeys.registered) == 1, \
-        f"registered more than the configured hotkey: {sorted(SpyHotKeys.registered)!r}"
-
-
-def test_the_default_hotkey_is_registered_when_config_is_silent():
-    config = _config()
-    dictate.build_listener(config, lambda: None, hotkeys_class=SpyHotKeys)
-    assert dictation.DEFAULT_HOTKEYS["toggle"] in SpyHotKeys.registered, \
-        f"registered {sorted(SpyHotKeys.registered)!r}"
 
 
 def test_the_pid_file_round_trips():
@@ -655,38 +582,37 @@ def test_each_action_sends_its_own_signal():
     print("  toggle sent SIGUSR1, stop sent SIGTERM")
 
 
-def test_the_listener_callback_does_not_wait_for_the_toggle():
-    """macOS disables an event tap whose callback is too slow, and pynput never
-    switches it back on: CGEventTapEnable(tap, True) is called once, at listener
-    startup, and pynput/_util/darwin.py holds no other reference to it. So a toggle
-    run on the callback thread — which can hold the daemon's lock for as long as a
-    WAV conversion or a microphone retry takes, not bounded by
-    dictation.NOTIFY_TIMEOUT_SECONDS — kills the hotkey for the rest of the
-    session, with IS_TRUSTED still true and the listener still alive."""
+def test_the_signal_handler_does_not_wait_for_the_toggle():
+    """The SIGUSR1 handler runs on the main thread, which is the AppKit run loop. A
+    toggle run there can hold the daemon's lock for as long as a WAV conversion or a
+    microphone retry takes — not bounded by dictation.NOTIFY_TIMEOUT_SECONDS — and
+    that is the thread drawing the menu bar. It also must not be re-entered: a second
+    --toggle arriving inside the first would deadlock on a lock its own thread already
+    holds."""
     started, release = threading.Event(), threading.Event()
 
     def blocking_toggle():
         started.set()
         release.wait(5)
 
-    config = _config()
-    dictate.build_listener(config, blocking_toggle, hotkeys_class=SpyHotKeys)
+    handler = dictate._deferred(blocking_toggle, "test-signal")
     begin = time.monotonic()
-    _registered_callback(config)()
+    handler(signal.SIGUSR1, None)          # exactly how a signal handler is called
     elapsed = time.monotonic() - begin
     ran = started.wait(5)
     release.set()
     assert ran, "the toggle never ran at all"
-    assert elapsed < 0.5, f"the callback waited {elapsed:.2f}s for the toggle"
-    print(f"  the callback returned in {elapsed * 1000:.1f} ms")
+    assert elapsed < 0.5, f"the handler waited {elapsed:.2f}s for the toggle"
+    print(f"  the handler returned in {elapsed * 1000:.1f} ms")
 
 
-def test_a_toggle_that_raises_does_not_kill_the_hotkey():
+def test_a_toggle_that_raises_does_not_kill_the_pump():
     """Daemon._begin_recording's trailing sink.recording() is outside its guard by
-    design, so toggle can raise on the recording path. Whatever carries the toggle
-    off the callback thread has to survive that — a carrier that dies is the same
-    silently dead hotkey as a disabled tap. The second press raises SystemExit,
-    which a plain `except Exception` would let through."""
+    design, so toggle can raise on the recording path. The thread carrying the toggle
+    off the signal handler has to survive that: a pump that dies leaves --toggle
+    silently dead for the rest of the session, with nothing on screen and nothing in
+    any log. The second request raises SystemExit, which a plain `except Exception`
+    would let through."""
     presses = []
     third = threading.Event()
 
@@ -698,15 +624,13 @@ def test_a_toggle_that_raises_does_not_kill_the_hotkey():
             raise SystemExit("something called sys.exit on the toggle's thread")
         third.set()
 
-    config = _config()
-    dictate.build_listener(config, angry_toggle, hotkeys_class=SpyHotKeys)
-    callback = _registered_callback(config)
+    submit = dictate._deferred(angry_toggle, "test-pump")
     for press in (1, 2, 3):
         try:
-            callback()
+            submit(signal.SIGUSR1, None)
         except BaseException as e:
             raise AssertionError(
-                f"press {press} let {e!r} reach the listener") from None
+                f"request {press} let {e!r} reach the signal handler") from None
         assert _wait_for(lambda: len(presses) >= press, 5), \
             f"press {press} was never delivered: {presses!r}"
     assert third.wait(5), "the third press never reached the toggle"
@@ -716,18 +640,12 @@ def test_a_toggle_that_raises_does_not_kill_the_hotkey():
 def test_shutdown_leaves_no_pid_file_and_no_recording_behind():
     """A pid file that outlives its daemon refuses the next start; a recording that
     outlives it leaves the microphone open and a temporary directory on disk."""
-    stopped = []
-
-    class StoppableListener:
-        def stop(self): stopped.append("stop")
-
     with workdir("pid") as d:
         path = d / "dictate.pid"
         dictate.write_pid(path)
         daemon, clip, sink, _ = build()
         daemon.toggle()                        # a recording still going
-        dictate._shutdown(StoppableListener(), daemon, path)
-        assert stopped == ["stop"], f"the listener was left running: {stopped!r}"
+        dictate._shutdown(daemon, path)
         assert daemon.state == dictation.IDLE, f"state {daemon.state!r} after shutdown"
         assert "discard" in FakeCapture.instances[-1].events, \
             f"the recording was left behind: {FakeCapture.instances[-1].events!r}"
