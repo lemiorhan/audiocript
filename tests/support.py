@@ -159,3 +159,29 @@ def run(names, namespace):
     if failed:
         print(f"\n{len(failed)} failed: {', '.join(failed)}")
     sys.exit(1 if failed else 0)
+
+
+def fake_env(**values):
+    """An `env` callable backed by a dict, matching publish.env_value's signature."""
+    def env(key, default=None):
+        return values.get(key, default)
+    return env
+
+
+class FakeClipboard:
+    def __init__(self, initial="ONCEKI ICERIK"):
+        self.text, self.writes = initial, 0
+
+    def copy(self, text):
+        self.text = text
+        self.writes += 1
+
+
+class RecordingSink:
+    def __init__(self):
+        self.calls = []
+
+    def recording(self): self.calls.append(("recording", None))
+    def processing(self): self.calls.append(("processing", None))
+    def done(self, text): self.calls.append(("done", text))
+    def failed(self, reason): self.calls.append(("failed", reason))
