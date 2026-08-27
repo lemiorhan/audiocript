@@ -1,10 +1,10 @@
 """dictation.resolve_config: the configuration half of the dictation daemon.
 
-Nothing here may reach a real API or read a developer's .env. Every test passes
-an explicit `env`, so publish.env_value is never consulted — except the last
-test, which proves resolve_config's default falls back to publish.env_value
-while keeping publish.ROOT pointed at an empty directory so it still cannot
-reach a real .env.
+Nothing here may reach a real API or read a developer's .env. Every test but
+one passes an explicit `env`, so publish.env_value is never consulted.
+test_env_defaults_to_publish_env_value is the exception: it monkeypatches
+publish.env_value itself, so resolve_config's fallback to it is pinned without
+ever touching a real .env.
 """
 import os
 import tempfile
@@ -82,9 +82,23 @@ def test_unknown_language_is_refused():
 
 
 def test_unparseable_hotkey_is_refused():
-    for bad in ("cmd+alt+d", "<zort>+d", ""):
+    for bad in ("cmd+alt+d", "<zort>+d"):
         cfg = {"dictation_hotkeys": {"toggle": bad}}
         _refuses(cfg, fake_env(**BASE_ENV), bad)
+
+    # "" in message is vacuously true for any message, so the empty-string case
+    # needs a real assertion: the message must be non-empty and must name either
+    # the action or the expected syntax.
+    try:
+        dictation.resolve_config({"dictation_hotkeys": {"toggle": ""}},
+                                 fake_env(**BASE_ENV))
+    except dictation.ConfigError as e:
+        message = str(e)
+        assert message, "an empty hotkey produced an empty message"
+        assert "toggle" in message or "key combination" in message, \
+            f"message {message!r} names neither the action nor the expected syntax"
+    else:
+        raise AssertionError("accepted an empty hotkey combination")
     print("  refused 3 unparseable combinations")
 
 
@@ -103,6 +117,22 @@ def test_bad_max_seconds_is_refused():
     _refuses({"dictation_max_seconds": "soon"}, fake_env(**BASE_ENV), "soon")
     _refuses({"dictation_max_seconds": 0}, fake_env(**BASE_ENV), "0")
     print("  refused a non-integer and a non-positive max_seconds")
+
+
+def test_env_defaults_to_publish_env_value():
+    """resolve_config's `env` parameter defaults to publish.env_value. Pinned by
+    monkeypatching that function rather than touching a real .env, so dropping
+    or inverting `env = env or publish.env_value` in dictation.py would be
+    caught here even though every other test passes an explicit `env`."""
+    saved = publish.env_value
+    publish.env_value = fake_env(OPENAI_API_KEY="sk-from-publish")
+    try:
+        cfg = dictation.resolve_config({})
+        print(f"  openai_token={cfg.openai_token!r}")
+        assert cfg.openai_token == "sk-from-publish", \
+            "resolve_config's default did not consult publish.env_value"
+    finally:
+        publish.env_value = saved
 
 
 def test_it_resolves_where_publish_config_would_not():

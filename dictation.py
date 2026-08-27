@@ -43,7 +43,7 @@ def _validated_hotkeys(cfg):
         except ValueError:
             raise ConfigError(
                 f"hotkey {combination!r} for the {action!r} action is not a "
-                "valid key combination")
+                "valid key combination") from None
         if not any(isinstance(key, Key) for key in parsed):
             raise ConfigError(
                 f"hotkey {combination!r} for the {action!r} action needs a "
