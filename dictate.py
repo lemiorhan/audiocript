@@ -436,7 +436,9 @@ class Daemon:
             # deliver reports on the sink itself on every one of its paths, so
             # nothing here reports again: that would notify the user twice for
             # one dictation.
-            self._deliver(transcript, self._config, self._clipboard, self._sink)
+            delivery = self._deliver(transcript, self._config, self._clipboard,
+                                     self._sink)
+            self._record(delivery)
         except Exception as e:
             A._log_problem("dictation could not be processed", e)
             self._sink.failed(f"processing failed: {e}")
@@ -447,6 +449,28 @@ class Daemon:
             with self._lock:
                 self._capture = None
                 self.state = dictation.IDLE
+
+    def _record(self, delivery):
+        """Add what reached the clipboard to the history log, if there is one.
+
+        The condition is `delivery.text`, not a list of statuses: EMPTY is the only
+        path that copies nothing, and testing the text means a status added to the
+        pipeline later cannot be silently logged or silently dropped.
+
+        Guarded on its own rather than left to _work's `except`. The real History
+        already swallows its own failures, but a failure that reached _work's handler
+        would report "processing failed" for a dictation whose text is on the
+        clipboard and which the user has already been told about — the log is the
+        least important thing happening here.
+
+        `delivery` may be None: only an injected test double returns that, and
+        nothing to record is not an error."""
+        if self._history is None or delivery is None or not delivery.text:
+            return
+        try:
+            self._history.append(delivery.text, delivery.status)
+        except Exception as e:
+            A._log_problem("a dictation could not be recorded in the history", e)
 
 
 # ============================ The global hotkey ============================

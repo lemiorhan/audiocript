@@ -1103,5 +1103,94 @@ def test_disable_does_not_wait_for_a_load_in_flight():
     daemon.join_power(5)
 
 
+# ============================== the history log ==============================
+
+
+class FakeHistory:
+    """Records what the daemon asked to be logged. `fail` makes append raise, which
+    the real History never does — it swallows — so only a broken one gets here."""
+
+    def __init__(self, fail=None):
+        self.entries, self.fail = [], fail
+
+    def append(self, text, status):
+        if self.fail is not None:
+            raise self.fail
+        self.entries.append((text, status))
+
+
+def _delivering(status, text):
+    """A deliver double that behaves the way the real one does for `status`: copies
+    and reports done when there is text, reports failed when there is not."""
+    def deliver(_transcript, _cfg, clipboard, sink, **_kw):
+        if text:
+            clipboard.copy(text)
+            sink.done(text)
+        else:
+            sink.failed("no speech was detected")
+        return dictation.Delivery(status, text, "")
+    return deliver
+
+
+def test_every_delivery_status_is_logged_by_the_same_rule():
+    """One rule for all of them: what reached the clipboard is what is logged, and
+    EMPTY is the only status that reaches it with nothing.
+
+    Scanned over dictation.DELIVERY_STATUSES rather than naming the four, because a
+    fifth status added to the pipeline would otherwise be silently logged or silently
+    dropped with no test noticing — and the guard in _work is a test on
+    delivery.text, not a list of statuses, for exactly the same reason."""
+    for status in dictation.DELIVERY_STATUSES:
+        text = "" if status == dictation.EMPTY else f"bir cumle ({status})"
+        log = FakeHistory()
+        daemon, clip, _sink, _ = build(deliver=_delivering(status, text), history=log)
+        daemon.toggle()
+        daemon.toggle()
+        daemon.join_worker(timeout=5)
+        expected = [(text, status)] if text else []
+        assert log.entries == expected, \
+            f"status {status!r} logged {log.entries!r}, expected {expected!r}"
+        if text:
+            assert clip.text == text, f"status {status!r} left {clip.text!r} on the clipboard"
+    print(f"  {len(dictation.DELIVERY_STATUSES)} statuses, one rule: "
+          f"{[s for s in dictation.DELIVERY_STATUSES if s != dictation.EMPTY]} logged")
+
+
+def test_a_history_failure_does_not_cost_the_dictation():
+    """The log is the least important thing happening. By the time it is written the
+    text is on the clipboard and the user has been told — so a failure here must not
+    turn a dictation that worked into a "processing failed" report, and must not
+    strand the daemon."""
+    logged = []
+    saved = A._log_problem
+    A._log_problem = lambda what, exc=None: logged.append((what, exc))
+    try:
+        daemon, clip, sink, _ = build(history=FakeHistory(fail=OSError("disk full")))
+        daemon.toggle()
+        daemon.toggle()
+        daemon.join_worker(timeout=5)
+    finally:
+        A._log_problem = saved
+    kinds = [kind for kind, _ in sink.calls]
+    assert daemon.state == dictation.IDLE, f"state {daemon.state!r}"
+    assert clip.text == "bir cumle", f"the clipboard holds {clip.text!r}"
+    assert "done" in kinds, f"the user was not told it worked: {sink.calls!r}"
+    assert "failed" not in kinds, \
+        f"a log failure was reported as the dictation failing: {sink.calls!r}"
+    assert logged, "the log failure was swallowed without a trace"
+    print(f"  reported done, logged the problem: {logged[0][0]}")
+
+
+def test_a_daemon_with_no_history_still_dictates():
+    """history is optional: the CLI path and every test that predates the log pass
+    nothing, and a dictation must not depend on there being somewhere to record it."""
+    daemon, clip, sink, delivered = build(history=None)
+    daemon.toggle()
+    daemon.toggle()
+    daemon.join_worker(timeout=5)
+    assert delivered == ["bir cumle"], f"delivered {delivered!r}"
+    assert daemon.state == dictation.IDLE, f"state {daemon.state!r}"
+
+
 if __name__ == "__main__":
     run([n for n in sorted(globals()) if n.startswith("test_")], globals())

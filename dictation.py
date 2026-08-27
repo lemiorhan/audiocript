@@ -316,6 +316,11 @@ UNCORRECTED = "uncorrected"    # the provider failed; the raw transcript is on i
 SKIPPED = "skipped"            # the reply broke the length contract; raw transcript
 EMPTY = "empty"                # nothing was said; the clipboard was not touched
 
+# All four, so a caller — or a test — can cover them without naming them. A fifth
+# status added here widens every scan that iterates this, which is the only way an
+# added status does not go silently unhandled by the history log or by a report.
+DELIVERY_STATUSES = (CORRECTED, UNCORRECTED, SKIPPED, EMPTY)
+
 # The prompt asks for punctuation, dropped fillers and nothing else, so a faithful
 # reply is about as long as the transcript. A reply well outside this band is a
 # rewrite, a summary, or a commentary about the text — the one failure the user
