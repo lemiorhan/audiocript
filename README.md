@@ -33,6 +33,8 @@ meters, and get a saved transcript. Everything runs on your machine.
   collapsible menu — no commands to memorize.
 - **Record mic + system audio together** — your voice and the computer's output
   (a call, a video) are captured simultaneously and mixed into one track.
+- **Automatic acoustic echo cancellation** — when recording both sources,
+  speaker leakage is removed from the microphone at finalization when available.
 - **System audio without BlackHole** — a native macOS **Core Audio process tap**
   keeps your audio playing through your speakers while it's captured. No virtual
   cable, no Multi-Output Device, no rerouting.
@@ -74,8 +76,12 @@ downloads the transcription models (≈1.5–1.6 GB) and caches them.
 ```
 
 `run.sh` creates the virtual environment, installs Python dependencies the first
-time (and only when `requirements.txt` changes), offers to install the optional
-external tools if missing, then launches the app.
+time (and only when its requirements files change), offers to install the optional
+external tools if missing, then launches the app. It also tries to install optional
+WebRTC acoustic echo cancellation (`pywebrtc-audio`). That package can need a native
+compiler on Python versions without a prebuilt wheel; if installation fails,
+Audiocript warns and starts normally. Retry it later with
+`.venv/bin/python -m pip install -r requirements-aec.txt`.
 
 > Permission denied? Run `chmod +x run.sh` once, or use `bash run.sh`.
 > Pick a Python with `PYTHON=python3.12 ./run.sh`. Skip the tool check with
@@ -88,6 +94,7 @@ external tools if missing, then launches the app.
 python3 -m venv .venv   # Python 3.12+
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install -r requirements-aec.txt  # optional WebRTC acoustic echo cancellation
 python audiocript.py
 ```
 </details>
@@ -156,6 +163,14 @@ Each source is resampled to **16 kHz mono** with `torchaudio` (Kaiser
 anti-aliasing), trimmed to the shortest, summed with peak-limiting, and written as
 one mono `audio.wav` — exactly what Whisper expects.
 
+When both microphone and system audio were captured, Audiocript first aligns their
+start times, then automatically applies **acoustic echo cancellation** to remove
+speaker output leaking back into the microphone before mixing. This is most useful
+for calls played through speakers; **headphones** remain the cleanest option. If the
+optional WebRTC processor is unavailable or fails, finalization safely uses the
+aligned original microphone instead, so the recording is still saved and can be
+transcribed.
+
 ### Models (per language)
 
 `distil-large-v3` is English-only, so each language uses a dedicated model:
@@ -214,7 +229,8 @@ Notes & limits:
 <recordings folder>/
 └── 2026-06-10_14-30-15/
     ├── audio.wav          # 16 kHz mono mix
-    ├── mic.wav            # mic-only channel    (only when speaker labels are on)
+    ├── mic.wav            # echo-cleaned mic channel when AEC succeeds
+    │                      # (only when speaker labels are on)
     ├── system.wav         # system-only channel (only when speaker labels are on)
     ├── transcription.txt  # transcript (labeled by speaker when enabled)
     └── meta.json          # { "name": "Daily standup", "language": "tr",
@@ -296,6 +312,11 @@ On first use, grant these under **System Settings → Privacy & Security**:
   (`xcode-select --install`) and grant *System Audio Recording*.
 - **Can't import a file** — install ffmpeg (`brew install ffmpeg`).
 - **First transcription is slow** — the model loads on first use, then it's cached.
+- **Echo cancellation is unavailable** — the recording was still saved using the
+  aligned original microphone. Retry the optional install with
+  `.venv/bin/python -m pip install -r requirements-aec.txt`; a native compiler may
+  be needed when `pywebrtc-audio` has no wheel for your Python version. Headphones
+  are the cleanest way to avoid speaker leakage.
 
 ---
 
@@ -310,6 +331,7 @@ mac_audio_tap/
 tests/                         # plain scripts; see tests/run_all.py
 run.sh                         # one-command launcher
 requirements.txt
+requirements-aec.txt           # optional WebRTC acoustic echo cancellation
 assets/                        # logo, header, screenshots
 ```
 
@@ -342,3 +364,4 @@ notice and permission notice are preserved.
 - [`selimc/whisper-large-v3-turbo-turkish`](https://huggingface.co/selimc/whisper-large-v3-turbo-turkish)
 - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) · [`pywhispercpp`](https://github.com/absadiki/pywhispercpp)
 - [Rich](https://github.com/Textualize/rich) · [sounddevice](https://python-sounddevice.readthedocs.io/)
+- [`pywebrtc-audio`](https://pypi.org/project/pywebrtc-audio/) for optional WebRTC acoustic echo cancellation

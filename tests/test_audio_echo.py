@@ -1,4 +1,6 @@
 """Align separately captured microphone and system audio into one time base."""
+from pathlib import Path
+
 import numpy as np
 
 from support import run, wav_samples, workdir, write_wav
@@ -268,6 +270,15 @@ def test_native_aec_reduces_echo_and_preserves_near_end_audio():
     assert clean_near_rms / raw_near_rms >= 0.5
 
 
+def test_readme_describes_echo_cancellation():
+    """Removing AEC setup guidance would leave users without its fallback path."""
+    readme = (Path(__file__).parent.parent / "README.md").read_text()
+    readme = readme.casefold()
+    assert "acoustic echo cancellation" in readme
+    assert "headphones" in readme
+    assert "pywebrtc-audio" in readme
+
+
 if __name__ == "__main__":
     run(["test_mic_prefix_is_removed_when_mic_started_first",
          "test_system_prefix_is_removed_when_system_started_first",
@@ -278,5 +289,6 @@ if __name__ == "__main__":
          "test_echo_cancellation_rejects_unequal_input_lengths",
          "test_echo_cancellation_rejects_malformed_processor_output",
          "test_echo_cancellation_rejects_wrong_wav_format",
-         "test_native_aec_reduces_echo_and_preserves_near_end_audio"],
+         "test_native_aec_reduces_echo_and_preserves_near_end_audio",
+         "test_readme_describes_echo_cancellation"],
         globals())

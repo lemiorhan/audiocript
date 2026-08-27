@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **Combined microphone and system-audio captures now receive automatic acoustic
+  echo cancellation at finalization.** When the optional `pywebrtc-audio` processor
+  is available, speaker leakage is removed from the aligned microphone before the
+  sources are mixed; saved `mic.wav` is the cleaned channel when speaker labels are
+  enabled. The optional native dependency is installed best-effort, and an
+  unavailable or failed processor safely falls back to the aligned original
+  microphone without losing the recording. Headphones remain the cleanest option.
+
 - **Long transcripts can be published with one keypress.** With
   `GITHUB_REPO_FOR_TRANSCRIPTS`, `GITHUB_TOKEN` and `OPENAI_API_KEY` set in `.env`,
   **`u`** on a recording sends a transcript longer than `TRANSCRIPT_MIN_CHARS` (2000
