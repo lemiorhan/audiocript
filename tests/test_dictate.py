@@ -181,12 +181,12 @@ def test_discard_never_raises_and_leaves_nothing_behind():
 
 def test_a_full_cycle_returns_to_idle():
     d, clip, sink, delivered = build()
-    assert d.state == dictate.IDLE, f"state {d.state!r} before the first toggle"
+    assert d.state == dictation.IDLE, f"state {d.state!r} before the first toggle"
     d.toggle()
-    assert d.state == dictate.RECORDING, f"state {d.state!r} after one toggle"
+    assert d.state == dictation.RECORDING, f"state {d.state!r} after one toggle"
     d.toggle()
     d.join_worker(timeout=5)
-    assert d.state == dictate.IDLE, f"state {d.state!r} after the cycle"
+    assert d.state == dictation.IDLE, f"state {d.state!r} after the cycle"
     assert delivered == ["bir cumle"], f"delivered {delivered!r}"
     assert clip.text == "bir cumle", f"clipboard {clip.text!r}"
     print(f"  {sink.calls}")
@@ -212,7 +212,7 @@ def test_a_microphone_that_cannot_open_returns_to_idle():
 
     d, clip, sink, _ = build(capture=refused)
     d.toggle()
-    assert d.state == dictate.IDLE, f"state {d.state!r} after a refused mic"
+    assert d.state == dictation.IDLE, f"state {d.state!r} after a refused mic"
     assert any(kind == "failed" for kind, _ in sink.calls), \
         f"the user was not told: {sink.calls!r}"
     assert clip.writes == 0, f"the clipboard was written {clip.writes} times"
@@ -228,7 +228,7 @@ def test_a_capture_that_cannot_be_finished_returns_to_idle():
     d, clip, sink, delivered = build(capture=StopFailsCapture)
     d.toggle()
     d.toggle()
-    assert d.state == dictate.IDLE, f"state {d.state!r} after a failed stop"
+    assert d.state == dictation.IDLE, f"state {d.state!r} after a failed stop"
     assert any(kind == "failed" for kind, _ in sink.calls), \
         f"the user was not told: {sink.calls!r}"
     assert delivered == [], f"delivered {delivered!r} from a capture with no WAV"
@@ -273,7 +273,7 @@ def test_a_report_between_the_two_states_cannot_strand_the_daemon():
         # that caller takes the listener with it.
         raise AssertionError(f"toggle() let {e!r} reach its caller") from None
     d.join_worker(timeout=5)
-    assert d.state == dictate.IDLE, f"state {d.state!r} after a report blew up"
+    assert d.state == dictation.IDLE, f"state {d.state!r} after a report blew up"
     assert "discard" in FakeCapture.instances[-1].events, \
         f"the capture was left behind: {FakeCapture.instances[-1].events!r}"
     assert delivered == [], f"delivered {delivered!r} with no worker running"
@@ -291,7 +291,7 @@ def test_a_crashing_worker_returns_to_idle():
     d.toggle()
     d.toggle()
     d.join_worker(timeout=5)
-    assert d.state == dictate.IDLE, f"state {d.state!r} after a crashing worker"
+    assert d.state == dictation.IDLE, f"state {d.state!r} after a crashing worker"
     assert any(kind == "failed" for kind, _ in sink.calls), \
         f"the user was not told: {sink.calls!r}"
     print(f"  {sink.calls}")
@@ -309,7 +309,7 @@ def test_the_cleanup_survives_what_the_worker_cannot_catch():
     d.toggle()
     d.toggle()
     d.join_worker(timeout=5)
-    assert d.state == dictate.IDLE, f"state {d.state!r} after an uncatchable exit"
+    assert d.state == dictation.IDLE, f"state {d.state!r} after an uncatchable exit"
     assert "discard" in FakeCapture.instances[-1].events, \
         f"events {FakeCapture.instances[-1].events!r}"
     assert delivered == [], f"delivered {delivered!r}"
@@ -339,12 +339,12 @@ def test_a_toggle_while_processing_is_ignored():
     d.toggle()
     d.toggle()
     deadline = time.time() + 5
-    while d.state != dictate.PROCESSING and time.time() < deadline:
+    while d.state != dictation.PROCESSING and time.time() < deadline:
         time.sleep(0.01)
-    assert d.state == dictate.PROCESSING, f"state {d.state!r}"
+    assert d.state == dictation.PROCESSING, f"state {d.state!r}"
     before = len(FakeCapture.instances)
     d.toggle()
-    assert d.state == dictate.PROCESSING, f"the toggle was not ignored: {d.state!r}"
+    assert d.state == dictation.PROCESSING, f"the toggle was not ignored: {d.state!r}"
     assert len(FakeCapture.instances) == before, "a second capture was started"
     assert any(k == "failed" for k, _ in sink.calls), (
         f"the user was not told it was still working: {sink.calls!r}")
@@ -355,7 +355,7 @@ def test_a_toggle_while_processing_is_ignored():
 def test_the_duration_bound_stops_the_recording_by_itself():
     d, clip, sink, delivered = build(max_seconds=1)
     d.toggle()
-    assert _wait_for(lambda: d.state == dictate.IDLE, 10), \
+    assert _wait_for(lambda: d.state == dictation.IDLE, 10), \
         f"the bound did not finish the dictation: state {d.state!r}"
     assert delivered == ["bir cumle"], f"delivered {delivered!r}"
     assert clip.text == "bir cumle", f"clipboard {clip.text!r}"
@@ -377,7 +377,7 @@ def test_a_stale_duration_timer_cannot_start_a_recording():
 
     d._on_duration_bound(epoch)           # the timer thread, arriving late
 
-    assert d.state == dictate.IDLE, f"state {d.state!r} after a stale bound"
+    assert d.state == dictation.IDLE, f"state {d.state!r} after a stale bound"
     assert len(FakeCapture.instances) == before, "the stale bound started a recording"
     assert len(sink.calls) == calls, f"the stale bound reported: {sink.calls[calls:]!r}"
 
@@ -394,7 +394,7 @@ def test_a_stale_duration_timer_cannot_stop_the_next_recording():
 
     d._on_duration_bound(epoch)           # the first recording's timer, late
 
-    assert d.state == dictate.RECORDING, \
+    assert d.state == dictation.RECORDING, \
         f"the stale bound cut the next recording short: {d.state!r}"
     d.toggle()
     d.join_worker(timeout=5)
@@ -711,7 +711,7 @@ def test_shutdown_leaves_no_pid_file_and_no_recording_behind():
         daemon.toggle()                        # a recording still going
         dictate._shutdown(StoppableListener(), daemon, path)
         assert stopped == ["stop"], f"the listener was left running: {stopped!r}"
-        assert daemon.state == dictate.IDLE, f"state {daemon.state!r} after shutdown"
+        assert daemon.state == dictation.IDLE, f"state {daemon.state!r} after shutdown"
         assert "discard" in FakeCapture.instances[-1].events, \
             f"the recording was left behind: {FakeCapture.instances[-1].events!r}"
         assert not path.exists(), f"{path} outlived the daemon"
@@ -733,7 +733,7 @@ def test_shutdown_does_not_take_the_capture_away_from_a_running_worker():
     daemon, clip, _, _ = build(deliver=slow_deliver)
     daemon.toggle()
     daemon.toggle()
-    assert _wait_for(lambda: daemon.state == dictate.PROCESSING, 5), \
+    assert _wait_for(lambda: daemon.state == dictation.PROCESSING, 5), \
         f"state {daemon.state!r}"
     capture = FakeCapture.instances[-1]
 

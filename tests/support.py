@@ -191,3 +191,5 @@ class RecordingSink:
     def done(self, text, note=""):
         self.calls.append(("done", text))
         self.notes.append(note)
+
+    def power_changed(self, power): self.calls.append(("power_changed", power))

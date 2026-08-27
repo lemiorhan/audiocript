@@ -7,6 +7,7 @@ publish.env_value itself, so resolve_config's fallback to it is pinned without
 ever touching a real .env. Every provider call goes to a FakeAPI on localhost or
 to an address with nothing listening, so no test can spend a real API key.
 """
+import inspect
 import os
 import re
 import tempfile
@@ -217,24 +218,152 @@ def test_notify_sink_truncates_a_long_preview():
     print(f"  message length={len(message)}")
 
 
-def test_notify_sink_survives_a_failing_notifier():
+# One sample per parameter name the contract uses. A moment whose parameter has no
+# sample here fails _drive_every_moment loudly rather than being skipped, which is
+# what keeps the scans below honest as the contract grows.
+MOMENT_SAMPLES = {"text": "Bir cümle.", "reason": "mikrofon açılamadı",
+                  "power": "on"}
+
+
+def _drive_every_moment(sink):
+    """Call every moment StatusSink declares on `sink`, and return their names.
+
+    Discovered by scanning the contract, never by listing it. Enumerating the moments
+    is how a test keeps passing while a newly added one goes unimplemented and
+    unguarded — which is exactly what happened when the fifth, power_changed, was
+    added to a contract whose tests named done() and failed()."""
+    called = []
+    for name, declared in vars(dictation.StatusSink).items():
+        if name.startswith("_") or not callable(declared):
+            continue
+        args = []
+        for parameter in list(inspect.signature(declared).parameters.values())[1:]:
+            if parameter.default is not inspect.Parameter.empty:
+                continue                      # optional: the default is the contract
+            assert parameter.name in MOMENT_SAMPLES, (
+                f"{name}() requires {parameter.name!r} and this file has no sample "
+                "for it, so the moment would go untested — add one to MOMENT_SAMPLES")
+            args.append(MOMENT_SAMPLES[parameter.name])
+        getattr(sink, name)(*args)
+        called.append(name)
+    assert called, "no moments were discovered on StatusSink"
+    return sorted(called)
+
+
+def test_the_sink_contract_is_fully_implemented():
+    """StatusSink is a documented contract, not an abstract base class: nothing makes
+    a subclass implement it, and a moment left out inherits the contract's own empty
+    body — a silent no-op that reports nothing and raises nothing.
+
+    Scanned rather than listed, for the reason in _drive_every_moment. MenuBarSink is
+    not checked here because it lives in menubar.py, which this file may not import;
+    its own check belongs with it."""
+    moments = [name for name, value in vars(dictation.StatusSink).items()
+               if not name.startswith("_") and callable(value)]
+    assert moments, "no moments were discovered on StatusSink"
+    for implementation in (dictation.NotifySink, dictation.FanoutSink):
+        for moment in moments:
+            assert (getattr(implementation, moment)
+                    is not getattr(dictation.StatusSink, moment)), \
+                f"{implementation.__name__} inherits {moment}() as a silent no-op"
+    print(f"  {len(moments)} moments implemented by both sinks: {sorted(moments)}")
+
+
+def test_notify_sink_reports_each_power_change():
+    """The fifth moment exists because enable() returns before the model is loaded:
+    LOADING becoming ON is something only a sink call can tell the app about.
+
+    All three have to read differently, or "still loading the model" and "ready" look
+    the same to the user. No cue: the two that cue are the start and the stop of
+    speaking, where the user is not looking at the screen."""
+    notified, sounds = [], []
+    sink = dictation.NotifySink(notify=notified.append,
+                                sound=lambda: sounds.append(None))
+    powers = (dictation.POWER_OFF, dictation.POWER_LOADING, dictation.POWER_ON)
+    for power in powers:
+        sink.power_changed(power)
+    assert len(notified) == len(powers), notified
+    assert not sounds, f"a power change must not cue: {sounds}"
+    assert len(set(notified)) == len(powers), \
+        f"two power changes read the same to the user: {notified}"
+    print(f"  {notified}")
+
+
+def test_every_moment_survives_a_failing_notifier():
     """A broken osascript must not cost the user a dictation whose text is
     already on the clipboard: notify raising must not propagate. The swallowed
     exception must not be lost entirely either — it goes to
-    audiocript._log_problem, pinned here by monkeypatching it."""
+    audiocript._log_problem, pinned here by monkeypatching it.
+
+    This test named done() and failed() until the contract grew a fifth moment; it
+    scans now, so the sixth cannot arrive unguarded."""
     logged = []
     saved = A._log_problem
     A._log_problem = lambda what, exc=None: logged.append((what, exc))
     try:
-        def broken_notify(message):
+        def broken_notify(_message):
             raise OSError("osascript is not available")
         sink = dictation.NotifySink(notify=broken_notify, sound=lambda: None)
-        sink.done("Bir cümle.")
-        sink.failed("mikrofon açılamadı")
+        called = _drive_every_moment(sink)
     finally:
         A._log_problem = saved
-    assert len(logged) == 2, logged
-    print(f"  survived a failing notifier; logged {len(logged)} problems")
+    assert len(logged) == len(called), (
+        f"{len(called)} moments were driven ({called}) but {len(logged)} problems "
+        "were logged")
+    print(f"  survived a failing notifier on every moment: {called}")
+
+
+def test_the_fan_out_forwards_every_moment():
+    """The menu bar's icons are added to the notifications, not substituted for them:
+    an icon is visible only while the user looks at the menu bar, and NotifySink's
+    message with its cue is what says a dictation reached the clipboard. So the daemon
+    is handed both sinks behind a fan-out, and every moment has to reach both with the
+    same arguments."""
+    first, second = RecordingSink(), RecordingSink()
+    called = _drive_every_moment(dictation.FanoutSink(first, second))
+    for sink, which in ((first, "first"), (second, "second")):
+        kinds = sorted(kind for kind, _ in sink.calls)
+        assert kinds == called, f"the {which} sink got {kinds}, not {called}"
+    assert first.calls == second.calls, \
+        f"the two sinks got different arguments:\n{first.calls}\n{second.calls}"
+    print(f"  forwarded to both sinks: {called}")
+
+
+def test_one_failing_sink_does_not_silence_another():
+    """Every forward is guarded on its own. Without that, the second sink's
+    reliability would depend on the first one's: a raising MenuBarSink would take the
+    notification with it, on the one path where the user has already spoken and is
+    waiting to be told the text is on the clipboard."""
+    class Broken:
+        """Raises on every moment, whatever the contract grows to."""
+        def __getattr__(self, name):
+            def raise_it(*_args):
+                raise OSError(f"{name} is broken")
+            return raise_it
+
+    logged = []
+    saved = A._log_problem
+    A._log_problem = lambda what, exc=None: logged.append((what, exc))
+    try:
+        working = RecordingSink()
+        try:
+            called = _drive_every_moment(dictation.FanoutSink(Broken(), working))
+        except AssertionError:
+            raise
+        except Exception as e:
+            # Caught and re-raised as an assertion so the failure names the defect.
+            # Unguarded, the first raising sink escapes the fan-out and support.run
+            # — which catches only AssertionError — reports it as a crashed script
+            # rather than as this test failing.
+            raise AssertionError(
+                f"a raising sink propagated out of the fan-out: {e!r}") from None
+    finally:
+        A._log_problem = saved
+    kinds = sorted(kind for kind, _ in working.calls)
+    assert kinds == called, f"the working sink lost moments: {kinds} != {called}"
+    assert len(logged) == len(called), (
+        f"{len(called)} forwards failed but {len(logged)} were logged")
+    print(f"  the working sink still got every moment: {kinds}")
 
 
 def test_default_notify_and_sound_pass_a_timeout():

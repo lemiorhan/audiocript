@@ -25,8 +25,6 @@ from pynput import keyboard
 import audiocript as A
 import dictation
 
-IDLE, RECORDING, PROCESSING = "idle", "recording", "processing"
-
 # The WAV a capture converts itself into, inside its own temporary directory.
 WAV_NAME = "dictation.wav"
 RAW_NAME = "mic.raw"
@@ -144,7 +142,7 @@ class Daemon:
         self._deliver = deliver or dictation.deliver
 
         # `state` is read from anywhere and written only under `_lock`.
-        self.state = IDLE
+        self.state = dictation.IDLE
         self._lock = threading.Lock()
         self._capture = None
         self._worker = None
@@ -160,9 +158,9 @@ class Daemon:
         the correction run on a worker thread, because this is called from the
         hotkey listener."""
         with self._lock:
-            if self.state == IDLE:
+            if self.state == dictation.IDLE:
                 self._begin_recording()
-            elif self.state == RECORDING:
+            elif self.state == dictation.RECORDING:
                 self._begin_processing()
             else:
                 # Nothing else. A second dictation on top of one still being
@@ -189,11 +187,11 @@ class Daemon:
         here would delete the WAV out from under a transcription of something the
         user has already spoken."""
         with self._lock:
-            if self.state != RECORDING:
+            if self.state != dictation.RECORDING:
                 return
             capture, self._capture = self._capture, None
             self._leave_recording()
-            self.state = IDLE
+            self.state = dictation.IDLE
         # Outside the lock, as the worker's own cleanup is: discard() stops a
         # recorder and removes a directory, and neither needs the state guarded.
         capture.discard()
@@ -229,7 +227,7 @@ class Daemon:
             self._sink.failed(f"the microphone could not be opened: {e}")
             return
         self._capture = capture
-        self.state = RECORDING
+        self.state = dictation.RECORDING
         self._timer = threading.Timer(self._config.max_seconds,
                                       self._on_duration_bound, args=(self._epoch,))
         # daemon: a recording that is never stopped must not keep the process
@@ -252,7 +250,7 @@ class Daemon:
         self._leave_recording()
         try:
             wav_path = capture.stop()
-            self.state = PROCESSING
+            self.state = dictation.PROCESSING
             self._sink.processing()
             # Published only once it is actually running: join()ing a thread that
             # never started raises, and join_worker is what the tests wait on.
@@ -266,7 +264,7 @@ class Daemon:
             # raises in here cannot leave the daemon in PROCESSING.
             capture.discard()
             self._capture = None
-            self.state = IDLE
+            self.state = dictation.IDLE
             self._sink.failed(f"the dictation could not be finished: {e}")
 
     def _leave_recording(self):
@@ -287,7 +285,7 @@ class Daemon:
         """The duration bound was reached: stop the recording as a toggle would,
         but say that the limit stopped it rather than the user."""
         with self._lock:
-            if epoch != self._epoch or self.state != RECORDING:
+            if epoch != self._epoch or self.state != dictation.RECORDING:
                 return                    # this timer's recording is already over
             # Turkish, unlike the rest of this module's English, because it is
             # read by the user in a notification alongside the sink's own
@@ -317,7 +315,7 @@ class Daemon:
             capture.discard()
             with self._lock:
                 self._capture = None
-                self.state = IDLE
+                self.state = dictation.IDLE
 
 
 # ============================ The global hotkey ============================
@@ -555,7 +553,7 @@ def _shutdown(listener, daemon, path=PID_PATH, drain_seconds=DRAIN_SECONDS):
             listener.stop()
         daemon.abandon_recording()
         daemon.join_worker(timeout=drain_seconds)
-        if daemon.state != IDLE:
+        if daemon.state != dictation.IDLE:
             print(f"a dictation was still being processed after {drain_seconds}s; "
                   "its text did not reach the clipboard")
     except Exception as e:

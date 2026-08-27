@@ -17,6 +17,19 @@ DEFAULT_HOTKEYS = {"toggle": "<cmd>+<alt>+d"}
 DEFAULT_MAX_SECONDS = 300
 DEFAULT_MODEL = "gpt-4.1-mini"
 
+# The daemon's two axes of state. `state` is one dictation's progress; `power` is
+# whether the daemon is up at all, and means the model is loaded and a recording can
+# start. They are separate because "recording" and "off" are not comparable: folding
+# them into one enum would make every existing `state == IDLE` guard quietly start
+# meaning "powered on and idle".
+#
+# They live here rather than in dictate.py, which owns both state machines, because
+# the menu model below is pure and may not import dictate: the vocabulary both layers
+# branch on belongs to the module underneath. dictate.py refers to them through this
+# module and keeps no aliases of its own.
+IDLE, RECORDING, PROCESSING = "idle", "recording", "processing"
+POWER_OFF, POWER_LOADING, POWER_ON = "off", "loading", "on"
+
 
 class ConfigError(Exception):
     """Raised by resolve_config when a configured value cannot be used as given."""
@@ -140,6 +153,18 @@ class StatusSink:
     def failed(self, reason):
         """The attempt produced no text; `reason` explains why, for the user."""
 
+    def power_changed(self, power):
+        """The daemon's power axis moved to `power` — one of POWER_OFF,
+        POWER_LOADING, POWER_ON.
+
+        The fifth moment exists because `enable()` returns before the model is
+        loaded: the load runs on a thread of its own, so LOADING becoming ON is
+        something only a sink call can tell a caller about. MenuBarSink renders it as
+        an icon title; NotifySink says it out loud.
+
+        Named `power_changed` rather than `power` so the parameter is not called
+        `state`, which is the other axis's word."""
+
 
 def _osascript_notify(message):
     """Show `message` as a macOS notification titled Audiocript.
@@ -209,6 +234,70 @@ class NotifySink(StatusSink):
 
     def failed(self, reason):
         self._report(f"Dictation failed: {reason}")
+
+    def power_changed(self, power):
+        # No cue. The two moments that cue are the start and the stop of speaking,
+        # where the user is not looking at the screen; a power change is something
+        # they just asked for by clicking.
+        #
+        # .get rather than [power]: an unexpected value is worth reporting as itself,
+        # where a KeyError here would raise on a status report — outside the
+        # try/except in _report, which guards the notification, not this lookup.
+        self._report(POWER_MESSAGES.get(power, f"Dictation daemon: {power}"))
+
+
+# What each power value says to the user. English, like NotifySink's other four
+# messages; the Turkish in this feature is in the menu titles and in the duration
+# bound's notification, which dictate.py explains where it builds it.
+POWER_MESSAGES = {POWER_OFF: "Dictation off",
+                  POWER_LOADING: "Loading the model…",
+                  POWER_ON: "Dictation ready"}
+
+
+class FanoutSink(StatusSink):
+    """One report, several destinations: forwards every moment to each sink given.
+
+    The menu bar's icons are added to the notifications rather than substituted for
+    them. An icon is only visible while the user is looking at the menu bar, and
+    NotifySink's message plus its cue is what tells them a dictation reached the
+    clipboard — so the daemon is handed both, behind this.
+
+    Every forward is guarded on its own, one level above the guards already inside
+    NotifySink. Without that, the second sink's reliability would depend on the
+    first one's: a MenuBarSink raising on an icon update would take the notification
+    with it, on exactly the path where the user has already spoken and is waiting to
+    hear that the text is ready.
+
+    The five methods are written out rather than generated through __getattr__: this
+    is a documented contract, and a reader should be able to see that all of it is
+    forwarded. What keeps a sixth moment from being forgotten here is a test that
+    scans the contract, not a clever base class.
+    """
+
+    def __init__(self, *sinks):
+        self._sinks = sinks
+
+    def _forward(self, moment, *args):
+        for sink in self._sinks:
+            try:
+                getattr(sink, moment)(*args)
+            except Exception as e:
+                A._log_problem(f"a dictation status sink failed on {moment}", e)
+
+    def recording(self):
+        self._forward("recording")
+
+    def processing(self):
+        self._forward("processing")
+
+    def done(self, text, note=""):
+        self._forward("done", text, note)
+
+    def failed(self, reason):
+        self._forward("failed", reason)
+
+    def power_changed(self, power):
+        self._forward("power_changed", power)
 
 
 # =========================== The correction pipeline ===========================
