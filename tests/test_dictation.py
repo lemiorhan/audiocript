@@ -1,16 +1,19 @@
-"""dictation.resolve_config: the configuration half of the dictation daemon.
+"""dictation: the configuration, the output sinks and the correction pipeline.
 
 Nothing here may reach a real API or read a developer's .env. Every test but
 one passes an explicit `env`, so publish.env_value is never consulted.
 test_env_defaults_to_publish_env_value is the exception: it monkeypatches
 publish.env_value itself, so resolve_config's fallback to it is pinned without
-ever touching a real .env.
+ever touching a real .env. Every provider call goes to a FakeAPI on localhost or
+to an address with nothing listening, so no test can spend a real API key.
 """
 import os
+import re
 import tempfile
 from pathlib import Path
 
-from support import A, run, fake_env
+from support import A, run, fake_env, FakeClipboard, RecordingSink
+from test_publish import FakeAPI, completion
 
 import dictation
 import publish
@@ -259,6 +262,214 @@ def test_default_notify_and_sound_pass_a_timeout():
         assert isinstance(kwargs["timeout"], (int, float)) and kwargs["timeout"] > 0, \
             f"timeout must be a positive number: {kwargs}"
     print(f"  timeouts={[c['timeout'] for c in calls]}")
+
+
+# =========================== the correction pipeline ===========================
+
+# What Whisper hands over: no punctuation, no Turkish letters, fillers in the
+# middle of it — and what one minimal correction of it looks like.
+RAW = "eee bu pr'i bugun mergeleyemeyiz cunku yani testler gecmiyor hani o repodaki"
+FIXED = "Bu PR'ı bugün merge edemeyiz, çünkü o repo'daki testler geçmiyor."
+
+ROUTE = ("POST", "/v1/chat/completions")
+
+
+def _config(base):
+    return dictation.resolve_config(
+        {}, fake_env(OPENAI_API_KEY="sk-test", OPENAI_API_BASE=base))
+
+
+def _bases():
+    """Both ways the provider can fail: a 500, and nothing listening at all."""
+    api = FakeAPI({ROUTE: [(500, {})]})
+    yield api.url, api
+    api.close()
+    yield "http://127.0.0.1:1", None
+
+
+def test_a_failing_provider_still_delivers_the_raw_transcript():
+    # The user has already spoken and is waiting. Unpunctuated Turkish beats nothing.
+    for base, api in _bases():
+        try:
+            clip, sink = FakeClipboard(), RecordingSink()
+            d = dictation.deliver(RAW, _config(base), clip, sink)
+            assert d.status == dictation.UNCORRECTED, f"{base}: status {d.status!r}"
+            assert clip.text == RAW, f"{base}: clipboard {clip.text!r} != the raw transcript"
+            assert clip.writes == 1, f"{base}: clipboard written {clip.writes} times"
+            assert d.detail, f"{base}: no reason was recorded"
+            assert any(k == "done" for k, _ in sink.calls), f"{base}: {sink.calls!r}"
+        finally:
+            if api:
+                api.close()
+    print("  a 500 and an unreachable provider both delivered the raw transcript")
+
+
+def test_an_empty_transcript_leaves_the_clipboard_alone():
+    for nothing in ("", "   ", "\n"):
+        clip, sink = FakeClipboard(), RecordingSink()
+        d = dictation.deliver(nothing, _config("http://127.0.0.1:1"), clip, sink)
+        assert d.status == dictation.EMPTY, f"{nothing!r}: status {d.status!r}"
+        assert clip.writes == 0, f"{nothing!r}: the clipboard was written to"
+        assert clip.text == "ONCEKI ICERIK", f"{nothing!r}: clipboard {clip.text!r}"
+        assert any(k == "failed" for k, _ in sink.calls), f"{nothing!r}: {sink.calls!r}"
+    print("  3 empty transcripts left the clipboard untouched")
+
+
+def test_the_transcript_is_inlined_into_the_prompt():
+    # A prompt file edited into a shape with no placeholder would append the
+    # transcript instead, and the model would read the rules as the text.
+    api = FakeAPI({ROUTE: [(200, completion(FIXED))]})
+    try:
+        dictation.deliver(RAW, _config(api.url), FakeClipboard(), RecordingSink())
+    finally:
+        api.close()
+    sent = api.requests[0]["body"]["messages"][0]["content"]
+    assert RAW in sent, "the transcript did not reach the prompt"
+    assert not sent.rstrip().endswith(RAW), (
+        "the transcript landed at the end — the placeholder was not found")
+    print(f"  the transcript was inlined into {len(sent)} chars of prompt")
+
+
+def test_corrected_text_reaches_the_clipboard():
+    api = FakeAPI({ROUTE: [(200, completion(FIXED))]})
+    clip, sink = FakeClipboard(), RecordingSink()
+    try:
+        d = dictation.deliver(RAW, _config(api.url), clip, sink)
+    finally:
+        api.close()
+    assert d.status == dictation.CORRECTED, f"status {d.status!r} ({d.detail})"
+    assert d.text == FIXED, f"delivered {d.text!r}"
+    assert clip.text == FIXED, f"clipboard {clip.text!r}"
+    assert clip.writes == 1, f"clipboard written {clip.writes} times"
+    assert ("done", FIXED) in sink.calls, sink.calls
+    assert api.requests[0]["body"]["model"] == dictation.DEFAULT_MODEL, \
+        api.requests[0]["body"]["model"]
+    print(f"  {FIXED!r} reached the clipboard")
+
+
+def _refused(reply, complete=None):
+    """deliver must refuse `reply` and put the raw transcript on the clipboard."""
+    clip, sink = FakeClipboard(), RecordingSink()
+    api = None
+    try:
+        if complete is None:
+            api = FakeAPI({ROUTE: [(200, completion(reply))]})
+            base = api.url
+        else:
+            base = "http://127.0.0.1:1"      # never reached: complete is injected
+        d = dictation.deliver(RAW, _config(base), clip, sink, complete=complete)
+    finally:
+        if api:
+            api.close()
+    assert d.status == dictation.SKIPPED, \
+        f"status {d.status!r} for a {len(reply)}-char reply"
+    assert clip.text == RAW, f"clipboard {clip.text!r} != the raw transcript"
+    assert clip.writes == 1, f"clipboard written {clip.writes} times"
+    assert d.detail, "no reason was recorded"
+    return d
+
+
+def test_a_reply_that_grows_too_much_is_refused():
+    d = _refused(RAW * 5)
+    print(f"  refused a 5x reply: {d.detail}")
+
+
+def test_a_reply_that_shrinks_too_much_is_refused():
+    d = _refused("Testler geçmiyor.")
+    print(f"  refused a summary: {d.detail}")
+
+
+def test_an_empty_reply_is_refused():
+    """The reply is injected rather than served: publish.openai_complete turns an
+    empty message into a RuntimeError of its own, so a FakeAPI serving one would
+    exercise the provider-failure path instead of deliver's length guard."""
+    d = _refused("   ", complete=lambda prompt, cfg: "   ")
+    print(f"  refused a blank reply: {d.detail}")
+
+
+def test_a_provider_failure_is_logged():
+    """A notification is gone the moment the user dismisses it, and the dictation
+    still succeeded from the user's side — so the reason the correction was lost
+    has to outlive it. Pinned by monkeypatching audiocript._log_problem."""
+    logged = []
+    saved = A._log_problem
+    A._log_problem = lambda what, exc=None: logged.append((what, exc))
+    try:
+        def broken(prompt, cfg_dict):
+            raise RuntimeError("the provider is down")
+        d = dictation.deliver(RAW, _config("http://127.0.0.1:1"), FakeClipboard(),
+                              RecordingSink(), complete=broken)
+    finally:
+        A._log_problem = saved
+    assert d.status == dictation.UNCORRECTED, f"status {d.status!r}"
+    assert len(logged) == 1, f"logged {logged!r}"
+    what, exc = logged[0]
+    assert "the provider is down" in str(exc), f"the exception was lost: {logged!r}"
+    assert what, "nothing was said about what failed"
+    print(f"  logged {what!r} with the exception")
+
+
+def test_the_api_key_reaches_nothing_but_the_provider():
+    """The accident this guards actually happened once: a config rendered into a
+    message leaked a real key. The key must reach the provider call and nowhere
+    else — not the prompt, the Delivery, the clipboard, the sink or the log."""
+    canary = "sk-SECRET-CANARY"
+    cfg = dictation.resolve_config(
+        {}, fake_env(OPENAI_API_KEY=canary, OPENAI_API_BASE="http://127.0.0.1:1"))
+    seen, logged = [], []
+    saved = A._log_problem
+    A._log_problem = lambda what, exc=None: logged.append(f"{what} {exc}")
+    try:
+        def complete(prompt, cfg_dict):
+            seen.append((prompt, cfg_dict["openai_token"]))
+            raise RuntimeError("no provider today")
+        clip, sink = FakeClipboard(), RecordingSink()
+        d = dictation.deliver(RAW, cfg, clip, sink, complete=complete)
+    finally:
+        A._log_problem = saved
+    assert len(seen) == 1, f"complete was called {len(seen)} times with a token"
+    prompt, token = seen[0]
+    assert token == canary, "the provider call did not get the key it needs"
+    for where, text in (("the prompt", prompt), ("the detail", d.detail),
+                        ("the delivered text", d.text), ("the clipboard", clip.text),
+                        ("the sink", repr(sink.calls)), ("the log", " ".join(logged))):
+        assert "SECRET-CANARY" not in text, f"the API key reached {where}: {text!r}"
+    print("  the key reached the provider call and nothing else")
+
+
+def test_the_fixture_exercises_the_guards_middle():
+    """Otherwise test_corrected_text_reaches_the_clipboard would be silently
+    asserting on a reply the length guard should have refused."""
+    ratio = len(FIXED) / len(RAW)
+    assert dictation.MIN_SHRINK < ratio < dictation.MAX_GROWTH, \
+        f"the happy-path fixture is at {ratio:.2f}x, outside the guard's bounds"
+    print(f"  the fixture pair is {ratio:.2f}x, inside "
+          f"[{dictation.MIN_SHRINK}, {dictation.MAX_GROWTH}]")
+
+
+def test_the_prompt_file_carries_a_placeholder():
+    """publish.render_prompt appends the transcript to the end of a prompt with no
+    bracketed trailing line, so losing the placeholder silently changes what the
+    model is asked."""
+    text = dictation.PROMPT_PATH.read_text(encoding="utf-8")
+    assert re.search(r"^\[[^\]\n]*\]\s*$", text, re.MULTILINE), \
+        f"{dictation.PROMPT_PATH} has no bracketed placeholder line"
+    print(f"  {dictation.PROMPT_PATH.name} carries a placeholder")
+
+
+def test_the_prompt_path_does_not_depend_on_the_working_directory():
+    """The daemon runs from wherever the user launched it, so a cwd-relative
+    prompt path would work in the repo and fail everywhere else."""
+    saved = os.getcwd()
+    os.chdir(tempfile.gettempdir())
+    try:
+        assert dictation.PROMPT_PATH.is_file(), \
+            f"{dictation.PROMPT_PATH} is not readable from {os.getcwd()}"
+        body = publish.render_prompt(dictation.PROMPT_PATH, RAW)
+    finally:
+        os.chdir(saved)
+    assert RAW in body, "the prompt did not render from another directory"
+    print(f"  the prompt rendered from {tempfile.gettempdir()}")
 
 
 if __name__ == "__main__":

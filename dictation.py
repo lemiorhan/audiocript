@@ -1,8 +1,9 @@
 """The parts of dictation holding no threads and no global state: configuration,
-the clipboard, and the status sinks today, and — as a later task adds it — the
-correction pipeline. Kept apart from dictate.py's state machine and hotkey
+the clipboard, the status sinks, and the correction pipeline that decides what
+reaches the clipboard. Kept apart from dictate.py's state machine and hotkey
 listener so all of it can be tested without audio hardware or a running daemon.
 """
+import pathlib
 import subprocess
 from dataclasses import dataclass, field
 
@@ -201,3 +202,80 @@ class NotifySink(StatusSink):
 
     def failed(self, reason):
         self._report(f"Dictation failed: {reason}")
+
+
+# =========================== The correction pipeline ===========================
+
+CORRECTED = "corrected"        # the provider's text is on the clipboard
+UNCORRECTED = "uncorrected"    # the provider failed; the raw transcript is on it
+SKIPPED = "skipped"            # the reply broke the length contract; raw transcript
+EMPTY = "empty"                # nothing was said; the clipboard was not touched
+
+# The prompt asks for punctuation, dropped fillers and nothing else, so a faithful
+# reply is about as long as the transcript. A reply well outside this band is a
+# rewrite, a summary, or a commentary about the text — the one failure the user
+# cannot spot before pasting, because it reads perfectly well. Measured in
+# characters rather than words: dictations are short, so a word ratio moves in
+# steps of 1/N and a single dropped filler can look like a breach, and a
+# character count also sees a prepended preamble or a code fence that adds few
+# words. Punctuation is a few percent of the length, nowhere near these bounds.
+MAX_GROWTH = 2.0               # a reply longer than this multiple of the input is refused
+MIN_SHRINK = 0.4               # a reply shorter than this fraction of the input is refused
+
+# Anchored on this file, never on the working directory: the daemon runs from
+# wherever the user launched it.
+PROMPT_PATH = pathlib.Path(__file__).resolve().parent / "prompts" / "dictation_prompt.md"
+
+
+@dataclass
+class Delivery:
+    """What deliver() did, for the caller to report and for a test to assert on."""
+    status: str                # one of the four constants above
+    text: str                  # what reached the clipboard; "" for EMPTY
+    detail: str = ""           # why, when it was not a plain correction
+
+
+def deliver(transcript, config, clipboard, sink, complete=None):
+    """Correct `transcript` with the provider, put the result on the clipboard, and
+    return a Delivery saying what happened.
+
+    Every path but EMPTY copies exactly once: the user has already spoken and is
+    waiting, so a failed correction still delivers the raw transcript rather than
+    nothing. EMPTY copies nothing at all — silently replacing whatever the user
+    already had on the clipboard is worse than doing nothing.
+
+    `complete` is a callable(prompt, cfg_dict) -> str, defaulting to
+    publish.openai_complete, so the daemon's tests need no socket."""
+    complete = complete or publish.openai_complete
+    transcript = (transcript or "").strip()
+    if not transcript:
+        reason = "no speech was detected"
+        sink.failed(reason)
+        return Delivery(EMPTY, "", reason)
+
+    def raw(status, detail):
+        """The transcript itself on the clipboard, unpunctuated but pasteable."""
+        clipboard.copy(transcript)
+        sink.done(transcript)
+        return Delivery(status, transcript, detail)
+
+    # Built here as a local and never logged, returned or put in a message: it
+    # carries the API key, and DictationConfig hides it from repr() for a reason.
+    cfg_dict = {"openai_base": config.openai_base,
+                "openai_token": config.openai_token,
+                "model": config.model}
+    try:
+        corrected = complete(publish.render_prompt(PROMPT_PATH, transcript),
+                             cfg_dict).strip()
+    except Exception as e:
+        A._log_problem("dictation correction failed", e)
+        return raw(UNCORRECTED, f"the correction failed: {e}")
+
+    ratio = len(corrected) / len(transcript)
+    if not MIN_SHRINK <= ratio <= MAX_GROWTH:
+        # An empty reply lands here too, at 0.00x.
+        return raw(SKIPPED, f"the correction came back {ratio:.2f}x the length of "
+                            "the dictation, so it was not used")
+    clipboard.copy(corrected)
+    sink.done(corrected)
+    return Delivery(CORRECTED, corrected)
