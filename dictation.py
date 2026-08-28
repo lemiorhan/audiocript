@@ -1,7 +1,13 @@
-"""The parts of dictation holding no threads and no global state: configuration,
-the clipboard, the status sinks, and the correction pipeline that decides what
-reaches the clipboard. Kept apart from dictate.py's state machine and hotkey
-listener so all of it can be tested without audio hardware or a running daemon.
+"""The parts of dictation that hold no daemon threads and no global state:
+configuration, the clipboard, the status sinks, the history log, the menu model and
+the correction pipeline that decides what reaches the clipboard.
+
+Kept apart from dictate.py's state machines and from menubar.py's AppKit layer so all
+of it can be tested without audio hardware, a loaded model, a running daemon or a
+menu bar — which is where most of this feature's rules live.
+
+`History` starts no threads either, but it does serialise its own file access with a
+lock: the worker appends while the main thread reads the menu.
 """
 import json
 import pathlib
@@ -10,13 +16,9 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from pynput.keyboard import HotKey, Key
-
 import audiocript as A
 import publish
 
-HOTKEY_ACTIONS = ("toggle",)
-DEFAULT_HOTKEYS = {"toggle": "<cmd>+<alt>+0"}
 DEFAULT_MAX_SECONDS = 300
 DEFAULT_MODEL = "gpt-4.1-mini"
 
@@ -47,35 +49,12 @@ class ConfigError(Exception):
 @dataclass
 class DictationConfig:
     language: str
-    hotkeys: dict
     max_seconds: int
     model: str
     # repr=False: a traceback, a log line, or a careless print/f-string must not
     # be able to render (and so leak) the API key held here.
     openai_token: str = field(repr=False)
     openai_base: str
-
-
-def _validated_hotkeys(cfg):
-    """DEFAULT_HOTKEYS with any configured combinations laid over it, so a partial
-    `dictation_hotkeys` object keeps the actions it did not mention."""
-    hotkeys = {**DEFAULT_HOTKEYS, **(cfg.get("dictation_hotkeys") or {})}
-    for action, combination in hotkeys.items():
-        if action not in HOTKEY_ACTIONS:
-            raise ConfigError(
-                f"unknown hotkey action {action!r}: expected one of {HOTKEY_ACTIONS}")
-        try:
-            parsed = HotKey.parse(combination)
-        except ValueError:
-            raise ConfigError(
-                f"hotkey {combination!r} for the {action!r} action is not a "
-                "valid key combination") from None
-        if not any(isinstance(key, Key) for key in parsed):
-            raise ConfigError(
-                f"hotkey {combination!r} for the {action!r} action needs a "
-                "modifier such as <cmd>, <alt> or <shift> — otherwise it would "
-                "fire on every matching key typed anywhere")
-    return hotkeys
 
 
 def _validated_max_seconds(cfg):
@@ -99,7 +78,6 @@ def resolve_config(cfg, env=None):
         raise ConfigError(
             f"unknown language {language!r}: expected one of {sorted(A.LANGUAGES)}")
 
-    hotkeys = _validated_hotkeys(cfg)
     max_seconds = _validated_max_seconds(cfg)
 
     openai_token = env("OPENAI_API_KEY")
@@ -109,7 +87,6 @@ def resolve_config(cfg, env=None):
 
     return DictationConfig(
         language=language,
-        hotkeys=hotkeys,
         max_seconds=max_seconds,
         model=env("DICTATION_MODEL", DEFAULT_MODEL),
         openai_token=openai_token,

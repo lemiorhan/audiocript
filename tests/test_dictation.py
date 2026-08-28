@@ -38,20 +38,16 @@ def test_defaults_when_config_is_empty():
     cfg = dictation.resolve_config({}, fake_env(**BASE_ENV))
     print(f"  {cfg}")
     assert cfg.language == "tr"
-    assert cfg.hotkeys == dictation.DEFAULT_HOTKEYS
     assert cfg.max_seconds == dictation.DEFAULT_MAX_SECONDS
     assert cfg.model == dictation.DEFAULT_MODEL
     assert cfg.openai_base == "https://api.openai.com"
 
 
 def test_config_values_are_used():
-    given = {"language": "en",
-             "dictation_hotkeys": {"toggle": "<cmd>+<shift>+<alt>+k"},
-             "dictation_max_seconds": 42}
+    given = {"language": "en", "dictation_max_seconds": 42}
     cfg = dictation.resolve_config(given, fake_env(**BASE_ENV))
     print(f"  {cfg}")
     assert cfg.language == "en"
-    assert cfg.hotkeys == {"toggle": "<cmd>+<shift>+<alt>+k"}
     assert cfg.max_seconds == 42
 
 
@@ -64,10 +60,46 @@ def test_env_overrides_model_and_base():
     assert cfg.openai_base == "https://proxy.example"
 
 
-def test_a_partial_hotkeys_object_keeps_the_defaults():
-    cfg = dictation.resolve_config({"dictation_hotkeys": {}}, fake_env(**BASE_ENV))
-    print(f"  hotkeys={cfg.hotkeys}")
-    assert cfg.hotkeys == dictation.DEFAULT_HOTKEYS
+def test_nothing_in_the_repository_mentions_pynput():
+    """The hotkey is gone, and it was pynput's only use. Scanned over the repository
+    rather than checking the files that used to import it: the next one would be added
+    to a fourth file and nothing would notice.
+
+    requirements files are scanned too. Leaving the dependency declared would keep
+    installing it — and, worse, keep pyobjc-framework-Cocoa arriving through it by
+    accident rather than because menubar.py asks for it."""
+    root = Path(__file__).resolve().parent.parent
+    # An import, not the bare word: this test's own docstring says the word, and so may
+    # a comment explaining why the dependency went. What must not exist is a use.
+    imports = re.compile(r"^\s*(?:import|from)\s+pynput\b", re.M)
+    declares = re.compile(r"^\s*pynput\b", re.M)
+    scanned, offenders = 0, []
+    for path in sorted(list(root.rglob("*.py")) + list(root.glob("requirements*.txt"))):
+        if ".venv" in path.parts or "__pycache__" in path.parts:
+            continue
+        scanned += 1
+        text = path.read_text(encoding="utf-8")
+        pattern = declares if path.suffix == ".txt" else imports
+        if pattern.search(text):
+            offenders.append(str(path.relative_to(root)))
+    assert scanned > 5, \
+        f"the scan only looked at {scanned} files; it found nothing to check"
+    assert not offenders, f"pynput is still used or declared in {offenders}"
+    print(f"  {scanned} files scanned, none imports or declares pynput")
+
+
+def test_a_config_with_the_dead_hotkey_key_still_starts():
+    """resolve_config does not reject unknown keys and must not start now: an existing
+    config.json with dictation_hotkeys in it would otherwise turn into a startup
+    failure over a feature that no longer exists. The key is ignored, not migrated —
+    rewriting a user's config file to drop one dead line is the worse trade."""
+    config = dictation.resolve_config(
+        {"dictation_hotkeys": {"toggle": "<cmd>+<alt>+d"}, "language": "tr"},
+        fake_env(**BASE_ENV))
+    assert config.language == "tr", config
+    assert not hasattr(config, "hotkeys"), \
+        "DictationConfig still carries a hotkeys field"
+    print("  an old config with dictation_hotkeys still resolves")
 
 
 def test_every_known_language_is_accepted():
@@ -85,38 +117,6 @@ def test_missing_api_key_is_refused():
 def test_unknown_language_is_refused():
     _refuses({"language": "de"}, fake_env(**BASE_ENV), "de")
     print("  refused unknown language")
-
-
-def test_unparseable_hotkey_is_refused():
-    for bad in ("cmd+alt+d", "<zort>+d"):
-        cfg = {"dictation_hotkeys": {"toggle": bad}}
-        _refuses(cfg, fake_env(**BASE_ENV), bad)
-
-    # "" in message is vacuously true for any message, so the empty-string case
-    # needs a real assertion: the message must be non-empty and must name either
-    # the action or the expected syntax.
-    try:
-        dictation.resolve_config({"dictation_hotkeys": {"toggle": ""}},
-                                 fake_env(**BASE_ENV))
-    except dictation.ConfigError as e:
-        message = str(e)
-        assert message, "an empty hotkey produced an empty message"
-        assert "toggle" in message or "key combination" in message, \
-            f"message {message!r} names neither the action nor the expected syntax"
-    else:
-        raise AssertionError("accepted an empty hotkey combination")
-    print("  refused 3 unparseable combinations")
-
-
-def test_hotkey_without_a_modifier_is_refused():
-    _refuses({"dictation_hotkeys": {"toggle": "d"}}, fake_env(**BASE_ENV), "d")
-    print("  refused a bare key with no modifier")
-
-
-def test_unknown_hotkey_action_is_refused():
-    cfg = {"dictation_hotkeys": {"togle": "<cmd>+<alt>+d"}}
-    _refuses(cfg, fake_env(**BASE_ENV), "togle")
-    print("  refused an unknown hotkey action")
 
 
 def test_bad_max_seconds_is_refused():

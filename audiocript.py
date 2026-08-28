@@ -18,7 +18,6 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 import warnings
-from pynput import keyboard
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.live import Live

@@ -6,21 +6,37 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
-- **A background dictation daemon.** `./run.sh --dictate` runs a global hotkey
-  (`<cmd>+<alt>+d` by default) that starts and stops a recording from anywhere on
-  macOS; on stop, the audio is transcribed locally, corrected by an OpenAI model,
-  and the result replaces the clipboard contents. Nothing is saved to disk — the
-  audio and its transcript exist only for the duration of one dictation. The
-  language follows the existing Language setting. Two new `config.json` keys:
-  `dictation_hotkeys` (default `{"toggle": "<cmd>+<alt>+d"}`) and
+- **A dictation menu bar app.** `./run.sh --dictate` puts one icon in the menu
+  bar and everything behind its menu: click to record, click to stop, and the
+  audio is transcribed locally, corrected by an OpenAI model, and put on the
+  clipboard. The icon is the state — `◯` off, `◌` loading the model, `🎙` ready,
+  `🔴` recording, `⏳` working. The daemon starts off, so the icon appears without
+  waiting for a model; starting it loads the model and stopping it unloads it,
+  giving back about 3 GB. **Neither stopping the daemon nor quitting is possible
+  while a dictation is running** — both rows grey out until it finishes.
+
+  **The last ten dictations are in the same menu**, each cut to 250 characters
+  with the whole text as its tooltip; clicking one puts that text back on the
+  clipboard. Every delivered dictation is also appended to
+  `~/.audiocript/dictations.jsonl` — one JSON object per line, with the local
+  time, the correction path taken, and the exact text that reached the clipboard.
+  Nothing prunes it. No audio is saved: the recording and its WAV exist only for
+  the duration of one dictation.
+
+  The language follows the existing Language setting. One `config.json` key,
   `dictation_max_seconds` (default `300`, after which a forgotten recording stops
-  itself). A new environment variable, `DICTATION_MODEL` (default
-  `gpt-4.1-mini`), picks the correction model; `OPENAI_API_KEY` (shared with
-  publishing) is required and the daemon refuses to start without it. Requires
-  the **Input Monitoring** permission for the global hotkey; without it,
-  `dictate.py --toggle`/`--stop` still work from another shell, a macOS
-  Shortcut, or `skhd`. This is not offline: every dictation sends its transcript
-  to OpenAI for correction. Uses no new dependencies.
+  itself). `DICTATION_MODEL` (default `gpt-4.1-mini`) picks the correction model;
+  `OPENAI_API_KEY` (shared with publishing) is required and the app refuses to
+  start without it. **It needs no macOS permission beyond the microphone.** For a
+  keystroke instead of a click, bind one to `dictate.py --toggle` through a macOS
+  Shortcut or `skhd`; `--stop` quits the app. This is not offline: every dictation
+  sends its transcript to OpenAI for correction.
+
+  Replaces `pynput` with `pyobjc-framework-Cocoa`. An earlier iteration of this
+  feature used a global hotkey and needed the **Input Monitoring** and
+  **Accessibility** permissions; a menu bar icon needs neither, which is why it
+  replaced it. A `dictation_hotkeys` key left over from that iteration is ignored
+  rather than an error.
 
 - **Combined microphone and system-audio captures now receive automatic acoustic
   echo cancellation at finalization.** When the optional `pywebrtc-audio` processor

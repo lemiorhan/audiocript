@@ -52,10 +52,11 @@ meters, and get a saved transcript. Everything runs on your machine.
 - **Per-language models** for quality (Turkish & English — see [below](#models-per-language)).
 - **Runs on the best device automatically** — CUDA → Apple Silicon (MPS/Metal) → CPU.
 - **Background model pre-warming** so your first transcript is fast.
-- **System-wide dictation (optional)** — a global hotkey records anywhere on
+- **System-wide dictation (optional)** — one menu bar icon records anywhere on
   macOS and delivers a corrected transcript straight to your clipboard, no app
-  window needed. Sends transcript text to an AI provider, so it is not fully
-  offline — see [below](#dictation-optional-off-by-default).
+  window needed, and keeps the last dictations one click away. Sends transcript
+  text to an AI provider, so it is not fully offline — see
+  [below](#dictation-optional-off-by-default).
 - **One command to run** — `./run.sh` sets everything up.
 
 ---
@@ -299,10 +300,9 @@ configure it. Never commit `.env` — it is gitignored for that reason.
 
 ### Dictation (optional, off by default)
 
-Audiocript can also run as a background dictation daemon instead of the TUI:
-press a global hotkey anywhere on macOS, speak, press it again, and the
-corrected text lands on your clipboard — no need to bring the app to the
-foreground, or even have it open.
+Audiocript can also run as a menu bar app instead of the TUI: click, speak,
+click again, and the corrected text lands on your clipboard — no need to bring
+anything to the foreground. It needs no macOS permission beyond the microphone.
 
 ```bash
 ./run.sh --dictate
@@ -315,23 +315,57 @@ length threshold and no separate opt-in beyond starting the daemon, has its
 transcript sent as text to OpenAI. Do not dictate anything you would not want
 to leave your machine — a password included.
 
-Press **`<cmd>+<alt>+d`** (Cmd+Option+D) anywhere to start a recording; press
-it again to stop, correct, and copy the result — it replaces whatever was
-already on your clipboard. Forgetting to press it again is covered too: a
-recording stops itself after `dictation_max_seconds` (5 minutes by default).
-Nothing is saved to disk — the audio and its transcript exist only for the
-duration of one dictation and are discarded once the clipboard is written.
+One icon appears in the menu bar, and everything is in its menu. The icon is
+the state:
+
+| Icon | Meaning |
+|------|---------|
+| `◯` | the daemon is off — no model loaded, nothing listening |
+| `◌` | the model is loading — about 11s the first time in a session, about 4s after that; the very first run also downloads it |
+| `🎙` | ready: click *Kaydı başlat* to record |
+| `🔴` | recording: click *Kaydı bitir* to stop, correct and copy |
+| `⏳` | transcribing and correcting |
+
+The menu, in a fixed order: the record row, the daemon row (*Daemon'ı başlat* /
+*Daemon'ı durdur*), then the **last ten dictations** — each cut to 250
+characters, with the whole text as its tooltip — then *Geçmiş dosyasını aç* and
+*Çıkış*. Clicking one of the ten puts that whole dictation back on the
+clipboard, so a transcript is no longer lost to the next one.
+
+**The daemon cannot be stopped, and the app cannot be quit, while a dictation is
+running.** Both rows grey out until it finishes. Starting the daemon loads the
+model; stopping it unloads it and gives back about 3 GB.
+
+Forgetting to click again is covered: a recording stops itself after
+`dictation_max_seconds` (5 minutes by default). No audio is saved to disk — the
+recording and its WAV exist only for the duration of one dictation. The text is
+kept, in the log below.
+
+If the icon does not appear, a menu bar manager (Ice, Bartender, and the like)
+has hidden it rather than the app having failed to start — the app prints a line
+saying so.
+
+**Every delivered dictation is appended to `~/.audiocript/dictations.jsonl`**,
+one JSON object per line: the local time, which correction path it took, and the
+exact text that reached the clipboard. Nothing prunes it. That file is what the
+menu reads, and it is greppable:
+
+```bash
+jq -r '.text' ~/.audiocript/dictations.jsonl | tail -20
+```
 
 Dictation transcribes in whichever language is set in **Settings → language**
 — the same setting the rest of the app uses, so a session is Turkish or
 English, never a per-dictation choice.
 
-Two `config.json` keys, both optional:
+One `config.json` key, optional:
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `dictation_hotkeys` | `{"toggle": "<cmd>+<alt>+d"}` | The hotkey that starts and stops a dictation. |
 | `dictation_max_seconds` | `300` | A recording is stopped automatically after this many seconds. |
+
+A `dictation_hotkeys` key left over from an earlier version is ignored, not an
+error — the hotkey it configured no longer exists.
 
 It also needs `OPENAI_API_KEY` — the same key set up for
 [publishing](#publishing-transcripts-optional-off-by-default) above, in `.env`
@@ -339,12 +373,12 @@ or the environment — and refuses to start without it. One more optional
 environment variable: `DICTATION_MODEL` (default `gpt-4.1-mini`) picks the
 model used for the correction pass.
 
-Like any global hotkey on macOS, it needs the **Input Monitoring** permission:
-grant it under **System Settings → Privacy & Security → Input Monitoring** to
-the terminal (or Python interpreter) running the daemon, then start it again.
-Without it the daemon still runs, but the hotkey does nothing — use
-`.venv/bin/python dictate.py --toggle` and `--stop` instead, which work with no
-permission at all, from another shell, a macOS Shortcut, or `skhd`.
+**If you want a keystroke** rather than a click, bind one to
+`.venv/bin/python dictate.py --toggle` through a macOS Shortcut, `skhd`, or
+anything else that can run a command. It starts and stops a dictation in the
+running app exactly as the menu does, and needs no permission of its own —
+the daemon has to be on, or it says so and does nothing. `--stop` quits the
+app the same way *Çıkış* does.
 
 ---
 
@@ -355,9 +389,9 @@ On first use, grant these under **System Settings → Privacy & Security**:
 - **Microphone** — for recording.
 - **System Audio Recording** — for the tap. If denied (or `swiftc` is missing),
   the app continues mic-only.
-- **Input Monitoring** — only for [dictation](#dictation-optional-off-by-default)'s
-  global hotkey. If denied, the daemon still runs; `--toggle`/`--stop` work
-  without it.
+[Dictation](#dictation-optional-off-by-default) needs nothing beyond the
+microphone: a menu bar icon asks for no permission, which is the main reason it
+replaced the global hotkey it used to have.
 
 ---
 
@@ -375,11 +409,14 @@ On first use, grant these under **System Settings → Privacy & Security**:
   `.venv/bin/python -m pip install -r requirements-aec.txt`; a native compiler may
   be needed when `pywebrtc-audio` has no wheel for your Python version. Headphones
   are the cleanest way to avoid speaker leakage.
-- **The dictation hotkey does nothing** — grant *Input Monitoring* (see
-  [Permissions](#permissions-macos)) to the terminal or Python interpreter
-  running `./run.sh --dictate`, then start the daemon again. Until then,
-  `.venv/bin/python dictate.py --toggle` (or `--stop`) works without any
-  permission at all.
+- **The dictation icon is nowhere in the menu bar** — a menu bar manager (Ice,
+  Bartender, …) has almost certainly hidden it; drag it back into the visible
+  section. The app cannot tell: a hidden status item still reports itself as
+  visible, with its window moved off screen.
+- **The dictation menu says *Daemon kapalı*** — the daemon starts off, by design,
+  so the icons appear without waiting for a model. Click *Daemon'ı başlat*.
+- **`dictate.py --toggle` says the daemon is not running** — either no app is
+  running (`./run.sh --dictate`) or its daemon is off; start it from the menu.
 
 ---
 
@@ -387,8 +424,9 @@ On first use, grant these under **System Settings → Privacy & Security**:
 
 ```
 audiocript.py                  # the app (TUI + recording + transcription)
-dictate.py                     # the dictation daemon: state machine, hotkey, CLI
-dictation.py                   # dictation config, clipboard, status sinks, correction
+dictate.py                     # the dictation daemon: state machines, capture, CLI
+dictation.py                   # dictation config, clipboard, sinks, history, menu model
+menubar.py                     # the menu bar: one status item, its menu, the run loop
 publish.py                     # optional: OpenAI passes + the GitHub commit
 prompts/                       # transcript_prompt.md + documentation_prompt.md
                                 #   (publishing), dictation_prompt.md (dictation)
