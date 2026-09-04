@@ -356,7 +356,11 @@ def recording(d, text, name="demo", published=None):
 
 
 def fake_state(base):
-    return types.SimpleNamespace(bg_msg=None, status="", base_path=base, recordings=[])
+    """A stand-in for _TuiState carrying only what publishing touches. `jobs` and
+    `jobs_lock` are the list a publish registers itself on and the lock every mutation
+    of it goes through."""
+    return types.SimpleNamespace(status="", base_path=base, recordings=[],
+                                 jobs=[], jobs_lock=threading.Lock())
 
 
 def pipeline_routes():
@@ -452,7 +456,7 @@ def test_gate_reports_missing_configuration():
         assert A._publish_async(state, d, "x" * 5000, "demo") is None
         print(f"  status={state.status!r}")
         assert "not configured" in state.status, state.status
-        assert state.bg_msg is None, "left a progress message for a job never started"
+        assert state.jobs == [], "registered a job for work that never started"
 
 
 def test_end_to_end_updates_status_and_meta():
@@ -466,7 +470,10 @@ def test_end_to_end_updates_status_and_meta():
             thread.join(60)
             meta = json.loads((d / "meta.json").read_text())
             print(f"  status={state.status!r}")
-            assert state.bg_msg is None, "left a stale progress message"
+            assert A._active_jobs(state) == [], (
+                "the publish job never reached a terminal state — it would block its "
+                "recording and sit in the quit confirmation for the rest of the session")
+            assert state.jobs[0].state == A._JOB_DONE, state.jobs[0].state
             assert "Published" in state.status and "new-sha" in state.status
             assert meta["published"]["url"].endswith("/commit/new-sha")
             assert meta["published"]["at"], "no timestamp recorded"
@@ -486,7 +493,9 @@ def test_a_failure_is_reported_on_the_status_line():
             print(f"  status={state.status!r}")
             assert state.status.startswith("Publish failed:"), state.status
             assert "bad key" in state.status
-            assert state.bg_msg is None
+            assert A._active_jobs(state) == [], "a failed publish left its job running"
+            assert state.jobs[0].state == A._JOB_FAILED, state.jobs[0].state
+            assert "bad key" in state.jobs[0].message, state.jobs[0].message
             assert "published" not in json.loads((d / "meta.json").read_text())
     finally:
         api.close()
@@ -611,10 +620,14 @@ def test_saving_a_transcript_does_not_publish():
         with workdir("nopublish") as base, configured_env(api):
             d = base / "2026-08-08_06-00-00"
             d.mkdir()
-            state = types.SimpleNamespace(bg_msg=None, status="", base_path=base,
-                                          recordings=[], pending_name="stand-up",
-                                          language="tr", open_app=None)
-            A._save_and_open(state, d, "x" * 5000)
+            state = types.SimpleNamespace(status="", base_path=base, recordings=[],
+                                          jobs=[], jobs_lock=threading.Lock())
+            # Everything _save_and_open needs is on the job, settled when the user
+            # asked for the work: it no longer falls back to whatever is on the state
+            # by the time it runs.
+            job = A.Job("transcribe", d, "stand-up", language="tr", name="stand-up",
+                        open_app=None, base_path=base, audio_path=d / "audio.wav")
+            A._save_and_open(state, job, "x" * 5000)
             print(f"  status={state.status!r}, publish calls={len(calls)}")
             assert (d / "transcription.txt").exists(), "did not even save"
             assert calls == [], "saving a transcript started a publish"

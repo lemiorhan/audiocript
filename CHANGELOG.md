@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
+- **Several things at once.** Transcribing, importing, publishing and crash
+  recovery now run as **jobs behind the menu**, so the next recording can start
+  the moment the last one stops instead of waiting for it to finish. Each job
+  keeps its own progress: a recording's row shows what is happening to it
+  (`transcribing 42%`, `publishing…`), and an **Active jobs** group opens a step
+  list per job.
+
+  Two limits are physical rather than chosen, and the UI says which is which: one
+  recording at a time (one microphone), and one transcription at a time (one
+  loaded model per engine — a second one shows as `queued`, not as a stalled
+  progress bar). Publishing is unaffected; its model calls run in parallel and
+  only the GitHub push is serialized, because two commits built on the same head
+  cannot both fast-forward the branch.
+
+  One recording, one job: a second `t` on something already transcribing, `u` on a
+  transcript being rewritten, or `d` on a folder a publish is still writing into is
+  refused and says why. `q` with anything running asks before abandoning it.
+
 - **A dictation menu bar app.** `./run.sh --dictate` puts one icon in the menu
   bar and everything behind its menu: click to record, click to stop, and the
   audio is transcribed locally, corrected by an OpenAI model, and put on the
@@ -60,6 +78,39 @@ All notable changes to this project are documented here. The format is based on
   new dependencies.
 
 ### Fixed
+- **Two recordings started in the same second no longer land in the same folder.**
+  A project folder is named for the wall-clock second it began, and it was created
+  with `exist_ok=True` — so the second one moved into the first's folder and, since
+  every filename inside is fixed, overwrote its `mic.raw`, `audio.wav`,
+  `transcription.txt` and `meta.json` without a word. Unreachable while the app
+  could only do one thing at a time, and one keystroke away once it could. A second
+  folder in the same second is now `…-02`, and the claim is the `mkdir` itself.
+
+- **A failed stop no longer strands the app on a screen that accepts no keys.**
+  Nothing wrapped the mixing step, so an exception there killed the worker thread
+  silently and left the transcription screen up for good, with every keystroke
+  dropped and nothing on screen to say why. Every worker now reports what went
+  wrong and hands the screen back.
+
+- **A finished background job no longer moves the user off the screen they are on.**
+  Workers wrote the app's screen state directly, so a job completing while you were
+  naming the next recording threw you back to the menu mid-word.
+
+- **A transcription no longer takes the *next* recording's microphone.** The stop
+  worker re-read the list of live recorders after it started, which was its own
+  list only for as long as a second recording could not be started behind it. Now
+  it is handed them.
+
+- **`meta.json` is written atomically.** It was truncated and rewritten in place,
+  and an unreadable one is treated as no metadata at all — so a reader landing in
+  that window saw a live capture as one that never started. A rename made while a
+  transcription runs also survives it: the job no longer writes back the name the
+  recording had when it began.
+
+- **A recording named something like `[/x]` no longer crashes the app.** Names went
+  into a markup string and out through Rich's parser, which raises on a tag it
+  cannot match — inside the render, which took the whole app down.
+
 - **A stray keystroke can no longer end a recording.** Space, `r` and `q` were all
   wired to the same irreversible action, so a space bar pressed mid-sentence stopped
   the capture and went straight into transcription with nothing to undo it. Only `q`

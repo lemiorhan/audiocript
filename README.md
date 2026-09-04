@@ -118,7 +118,8 @@ Audiocript is a full-screen app you drive with the **arrow keys**.
 | **Text fields** (name / rename / folder / app filter) | type · `Enter` confirm · `Esc` cancel |
 | **Microphone / app pickers** | `1`–`9` select · `Esc` cancel |
 | **Recording** | `q` stop & transcribe (asks first) — every other key is ignored |
-| **Stop / delete confirmation** | `y` confirm · any other key cancels |
+| **Active jobs** | `Enter` open the panel · `Esc` back |
+| **Stop / delete / quit confirmation** | `y` confirm · any other key cancels |
 
 The menu groups everything:
 
@@ -127,11 +128,32 @@ The menu groups everything:
 - **Recordings** — every project (name · date · language). On a selected recording
   you can **view** the transcript (`Enter`), **play/stop** its audio (`p`),
   **rename** it (`r`), or **delete** it (`d`, with confirmation). Inside the viewer
-  the transcript scrolls and `Enter` opens it in your external app.
+  the transcript scrolls and `Enter` opens it in your external app. A recording
+  something is working on says so on its own row — `(transcribing 42%)`,
+  `(publishing…)`.
+- **Active jobs** — appears while anything is running, with a step list per job.
 - **Settings** — language (TR/EN), microphone, system-audio capture, **speaker
   labels**, the "open with" app, and the recordings folder.
 
 `Ctrl-C` exits cleanly at any time.
+
+### Several things at once
+
+Transcribing, importing, publishing and crash recovery all run **behind the menu**,
+so the app stays usable and the next recording can start immediately — you do not
+wait for the last one to finish. Several jobs run at once, and each keeps its own
+progress. Two limits are real rather than chosen:
+
+- **One recording at a time**, because there is one microphone.
+- **One transcription at a time.** Both engines are a single loaded model, so a
+  second transcription queues behind the first and its row says `queued` rather
+  than showing a bar that never moves. Publishing is not affected: its two model
+  calls run in parallel with everything else, and only the GitHub push is
+  serialized, since two commits from the same starting point cannot both land.
+
+One recording, one job: a second `t` on something already transcribing, or `d` on a
+folder a publish is still writing into, is refused and says why. `q` with anything
+still running asks before abandoning it.
 
 ### While recording
 
@@ -145,8 +167,9 @@ stray space bar cannot end the capture.
 ### Importing a file
 
 Audio is extracted (via ffmpeg) into a new project folder as `audio.wav`
-(16 kHz mono) and transcribed like a recording, with a **live progress panel**
-(real % for extraction and for English transcription).
+(16 kHz mono) and transcribed like a recording, as a **job** you can watch under
+**Active jobs** (real % for extraction and for English transcription) while you go
+on using the app.
 
 ---
 
@@ -280,10 +303,11 @@ The repository gets one commit per recording, named after it:
 ```
 
 Both model outputs are also written next to the recording, before anything is pushed,
-so a failed push costs nothing but the retry. Progress shows on the status line while
-the menu stays usable. Two optional settings: `OPENAI_MODEL` (default `gpt-4.1` — it
-needs a large output budget, since the response is as long as the transcript) and
-`TRANSCRIPT_MIN_CHARS`.
+so a failed push costs nothing but the retry. It runs as a job under **Active jobs**
+while the menu stays usable, and several publishes can run at once — only the push
+itself is taken one at a time. Two optional settings: `OPENAI_MODEL` (default
+`gpt-4.1` — it needs a large output budget, since the response is as long as the
+transcript) and `TRANSCRIPT_MIN_CHARS`.
 
 Nothing publishes by itself. Transcribing saves the transcript and stops there —
 two paid model calls are not something to start on your behalf — so publishing waits

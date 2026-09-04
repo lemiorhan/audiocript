@@ -136,14 +136,25 @@ def test_the_question_shows_the_recording_is_still_running():
 
 
 def test_confirming_stops_and_transcribes():
+    """Confirming hands the work to a job and gives the menu straight back. It used to
+    switch to a transcription screen that had no key handler at all, so nothing could
+    be done — least of all starting the next recording — until it finished."""
     with workdir("stop-yes") as home:
         state = recording_state(home)
+        project = state.project_dir
         press(state, "q")
         worker = press(state, "y")
-        print(f"  mode after y: {state.mode!r}, worker calls: {worker.calls}")
-        assert state.mode == "transcribing", (
-            f"y did not start transcription (mode {state.mode!r})")
+        jobs = A._jobs_snapshot(state)
+        print(f"  mode after y: {state.mode!r}, worker calls: {worker.calls}, "
+              f"jobs: {jobs}")
+        assert state.mode == "menu", (
+            f"y left the app on {state.mode!r} instead of handing the menu back")
         assert worker.calls == 1, "the stop worker never ran"
+        assert len(jobs) == 1 and jobs[0].kind == "transcribe", (
+            f"the work was not registered as a job: {jobs}")
+        assert jobs[0].project_dir == project, "the job points at the wrong recording"
+        assert state.recorders == [], (
+            "the recorders were left on the state for the worker to re-read")
 
 
 def test_declining_goes_back_to_the_recording():

@@ -23,6 +23,7 @@ from rich.panel import Panel
 from rich.live import Live
 from rich.text import Text
 from rich.layout import Layout
+from rich.markup import escape as markup_escape
 
 import audio_echo
 import publish  # optional OpenAI + GitHub publishing; inert without a configured .env
@@ -90,6 +91,51 @@ _cpp_model = None
 _diar_pipe = None
 # Lock so the model is not loaded twice at once (e.g. background pre-warm + transcription).
 _MODEL_LOCK = threading.Lock()
+# The diarizer gets its own load lock rather than sharing _MODEL_LOCK. Both loads hold
+# their lock across a download — _ensure_diarizer across a gated ~1 GB pull, _ensure_model
+# across hf_hub_download — so sharing one meant a single job's diarizer download blocked
+# every other job's transcription model, in both languages, for as long as it took.
+_DIAR_MODEL_LOCK = threading.Lock()
+# Only one inference runs at a time. Each backend is a single cached instance —
+# one whisper.cpp context, one transformers pipeline, one pyannote pipeline — and none
+# is assumed safe to re-enter. NOT MEASURED: that is a design decision, not something
+# demonstrated here.
+#
+# LOCK ORDER, and it matters: _INFER_LOCK is always taken *after* the ensure_* call has
+# returned and released its load lock, so the two never nest. `unload_model` must never
+# take _INFER_LOCK — "don't drop a model mid-inference" looks like the obvious next fix
+# and would close an AB-BA cycle. _free_cpp_model_quietly instead skips the free when it
+# cannot get the lock without waiting.
+_INFER_LOCK = threading.Lock()
+# Serializes the read-modify-write in _write_meta, which several background jobs and
+# the UI thread can reach for the same recording at once.
+_META_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _held_for_inference(on_wait=None):
+    """Hold _INFER_LOCK, telling the caller whether it had to wait for it.
+
+    `on_wait(True)` is called when this has to queue behind another inference, and
+    `on_wait(False)` once the lock is held — both, in that order, when it queued. It
+    exists so a queued job can say it is queued and then say it started. Without it a
+    job waiting behind a 40-minute transcription draws an active step whose bar never
+    moves, which reads as a hang."""
+    def tell(waiting):
+        if on_wait:
+            try:
+                on_wait(waiting)
+            except Exception:
+                pass
+
+    if not _INFER_LOCK.acquire(blocking=False):
+        tell(True)
+        _INFER_LOCK.acquire()
+    tell(False)
+    try:
+        yield
+    finally:
+        _INFER_LOCK.release()
 
 
 def _free_cpp_model_quietly():
@@ -97,10 +143,27 @@ def _free_cpp_model_quietly():
     Free the whisper.cpp model while stderr (fd 2) is redirected to /dev/null, to
     hide the C/Metal teardown log ('ggml_metal_free: deallocating') it prints on
     release. Called at exit (atexit).
+
+    Skipped outright while a transcription holds _INFER_LOCK: this runs at interpreter
+    exit, and dropping the last reference to a whisper.cpp context from under a live C
+    call is a segfault on the way out. Leaking the model at exit costs nothing — the
+    process is going away. Taken without blocking, so quitting never waits on a job the
+    user has already chosen to abandon.
     """
     global _cpp_model
     if _cpp_model is None:
         return
+    if not _INFER_LOCK.acquire(blocking=False):
+        return
+    try:
+        _free_cpp_model_now()
+    finally:
+        _INFER_LOCK.release()
+
+
+def _free_cpp_model_now():
+    """Drop the whisper.cpp model with its teardown log redirected to /dev/null."""
+    global _cpp_model
     saved = devnull = None
     try:
         devnull = os.open(os.devnull, os.O_WRONLY)
@@ -1172,6 +1235,19 @@ def unload_model(language_code):
     Unlike `_ensure_model`, an unknown code is refused rather than read as Turkish.
     There the fallback only decides which model to load; here it would free nothing
     at all while the caller believes the model is gone.
+
+    **This must never take _INFER_LOCK.** Guarding the unload against a transcription
+    in flight is the obvious next thought, and it is wrong twice over. It would block
+    this call for the length of a transcription — minutes — which is exactly what the
+    daemon's `disable()` may not do. And it would put a lock order in place
+    (_INFER_LOCK, then _MODEL_LOCK) opposite to the one every inference path uses, so
+    the day anyone widens _held_for_inference to cover the `_ensure_*` call it becomes
+    a deadlock rather than a slowdown. Today no path holds both at once, and that is
+    the invariant to keep.
+
+    There is no caller for this function in this process in any case — dictate.py is
+    the only one, and it runs as a separate process, where a threading.Lock means
+    nothing at all.
     """
     global _hf_pipe, _cpp_model
     if language_code not in LANGUAGES:
@@ -1197,82 +1273,94 @@ def unload_model(language_code):
                     f"the {language_code} model's GPU cache was not emptied", e)
 
 
-def transcribe_audio(filepath, language_code, on_progress=None, duration=None):
+def transcribe_audio(filepath, language_code, on_progress=None, duration=None,
+                     *, on_wait=None):
     """
     Transcribe with the model for the selected language and return the text.
     If `on_progress` (a callable taking 0..1) and `duration` are given, report
     progress: for English (whisper.cpp) via each segment's end time / duration.
     The Turkish (transformers) path has no incremental hook, so it stays
     indeterminate.
+
+    Only one transcription runs at a time — see _INFER_LOCK. `on_wait` (keyword-only)
+    is called once if this has to queue behind another one; the first two parameters
+    stay positional because dictate.py binds and calls this as its transcriber.
     """
     _ensure_model(language_code)
-    if language_code == "en":
-        cb = None
-        if on_progress and duration:
-            def cb(seg):
-                t1 = getattr(seg, "t1", None)            # centiseconds (10 ms units)
-                if t1 is not None:
-                    try:
-                        on_progress(min(1.0, (t1 / 100.0) / duration))
-                    except Exception:
-                        pass
-        segments = _cpp_model.transcribe(str(filepath), language="en",
-                                         new_segment_callback=cb)
-        return "".join(segment.text for segment in segments).strip()
-    result = _hf_pipe(
-        str(filepath),
-        return_timestamps=True,
-        generate_kwargs={"language": "turkish", "task": "transcribe"},
-    )
-    return result.get("text", "")
+    with _held_for_inference(on_wait):
+        if language_code == "en":
+            cb = None
+            if on_progress and duration:
+                def cb(seg):
+                    t1 = getattr(seg, "t1", None)        # centiseconds (10 ms units)
+                    if t1 is not None:
+                        try:
+                            on_progress(min(1.0, (t1 / 100.0) / duration))
+                        except Exception:
+                            pass
+            segments = _cpp_model.transcribe(str(filepath), language="en",
+                                             new_segment_callback=cb)
+            return "".join(segment.text for segment in segments).strip()
+        result = _hf_pipe(
+            str(filepath),
+            return_timestamps=True,
+            generate_kwargs={"language": "turkish", "task": "transcribe"},
+        )
+        return result.get("text", "")
 
 
-def transcribe_segments(filepath, language_code, on_progress=None, duration=None):
+def transcribe_segments(filepath, language_code, on_progress=None, duration=None,
+                        *, on_wait=None):
     """
     Like transcribe_audio, but return timestamped segments:
         [{"start": seconds, "end": seconds, "text": str}, …]
     Empty-text segments are dropped. Used by the speaker-labeling path, which needs
     timestamps to align transcript text with diarization turns.
+
+    Shares _INFER_LOCK with transcribe_audio: same instances, same hazard. The lock is
+    per call, so a labeled recording — which transcribes two channels — lets another
+    job in between them rather than holding the model for the whole recording.
     """
     _ensure_model(language_code)
-    if language_code == "en":
-        cb = None
-        if on_progress and duration:
-            def cb(seg):
-                t1 = getattr(seg, "t1", None)            # centiseconds (10 ms units)
-                if t1 is not None:
-                    try:
-                        on_progress(min(1.0, (t1 / 100.0) / duration))
-                    except Exception:
-                        pass
-        segments = _cpp_model.transcribe(str(filepath), language="en",
-                                         new_segment_callback=cb)
+    with _held_for_inference(on_wait):
+        if language_code == "en":
+            cb = None
+            if on_progress and duration:
+                def cb(seg):
+                    t1 = getattr(seg, "t1", None)        # centiseconds (10 ms units)
+                    if t1 is not None:
+                        try:
+                            on_progress(min(1.0, (t1 / 100.0) / duration))
+                        except Exception:
+                            pass
+            segments = _cpp_model.transcribe(str(filepath), language="en",
+                                             new_segment_callback=cb)
+            out = []
+            for s in segments:
+                text = (s.text or "").strip()
+                if not text:
+                    continue
+                t0 = getattr(s, "t0", None)              # centiseconds
+                t1 = getattr(s, "t1", None)
+                start = (t0 / 100.0) if t0 is not None else 0.0
+                end = (t1 / 100.0) if t1 is not None else start
+                out.append({"start": start, "end": end, "text": text})
+            return out
+        result = _hf_pipe(
+            str(filepath),
+            return_timestamps=True,
+            generate_kwargs={"language": "turkish", "task": "transcribe"},
+        )
         out = []
-        for s in segments:
-            text = (s.text or "").strip()
+        for ch in result.get("chunks", []):
+            text = (ch.get("text") or "").strip()
             if not text:
                 continue
-            t0 = getattr(s, "t0", None)                  # centiseconds
-            t1 = getattr(s, "t1", None)
-            start = (t0 / 100.0) if t0 is not None else 0.0
-            end = (t1 / 100.0) if t1 is not None else start
+            ts = ch.get("timestamp") or (None, None)
+            start = float(ts[0]) if ts[0] is not None else 0.0
+            end = float(ts[1]) if ts[1] is not None else start
             out.append({"start": start, "end": end, "text": text})
         return out
-    result = _hf_pipe(
-        str(filepath),
-        return_timestamps=True,
-        generate_kwargs={"language": "turkish", "task": "transcribe"},
-    )
-    out = []
-    for ch in result.get("chunks", []):
-        text = (ch.get("text") or "").strip()
-        if not text:
-            continue
-        ts = ch.get("timestamp") or (None, None)
-        start = float(ts[0]) if ts[0] is not None else 0.0
-        end = float(ts[1]) if ts[1] is not None else start
-        out.append({"start": start, "end": end, "text": text})
-    return out
 
 
 # =========================== Speaker diarization (optional) ===========================
@@ -1294,7 +1382,10 @@ def _ensure_diarizer(cfg=None):
     global _diar_pipe
     if _diar_pipe is not None:
         return _diar_pipe
-    with _MODEL_LOCK:
+    # Its own lock, not _MODEL_LOCK: this holds across a gated ~1 GB download, and
+    # sharing the transcription models' load lock meant one job's diarizer pull
+    # blocked every other job's model load in both languages.
+    with _DIAR_MODEL_LOCK:
         if _diar_pipe is not None:
             return _diar_pipe
         _silence_ml_logging()
@@ -1321,11 +1412,16 @@ def _ensure_diarizer(cfg=None):
     return _diar_pipe
 
 
-def diarize(wav_path, cfg=None):
+def diarize(wav_path, cfg=None, *, on_wait=None):
     """Return speaker turns [(start, end, raw_label), …] for a mono WAV, sorted by
-    start time. Raises on failure; the caller decides the fallback."""
+    start time. Raises on failure; the caller decides the fallback.
+
+    Takes _INFER_LOCK for the same reason transcription does: _diar_pipe is one cached
+    pyannote pipeline, and a labeled recording and a labeled import can reach it at the
+    same moment. It also shares the device with the transcription models."""
     pipe = _ensure_diarizer(cfg)
-    annotation = pipe(str(wav_path))
+    with _held_for_inference(on_wait):
+        annotation = pipe(str(wav_path))
     turns = [(float(seg.start), float(seg.end), str(spk))
              for seg, _, spk in annotation.itertracks(yield_label=True)]
     turns.sort(key=lambda t: t[0])
@@ -1421,21 +1517,86 @@ def _read_meta(project_dir):
         return {}
 
 
+_META_TMP_NAME = "meta.json.tmp"
+
+
 def _write_meta(project_dir, **fields):
-    """Merge non-None `fields` into the recording's meta.json."""
-    meta = _read_meta(project_dir)
-    meta.update({k: v for k, v in fields.items() if v is not None})
-    try:
-        with open(Path(project_dir) / "meta.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+    """Merge non-None `fields` into the recording's meta.json.
+
+    Read-modify-write, so it is serialized under _META_LOCK: a background job's
+    `published` and a rename's `name` can reach the same file at the same moment.
+
+    Written to a temp file and renamed over, the way _finalize_sources writes
+    audio.wav. A plain open(…, "w") truncates first, and _read_meta reads an
+    unparseable file as {} — so a reader landing in that window sees a recording with
+    no name, no language and no capture flag, which is how a live capture gets treated
+    as one that never started. The temp name deliberately does not end in `.part`:
+    _finalize_sources glob-deletes those.
+
+    The filter is `is not None`, not truthiness. `capture={"in_progress": False}` has
+    to land, or _clear_capture never clears the flag and the recording is recovered
+    again on every launch.
+    """
+    d = Path(project_dir)
+    with _META_LOCK:
+        meta = _read_meta(d)
+        meta.update({k: v for k, v in fields.items() if v is not None})
+        tmp = d / _META_TMP_NAME
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+            tmp.replace(d / "meta.json")
+        except Exception:
+            # A deleted recording is the common case here — a job writing meta for a
+            # folder the user removed meanwhile. Leave no half-written temp behind.
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+_PROJECT_DIR_FORMAT = "%Y-%m-%d_%H-%M-%S"
+_PROJECT_DIR_STAMP_LEN = 19             # len("YYYY-MM-DD_HH-MM-SS")
+_PROJECT_DIR_ATTEMPTS = 100             # the timestamp, then -02 … -99
+
+
+def _new_project_dir(base_path):
+    """Create and return a fresh folder for one recording or import.
+
+    The name is the timestamp; a second one begun inside the same wall-clock second
+    gets `-02`, `-03`, … The claim is the mkdir itself (exist_ok=False), so two threads
+    asking at the same moment cannot come away with the same folder. They used to:
+    every filename inside a project folder is fixed, so the second occupant overwrote
+    the first's mic.raw, audio.wav, transcription.txt and meta.json, and exist_ok=True
+    meant nothing said so.
+
+    The suffix is zero-padded because list_recordings sorts on the folder name as a
+    string — `-10` would otherwise sort before `-2`.
+    """
+    base = Path(base_path)
+    base.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime(_PROJECT_DIR_FORMAT)
+    for n in range(1, _PROJECT_DIR_ATTEMPTS):
+        d = base / (stamp if n == 1 else f"{stamp}-{n:02d}")
+        try:
+            d.mkdir(exist_ok=False)
+            return d
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"{_PROJECT_DIR_ATTEMPTS} recordings already begin at {stamp}")
 
 
 def _fmt_created(dirname):
-    """Format a 'YYYY-MM-DD_HH-MM-SS' folder name as 'YYYY-MM-DD HH:MM'."""
+    """Format a 'YYYY-MM-DD_HH-MM-SS' folder name as 'YYYY-MM-DD HH:MM'.
+
+    _new_project_dir may have added a '-NN' suffix; the timestamp is fixed-width, so
+    it comes off the front and the suffix is not shown — two recordings from the same
+    second are meant to read as the same minute."""
+    stamp, rest = dirname[:_PROJECT_DIR_STAMP_LEN], dirname[_PROJECT_DIR_STAMP_LEN:]
+    if rest and not (rest.startswith("-") and rest[1:].isdigit()):
+        return dirname
     try:
-        return datetime.strptime(dirname, "%Y-%m-%d_%H-%M-%S").strftime("%Y-%m-%d %H:%M")
+        return datetime.strptime(stamp, _PROJECT_DIR_FORMAT).strftime("%Y-%m-%d %H:%M")
     except Exception:
         return dirname
 
@@ -1465,14 +1626,37 @@ def list_recordings(base_path):
     return recs
 
 
-def _interrupted_dirs(base_path):
-    """Recording folders whose capture never finished (meta still says in_progress)."""
+def _busy_dirs(state):
+    """Recording folders something in this process is still writing to."""
+    return [state.project_dir] if state.recorders and state.project_dir else []
+
+
+def _interrupted_dirs(base_path, skip=()):
+    """Recording folders whose capture never finished (meta still says in_progress).
+
+    `skip` is what this process is working in right now. A live recording carries the
+    same in_progress flag as an abandoned one — it is written the moment audio starts
+    arriving — and recovery reads that flag as permission to finalize the raw files and
+    then delete them. Run against a capture still being appended to, it writes a
+    truncated audio.wav and unlinks the file the recorder still holds open, so the rest
+    of the take goes to an inode nothing can reach; and if the raw file is still empty
+    it removes the live recording's folder outright.
+
+    The window is narrow today — recovery lists these once, on a worker started before
+    the first keystroke can be read — but the exclusion is what makes the invariant
+    true rather than merely likely."""
+    skip = {Path(p).resolve() for p in skip if p}
     try:
         entries = sorted(d for d in Path(base_path).iterdir() if d.is_dir())
     except Exception:
         return []
     out = []
     for d in entries:
+        try:
+            if d.resolve() in skip:
+                continue
+        except Exception:
+            pass
         cap = _read_meta(d).get("capture")
         if isinstance(cap, dict) and cap.get("in_progress"):
             out.append(d)
@@ -1504,31 +1688,31 @@ def _recover_async(state):
     """Rebuild interrupted recordings in the background, once the UI is up.
 
     This used to run before Live started, so a long interrupted capture meant many
-    seconds of blank terminal that was indistinguishable from a hang. Progress goes to
-    state.bg_msg, which the footer prefers over state.status while it is set — so
-    recovery owns the status line without destroying the user's own messages."""
+    seconds of blank terminal that was indistinguishable from a hang. It runs as a job
+    per interrupted recording, so the footer and the jobs panel show it the way they
+    show everything else, and — unlike the single background-message slot it used to
+    share — it no longer refuses a publish or overwrites one's progress."""
     def run():
-        dirs = _interrupted_dirs(state.base_path)
+        dirs = _interrupted_dirs(state.base_path, skip=_busy_dirs(state))
         if not dirs:
             return
         recovered = 0
         for i, d in enumerate(dirs, 1):
-            label = _read_meta(d).get("name") or d.name
+            name = _read_meta(d).get("name") or d.name
             counter = f" ({i}/{len(dirs)})" if len(dirs) > 1 else ""
-
-            def show(frac, label=label, counter=counter):
-                state.bg_msg = (f"Recovering “{label}”…{counter}  "
-                                     f"{int(frac * 100):3d}%")
-
-            show(0.0)
+            job = _job_add(state, Job("recover", d, f"{name}{counter}",
+                                      base_path=state.base_path, steps=["finalize"]))
             try:
-                if _recover_one(d, show):
+                if _recover_one(d, lambda frac: setattr(job, "pct", frac)):
                     recovered += 1
                     state.recordings = list_recordings(state.base_path)
+                    _job_finish(state, job, f"Recovered “{name}”")
+                else:
+                    _job_finish(state, job, f"Nothing to recover in “{name}”")
             except Exception as e:
-                state.bg_msg = None
-                state.status = f"Recovery failed for “{label}”: {e}"
-        state.bg_msg = None
+                _job_finish(state, job, f"Recovery failed for “{name}”: {e}",
+                            failed=True)
+                state.status = f"Recovery failed for “{name}”: {e}"
         if recovered:
             state.recordings = list_recordings(state.base_path)
             state.status = (f"Recovered {recovered} interrupted "
@@ -1629,6 +1813,169 @@ def _discard_project(project_dir):
     shutil.rmtree(d, ignore_errors=True)
 
 
+_JOB_RUNNING, _JOB_QUEUED = "running", "queued"
+_JOB_DONE, _JOB_FAILED = "done", "failed"
+_JOB_TERMINAL = (_JOB_DONE, _JOB_FAILED)
+# How long a finished job stays in the list, so its result can be read before it goes.
+_JOB_KEEP_SECONDS = 20.0
+
+
+class Job:
+    """One piece of background work — a transcription, an import, a publish, a
+    recovery — with everything it needs settled when the user asks for it.
+
+    A job never reads the state it was made from. The user goes on using the app while
+    it runs, naming the next recording, toggling the language, changing where
+    transcripts open; each of those used to reach into a worker mid-flight, because
+    the worker read `state` directly and there was only ever one job to confuse.
+
+    `steps`/`phase`/`pct` are what the progress panel draws. They are plain attributes,
+    written only by the worker that owns this job and read by the render loop: one
+    writer, and the worst a torn read can cost is one frame of a progress bar. The
+    *list* of jobs is the shared thing, and that is what state.jobs_lock guards.
+    """
+
+    def __init__(self, kind, project_dir, label, *, language="", name="",
+                 diarize=False, open_app=None, base_path=None, audio_path=None,
+                 manifests=(), cfg=None, steps=()):
+        self.kind = kind
+        self.project_dir = Path(project_dir) if project_dir is not None else None
+        self.label = label
+        # The snapshot: what was true when the user asked for this work.
+        self.language = language
+        self.name = name
+        self.diarize = diarize
+        self.open_app = open_app
+        self.base_path = base_path
+        self.audio_path = audio_path
+        self.manifests = list(manifests)
+        self.cfg = cfg
+        # Progress.
+        self.steps = list(steps)
+        self.phase = self.steps[0] if self.steps else ""
+        self.pct = None
+        self.queued = False           # waiting on _INFER_LOCK, not stalled
+        self.phase_start = time.monotonic()
+        # Outcome.
+        self.state = _JOB_RUNNING
+        self.message = ""
+        self.started = time.monotonic()
+        self.finished_at = None
+
+    @property
+    def key(self):
+        """What makes two jobs the same piece of work: one kind, one recording."""
+        return (self.kind, str(self.project_dir))
+
+    def is_terminal(self):
+        return self.state in _JOB_TERMINAL
+
+    def __repr__(self):
+        return (f"<Job {self.kind} {self.label!r} {self.state}"
+                f"{' ' + self.phase if self.phase else ''}>")
+
+
+def _job_add(state, job):
+    """Put a job on the list. The list is read from the render loop and written from
+    workers, so every mutation goes through the lock."""
+    with state.jobs_lock:
+        state.jobs.append(job)
+    return job
+
+
+def _job_begin(job, phase, pct=None, steps=None):
+    """Enter a step of a job, restarting its clock so the panel's elapsed counter is
+    per step. Pass `steps` when the plan is set or changes."""
+    if steps is not None:
+        job.steps = list(steps)
+    job.phase = phase
+    job.pct = pct
+    job.queued = False
+    job.phase_start = time.monotonic()
+
+
+def _job_waiting(job):
+    """The `on_wait` callback for this job: it is told True while the job is queued
+    behind another inference and False once the model is its own.
+
+    Without it a job behind a long transcription draws an active step whose bar never
+    moves, which reads as a hang rather than as a queue."""
+    def told(waiting):
+        job.queued = bool(waiting)
+        job.state = _JOB_QUEUED if waiting else _JOB_RUNNING
+    return told
+
+
+def _job_finish(state, job, message="", failed=False):
+    """Mark a job done or failed. Every worker must reach this, on every path: a job
+    left running is never pruned, holds its recording's guard forever, and sits in the
+    Active jobs list and the quit confirmation for the rest of the session."""
+    job.message = message
+    job.state = _JOB_FAILED if failed else _JOB_DONE
+    job.finished_at = time.monotonic()
+    return job
+
+
+def _jobs_snapshot(state):
+    """A copy of the job list, taken under the lock.
+
+    Deliberately does not prune. The body, the footer and the key handler each ask for
+    the list within one frame; pruning here would hand them different lists, and could
+    drop a job's result between the frame the user read it on and the keystroke they
+    answered it with."""
+    with state.jobs_lock:
+        return list(state.jobs)
+
+
+def _prune_jobs(state, now=None):
+    """Drop finished jobs whose result has been on screen long enough. Called once at
+    the top of the main loop — never from a renderer (see _jobs_snapshot)."""
+    now = time.monotonic() if now is None else now
+    with state.jobs_lock:
+        state.jobs = [
+            j for j in state.jobs
+            if not (j.is_terminal() and j.finished_at is not None
+                    and now - j.finished_at >= _JOB_KEEP_SECONDS)
+        ]
+
+
+def _active_jobs(state):
+    """The jobs still working, oldest first."""
+    return [j for j in _jobs_snapshot(state) if not j.is_terminal()]
+
+
+def _job_working_in(state, project_dir, kinds=None):
+    """The unfinished job working in `project_dir`, if there is one.
+
+    This is what keeps two verbs off one recording: a second [t] on a transcription
+    already running, a [u] on a transcript being rewritten underneath it, a [d] on a
+    folder a publish is still writing paid-for output into."""
+    if project_dir is None:
+        return None
+    target = str(Path(project_dir))
+    for j in _jobs_snapshot(state):
+        if j.is_terminal() or j.project_dir is None:
+            continue
+        if str(j.project_dir) == target and (kinds is None or j.kind in kinds):
+            return j
+    return None
+
+
+_BUSY_REASONS = {
+    "transcribe": "Already transcribing “{label}”",
+    "import": "Already importing “{label}”",
+    "publish": "Already publishing “{label}”",
+    "recover": "Still recovering “{label}”",
+}
+
+
+def _busy_reason(job):
+    """Why a keypress on this recording did nothing. A key that is refused silently
+    reads as a broken app, which is why every gate here says its reason."""
+    return _BUSY_REASONS.get(job.kind, "Another job is working on “{label}”").format(
+        label=job.label)
+
+
 class _TuiState:
     """All UI/app state for the full-screen interface."""
 
@@ -1639,8 +1986,13 @@ class _TuiState:
         self.mic_index = _resolve_mic_index(cfg)
         self.capture_system = bool(cfg.get("capture_system_audio", False))
         self.diarize = bool(cfg.get("diarize", False))
-        # modes: menu | recording | confirm_stop | preparing | transcribing |
-        #        importing | viewer | name_input | start_failed | rename |
+        # Which screen is showing — and only that. Work in flight lives in `jobs`.
+        # `mode` used to mean both, so a transcription put the app on a screen with no
+        # key handler at all: every keystroke was dropped until it finished, which is
+        # why a second recording could not be started behind one.
+        #
+        # modes: menu | recording | confirm_stop | preparing | viewer | jobs |
+        #        name_input | start_failed | rename | confirm_delete | confirm_quit |
         #        mic_picker | app_picker | path_edit
         self.mode = "menu"
         self.status = "Ready."
@@ -1663,22 +2015,16 @@ class _TuiState:
             self.open_app = "Sublime Text" if "Sublime Text" in list_installed_apps() else None
         # background model pre-warming: lang -> "loading" | "ready" | "error: …"
         self.model_state = {}
-        # background file-import job progress
-        self.import_src = ""
-        self.import_phase = ""        # "extract" | "transcribe"
-        self.import_pct = None        # 0..1, or None for indeterminate
-        self.import_phase_start = 0.0
-        # background transcription job progress (record → [q], and [t] on a
-        # recording without a transcript); rendered by _transcribe_panel
-        self.tx_name = ""
-        self.tx_language = self.language
-        self.tx_steps = []            # ordered subset of _TX_LABELS' keys
-        self.tx_phase = ""            # the step currently running
-        self.tx_pct = None            # 0..1, or None for indeterminate
-        self.tx_phase_start = 0.0
-        # a background job's progress (crash recovery, publishing); while it is set
-        # the footer shows it in place of status
-        self.bg_msg = None
+        # Background work in flight — transcriptions, imports, publishes, recovery.
+        # Read from the render loop, written from workers, so every mutation goes
+        # through jobs_lock; see _job_add / _jobs_snapshot.
+        #
+        # This replaces three single-slot sets of fields (tx_*, import_*, bg_msg) that
+        # could only describe one job. A second job overwrote the first's progress,
+        # and the one shared background-message slot made an unrelated publish and a
+        # crash recovery refuse and clobber each other.
+        self.jobs = []
+        self.jobs_lock = threading.Lock()
         try:
             self.base_path.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -1827,62 +2173,88 @@ def _step_line(label, status, pct=None, elapsed=0.0, note=""):
     return f"  {label:<26}{meter}{note}"
 
 
-def _import_panel(state):
-    """Two-phase import progress: extract (real %), then transcribe (real % for
-    English, spinner+elapsed otherwise)."""
-    lines = [f"[bold]Importing[/bold] {state.import_src}", ""]
-    elapsed = time.monotonic() - state.import_phase_start if state.import_phase_start else 0.0
-
-    if state.import_phase == "extract":
-        lines.append(_step_line("Step 1/2  Extract audio", "active", state.import_pct, elapsed))
-        lines.append(_step_line("Step 2/2  Transcribe", "pending"))
-    elif state.import_phase == "transcribe":
-        lines.append(_step_line("Step 1/2  Extract audio", "done"))
-        lines.append(_step_line("Step 2/2  Transcribe", "active", state.import_pct, elapsed,
-                                _MODEL_NOTE if state.import_pct is None else ""))
-    elif state.import_phase == "diarize":
-        lines.append(_step_line("Step 1  Extract audio", "done"))
-        lines.append(_step_line("Step 2  Transcribe", "done"))
-        lines.append(_step_line("Step 3  Label speakers", "active", None, elapsed))
-    else:
-        lines.append(f"  Preparing…  {_spinner(elapsed)}")
-    return Panel(Text.from_markup("\n".join(lines)), title="Import", border_style="yellow")
+_STEP_LABELS = {"finalize": "Save audio", "diarize": "Label speakers",
+                "transcribe": "Transcribe", "extract": "Extract audio",
+                # Kept short enough that "Step n/m  <label>" still fits _step_line's
+                # 26-column label field; a longer one butts against the spinner.
+                "edit": "Edit transcript", "document": "Write docs",
+                "publish": "File on GitHub"}
+_JOB_VERBS = {"transcribe": "Transcribing", "import": "Importing",
+              "publish": "Publishing", "recover": "Recovering"}
+_QUEUED_NOTE = "  [dim](queued behind another transcription)[/dim]"
 
 
-_TX_LABELS = {"finalize": "Save audio", "diarize": "Label speakers",
-              "transcribe": "Transcribe"}
+def _job_elapsed(job):
+    return time.monotonic() - job.phase_start if job.phase_start else 0.0
 
 
-def _tx_begin(state, phase, pct=None, steps=None):
-    """Enter a step of the background transcription job, restarting its clock.
-    Pass `steps` (the full ordered key list) when the plan is set or changes."""
-    if steps is not None:
-        state.tx_steps = steps
-    state.tx_phase = phase
-    state.tx_pct = pct
-    state.tx_phase_start = time.monotonic()
+def _job_headline(job):
+    """`Transcribing “stand-up”` — the job's own line, name escaped.
+
+    Escaping matters here and not in _menu_row_text because this goes through
+    Text.from_markup: a recording called `[/x]` raises MarkupError out of the render,
+    inside Live, and takes the app down."""
+    verb = _JOB_VERBS.get(job.kind, job.kind.title())
+    return f"[bold]{verb}[/bold] “{markup_escape(job.label or 'recording')}”"
 
 
-def _transcribe_panel(state):
-    """Live progress for the transcription job — which step is running, for how
-    long, and (English) how far in. The work happens on a worker thread, so this
-    keeps animating: pressing [q] switches to it on the very next frame."""
-    elapsed = time.monotonic() - state.tx_phase_start if state.tx_phase_start else 0.0
-    steps = state.tx_steps or ["transcribe"]
-    active = steps.index(state.tx_phase) if state.tx_phase in steps else 0
-    lines = [f"[bold]Transcribing[/bold] “{state.tx_name or 'recording'}”"
-             f"     [dim]Language[/dim] {(state.tx_language or '').upper()}", ""]
+def _job_summary(job):
+    """One compact line for the footer: what is running and how far in.
+
+    Deliberately short. The footer is a couple of rows, and _step_line's row — a
+    26-column label plus a 30-column bar — does not fit an 80-column terminal."""
+    text = f"{_JOB_VERBS.get(job.kind, job.kind.title())} “{job.label}”"
+    if job.is_terminal():
+        return job.message or text
+    if job.queued:
+        return f"{text}… queued"
+    if job.pct is not None:
+        return f"{text}…  {int(job.pct * 100):3d}%"
+    step = _STEP_LABELS.get(job.phase, job.phase)
+    return f"{text}…  {step}" if step else f"{text}…"
+
+
+def _job_rows(job):
+    """The step list for one job in the jobs panel."""
+    rows = [_job_headline(job)]
+    if job.language:
+        rows[0] += f"     [dim]Language[/dim] {job.language.upper()}"
+    steps = job.steps or [job.phase or "transcribe"]
+    active = steps.index(job.phase) if job.phase in steps else 0
+    elapsed = _job_elapsed(job)
     for i, key in enumerate(steps):
-        label = f"Step {i + 1}/{len(steps)}  {_TX_LABELS.get(key, key)}"
-        if i < active:
-            lines.append(_step_line(label, "done"))
+        label = f"Step {i + 1}/{len(steps)}  {_STEP_LABELS.get(key, key)}"
+        if job.is_terminal():
+            rows.append(_step_line(label, "done" if job.state == _JOB_DONE else "pending"))
+        elif i < active:
+            rows.append(_step_line(label, "done"))
         elif i > active:
-            lines.append(_step_line(label, "pending"))
+            rows.append(_step_line(label, "pending"))
+        elif job.queued:
+            rows.append(_step_line(label, "active", None, elapsed, _QUEUED_NOTE))
         else:
-            note = _MODEL_NOTE if key == "transcribe" and state.tx_pct is None else ""
-            lines.append(_step_line(label, "active", state.tx_pct, elapsed, note))
+            note = _MODEL_NOTE if key == "transcribe" and job.pct is None else ""
+            rows.append(_step_line(label, "active", job.pct, elapsed, note))
+    if job.is_terminal() and job.message:
+        rows.append(f"  [dim]{markup_escape(job.message)}[/dim]")
+    return rows
+
+
+def _jobs_panel(state, jobs=None):
+    """Every job in flight, one step list each. Replaces the separate transcription
+    and import screens, which could only ever show the one job the app was locked to."""
+    jobs = _jobs_snapshot(state) if jobs is None else jobs
+    if not jobs:
+        return Panel(Text.from_markup("[dim]Nothing is running.[/dim]"),
+                     title="Jobs", border_style="cyan")
+    lines = []
+    for job in jobs:
+        if lines:
+            lines.append("")
+        lines += _job_rows(job)
     return Panel(Text.from_markup("\n".join(lines)),
-                 title="Please wait", border_style="yellow")
+                 title=f"Jobs ({len([j for j in jobs if not j.is_terminal()])} running)",
+                 border_style="yellow")
 
 
 def _model_label(state):
@@ -1912,8 +2284,14 @@ def _tui_header(state):
                  subtitle=clock, subtitle_align="right", border_style="cyan")
 
 
-def _menu_items(state):
-    """Build the flat list of visible menu rows from the group/expanded state."""
+def _menu_items(state, jobs=None):
+    """Build the flat list of visible menu rows from the group/expanded state.
+
+    `jobs` is passed in so that one frame's body, footer and key handler all describe
+    the same rows. Called three separate times, the job list could change between
+    them, and the row the user saw highlighted is not the row [d] would delete."""
+    jobs = _jobs_snapshot(state) if jobs is None else jobs
+    by_dir = {str(j.project_dir): j for j in jobs if not j.is_terminal()}
     items = [
         {"kind": "action", "action": "record", "label": "  New recording"},
         {"kind": "action", "action": "import", "label": "  Import file"},
@@ -1924,9 +2302,21 @@ def _menu_items(state):
     if rec_open:
         if state.recordings:
             for rec in state.recordings:
-                items.append({"kind": "recording", "rec": rec})
+                items.append({"kind": "recording", "rec": rec,
+                              "job": by_dir.get(str(rec["dir"]))})
         else:
             items.append({"kind": "info", "label": "      (no recordings yet)"})
+    # Below Recordings and collapsed by default: this list appears and disappears on
+    # its own, and above the recordings it would shift every row under it each time a
+    # job starts, finishes, or is pruned twenty seconds later.
+    if jobs:
+        jobs_open = "jobs" in state.menu_expanded
+        running = len([j for j in jobs if not j.is_terminal()])
+        items.append({"kind": "group", "group": "jobs",
+                      "label": f"{'▾' if jobs_open else '▸'} Active jobs ({running})"})
+        if jobs_open:
+            for job in jobs:
+                items.append({"kind": "job", "job": job})
     set_open = "settings" in state.menu_expanded
     items.append({"kind": "group", "group": "settings",
                   "label": f"{'▾' if set_open else '▸'} Settings"})
@@ -1944,19 +2334,35 @@ def _menu_items(state):
     return items
 
 
+def _job_badge(job):
+    """What a recording's row says about the job working on it."""
+    if job is None:
+        return ""
+    if job.queued:
+        return " (queued)"
+    verb = {"transcribe": "transcribing", "import": "importing",
+            "publish": "publishing", "recover": "recovering"}.get(job.kind, job.kind)
+    if job.pct is not None:
+        return f" ({verb} {int(job.pct * 100)}%)"
+    return f" ({verb}…)"
+
+
 def _menu_row_text(it, width):
     """Plain display text for a menu row (no markup; safe for arbitrary names)."""
     if it["kind"] == "recording":
         rec = it["rec"]
         nm = _rec_display_name(rec)
         lang = (rec["language"] or "").upper()
-        tx = "" if rec["has_transcript"] else " (no transcript)"
+        badge = _job_badge(it.get("job"))
+        tx = badge or ("" if rec["has_transcript"] else " (no transcript)")
         return f"      {nm[:30]:<30}  {rec['created']}  {lang}{tx}"
+    if it["kind"] == "job":
+        return f"      {_job_summary(it['job'])}"
     return it["label"]
 
 
-def _render_menu(state):
-    items = _menu_items(state)
+def _render_menu(state, items=None):
+    items = _menu_items(state) if items is None else items
     if state.menu_index >= len(items):
         state.menu_index = len(items) - 1
     if state.menu_index < 0:
@@ -2034,9 +2440,9 @@ def _recording_panel(state):
     return Panel(body, title=title, title_align="left", border_style="red")
 
 
-def _tui_body(state):
-    if state.mode == "importing":
-        return _import_panel(state)
+def _tui_body(state, items=None, jobs=None):
+    if state.mode == "jobs":
+        return _jobs_panel(state, jobs)
     if state.mode in ("recording", "confirm_stop"):
         return _recording_panel(state)
     if state.mode == "preparing":
@@ -2045,8 +2451,6 @@ def _tui_body(state):
                f"[dim]The first run may compile a helper, ask for a permission, or "
                f"load a model; this can take a moment.[/dim]")
         return Panel(Text.from_markup(msg), title="Please wait", border_style="yellow")
-    if state.mode == "transcribing":
-        return _transcribe_panel(state)
     if state.mode == "mic_picker":
         lines = []
         for i, (idx, name) in enumerate(state.devices, start=1):
@@ -2109,28 +2513,61 @@ def _tui_body(state):
             Text.from_markup("[red]This cannot be undone.[/red]   Press [bold]y[/bold] to delete, any other key to cancel."),
         )
         return Panel(body, title="Delete recording", border_style="red")
+    if state.mode == "confirm_quit":
+        running = [j for j in (jobs if jobs is not None else _jobs_snapshot(state))
+                   if not j.is_terminal()]
+        rows = [Text.from_markup(
+            f"[bold]{len(running)}[/bold] job{'s' if len(running) != 1 else ''} "
+            f"still running:"), Text("")]
+        for job in running:
+            rows.append(Text(f"   {_job_summary(job)}"))
+        rows += [Text(""), Text.from_markup(
+            "[red]Quitting abandons them.[/red]  A recording keeps its audio and can "
+            "be transcribed again with [bold]t[/bold]; a publish can be resumed with "
+            "[bold]u[/bold]."),
+            Text(""),
+            Text.from_markup(
+                "Press [bold]y[/bold] to quit, any other key to stay.")]
+        return Panel(Group(*rows), title="Quit", border_style="red")
     # default: the main menu
-    return _render_menu(state)
+    return _render_menu(state, items)
 
 
-def _tui_footer(state):
+def _footer_status(state, jobs):
+    """The status line: what the app is doing, or what the user last did.
+
+    Jobs take the line while they run — the oldest one, plus a count of the rest, so
+    the line stays one row whatever is happening. This used to be a single shared
+    slot, which meant crash recovery and a publish overwrote each other's message and
+    a publish was refused outright while recovery held it."""
+    running = [j for j in jobs if not j.is_terminal()]
+    if not running:
+        return state.status or ""
+    line = _job_summary(running[0])
+    if len(running) > 1:
+        line += f"   (+{len(running) - 1} more — see Active jobs)"
+    return line
+
+
+def _tui_footer(state, items=None, jobs=None):
     keymap = {
         "preparing": "please wait…",
-        "importing": "importing… please wait",
         "recording": "[q] Stop & transcribe (asks first)",
         "confirm_stop": "[y] Stop & transcribe   any other key: Keep recording",
-        "transcribing": "transcribing… please wait",
+        "jobs": "[Esc] Back to the menu",
         "viewer": "↑/↓ scroll   PgUp/PgDn page   Enter open in app   p play/stop   t transcribe   r rename   d delete   Esc back",
         "name_input": "[Enter] Start   [Esc] Cancel",
         "start_failed": "[Enter] Try again   [Esc] Back to the menu",
         "rename": "[Enter] Save   [Backspace] Delete   [Esc] Cancel",
         "confirm_delete": "[y] Delete   any other key: Cancel",
+        "confirm_quit": "[y] Quit anyway   any other key: Stay",
         "mic_picker": "[1-9] Select   [Esc] Cancel",
         "path_edit": "[Enter] Save   [Backspace] Delete   [Esc] Cancel",
         "app_picker": "[1-9] Select   [0] Off   [Enter] First match   type to filter   [Esc] Cancel",
     }
+    jobs = _jobs_snapshot(state) if jobs is None else jobs
     if state.mode == "menu":
-        items = _menu_items(state)
+        items = _menu_items(state, jobs) if items is None else items
         sel = items[state.menu_index] if 0 <= state.menu_index < len(items) else None
         if sel and sel["kind"] == "recording":
             # [t] and [u] are mutually exclusive: you transcribe first, publish after.
@@ -2145,20 +2582,32 @@ def _tui_footer(state):
     if _player_active(state):
         status = Text(f"▶ playing “{state.player_name}”  ·  p to stop", style="green")
     else:
-        # A background job borrows this line while it runs; the user's own last
-        # message comes back untouched when it finishes.
-        status = Text(state.bg_msg or state.status or "", style="dim")
+        status = Text(_footer_status(state, jobs), style="dim")
     return Panel(Group(keys, status), border_style="blue")
 
 
-def _tui_render(state):
+def _tui_frame(state, items, jobs):
+    """One frame from a job list and a row list the caller has already taken.
+
+    The main loop takes both once and passes them to the body, the footer and the key
+    handler. Computed separately they can disagree inside a single frame — and worse,
+    between the frame the user read and the key they answered it with, which is how
+    [d] ends up targeting a row other than the highlighted one."""
     layout = Layout()
     layout.split_column(
         Layout(_tui_header(state), name="header", size=4),
-        Layout(_tui_body(state), name="body"),
-        Layout(_tui_footer(state), name="footer", size=4),
+        Layout(_tui_body(state, items, jobs), name="body"),
+        Layout(_tui_footer(state, items, jobs), name="footer", size=4),
     )
     return layout
+
+
+def _tui_render(state):
+    """A frame taken from the current state. Used where there is no loop to pass the
+    lists down — the immediate redraw after a keystroke, and the tests."""
+    jobs = _jobs_snapshot(state)
+    items = _menu_items(state, jobs) if state.mode == "menu" else None
+    return _tui_frame(state, items, jobs)
 
 
 def _start_recording(state, live):
@@ -2178,9 +2627,8 @@ def _start_recording(state, live):
     state.start_error = ""
     announce("Creating project folder…")
 
-    project_dir = state.base_path / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     try:
-        project_dir.mkdir(parents=True, exist_ok=True)
+        project_dir = _new_project_dir(state.base_path)
     except Exception as e:
         _fail_to_start(state, f"Folder error: {e}", e)
         return
@@ -2228,6 +2676,11 @@ def _start_recording(state, live):
     state.project_dir = project_dir
     state.rec_start = time.monotonic()
     state.mode = "recording"
+    # Preparing runs on the UI thread, so no key was read while it did — they queued
+    # in the tty instead and would all be delivered to the recording screen at once.
+    # Starting a tap can take ten seconds; a stray [q] arriving from that wait would
+    # land on the confirmation to stop the recording that just started.
+    flush_stdin()
     if not sys_failed:
         state.status = "Recording started — speak now."
 
@@ -2252,45 +2705,78 @@ def _stop_and_transcribe(state, live):
     """Handle a confirmed [q] during a recording. Switches to the transcription screen
     right away and hands the slow part — mixing the raw capture into audio.wav, then
     transcribing it — to a worker thread, so the UI keeps animating instead of
-    freezing on the last recording frame with no sign that anything started."""
+    freezing on the last recording frame with no sign that anything started.
+
+    The recorders come off the state here, on the UI thread, and are handed to the
+    worker by value along with their manifests. The worker used to read
+    state.recorders itself — three times — which was safe only while the
+    transcription screen locked every keystroke out. The moment a second recording
+    can be started behind this one, that read finds the *new* recording's recorders:
+    it stops them, builds this recording's manifest out of them, finalizes nothing,
+    and deletes the recording it was called to save. A manifest is complete as soon
+    as start() has returned, so taking it here costs nothing."""
+    recorders = state.recorders
+    state.recorders = []
+    project_dir = state.project_dir
     diarize_system = state.diarize and any(isinstance(r, TapRecorder)
-                                           for r in state.recorders)
-    project_dir, language = state.project_dir, state.language
-    name, save_channels = state.pending_name, state.diarize
-    state.tx_name = name or project_dir.name
-    state.tx_language = language
-    _tx_begin(state, "finalize",
-              steps=["finalize"] + (["diarize"] if diarize_system else []) + ["transcribe"])
+                                           for r in recorders)
+    name = state.pending_name
+    job = _job_add(state, Job(
+        "transcribe", project_dir, name or project_dir.name,
+        language=state.language, name=name, diarize=state.diarize,
+        open_app=state.open_app, base_path=state.base_path,
+        audio_path=project_dir / "audio.wav",
+        manifests=[r.manifest() for r in recorders], cfg=state.cfg,
+        steps=["finalize"] + (["diarize"] if diarize_system else []) + ["transcribe"]))
     state.status = "Stopping the recording…"
-    state.mode = "transcribing"
+    state.mode = "menu"                   # the work is a job now, not a screen
     live.update(_tui_render(state))       # visible feedback on the keypress itself
     threading.Thread(
         target=_stop_worker,
-        args=(state, project_dir, language, name, save_channels, diarize_system),
+        args=(state, job, recorders, diarize_system),
         daemon=True).start()
+    return job
 
 
-def _stop_worker(state, project_dir, language, name, save_channels, diarize_system):
+def _stop_worker(state, job, recorders, diarize_system):
     """Background half of a confirmed stop: stop the recorders, mix their raw capture
-    files into audio.wav, then transcribe and save. Reports progress via state.tx_*."""
-    for r in state.recorders:
-        try:
-            r.stop()
-        except Exception:
-            pass
-    audio_path = project_dir / "audio.wav"
-    n = _finalize_sources(project_dir, [r.manifest() for r in state.recorders],
-                          save_channels=save_channels)
-    state.recorders = []
-    if not n:
-        state.status = "No audio captured; recording discarded."
-        shutil.rmtree(project_dir, ignore_errors=True)
-        state.mode = "menu"
-        return
-    # audio.wav is safely on disk now — drop the larger raw files and clear the flag.
-    _clear_capture(project_dir)
-    _transcribe_and_save(state, project_dir, audio_path, language, name,
-                         diarize_system=diarize_system)
+    files into audio.wav, then transcribe and save. Reports progress on the job.
+
+    `recorders` and the manifests on the job are passed in rather than read off the
+    state; see _stop_and_transcribe for what reading them here cost.
+
+    Everything is wrapped, and the job reaches a terminal state on every path: an
+    exception escaping this thread killed it silently and left the app on the
+    transcription screen forever, accepting no key and saying nothing. A job left
+    running is the same failure wearing different clothes — it is never pruned, it
+    blocks its recording's guard, and it sits in the quit confirmation for good."""
+    project_dir = job.project_dir
+    try:
+        for r in recorders:
+            try:
+                r.stop()
+            except Exception:
+                pass
+        n = _finalize_sources(project_dir, job.manifests,
+                              save_channels=job.diarize,
+                              on_progress=lambda p: setattr(job, "pct", p))
+        if not n:
+            shutil.rmtree(project_dir, ignore_errors=True)
+            _job_finish(state, job, "No audio captured; recording discarded.",
+                        failed=True)
+            state.recordings = list_recordings(state.base_path)
+            return
+        # audio.wav is safely on disk now — drop the larger raw files and clear the flag.
+        _clear_capture(project_dir)
+        # The recording exists on disk from here on, so put it in the list before the
+        # slow part: until it is there, a transcribing recording has no row to show a
+        # progress badge on.
+        state.recordings = list_recordings(state.base_path)
+        _transcribe_and_save(state, job, diarize_system=diarize_system)
+    except Exception as e:
+        _log_problem(f"finishing the recording “{job.label}” failed", e)
+        _job_finish(state, job, f"Could not finish the recording: {e}", failed=True)
+        state.status = f"Could not finish the recording: {e}"
 
 
 _PUBLISH_STEPS = {"edit": "Editing transcript “{label}”…",
@@ -2321,33 +2807,40 @@ def _publish_gate(project_dir, text):
 def _publish_async(state, project_dir, text, name):
     """Send a long transcript through OpenAI and file the results on GitHub.
 
-    Runs behind the menu, on the status line: the transcript this works from is
-    already saved, and the two model calls take minutes. Returns the worker thread, or
-    None when the gate says no, with the reason on the status line.
+    Runs as a job: the transcript this works from is already saved, and the two model
+    calls take minutes. Returns the worker thread, or None when the gate says no, with
+    the reason on the status line.
 
     A failure is recorded in meta.json as well as shown. The status line is volatile —
     it is gone as soon as anything else happens, and the thread is a daemon, so
     quitting the app kills the job mid-flight — which once left a failed publish with
-    nothing anywhere to say what had gone wrong."""
+    nothing anywhere to say what had gone wrong.
+
+    Publishes run in parallel with each other and with everything else; only the push
+    is serialized, inside publish.publish_files, because two commits branched from the
+    same head cannot both fast-forward the branch."""
     cfg, reason = _publish_gate(project_dir, text)
     if reason:
         state.status = reason
         return None
     label = name or Path(project_dir).name
+    job = _job_add(state, Job("publish", project_dir, label,
+                              name=name, base_path=state.base_path,
+                              steps=list(_PUBLISH_STEPS)))
 
     def worker():
         try:
             url = publish.run(
                 cfg, project_dir, text, name,
-                on_step=lambda s: setattr(state, "bg_msg", _PUBLISH_STEPS[s].format(
-                    label=label, repo=cfg["repo"])))
+                on_step=lambda s: _job_begin(job, s))
             _write_meta(project_dir, publish_error="", published={
                 "url": url, "at": datetime.now().isoformat(timespec="seconds")})
-            state.bg_msg = None
-            state.status = f"Published “{label}” → {url}"
+            message = f"Published “{label}” → {url}"
+            _job_finish(state, job, message)
+            state.status = message
         except Exception as e:
             _write_meta(project_dir, publish_error=str(e))
-            state.bg_msg = None
+            _job_finish(state, job, f"Publish failed: {e}", failed=True)
             state.status = f"Publish failed: {e}"
         state.recordings = list_recordings(state.base_path)
 
@@ -2363,14 +2856,21 @@ def _publish_existing(state, rec):
     trigger one: nothing is sent to OpenAI or GitHub, and nothing is paid for, until
     it is asked for here. Stages that already produced output — a publish that failed
     at the push, or one cut short by quitting the app — are reused rather than paid
-    for twice."""
+    for twice.
+
+    The gate is per recording, not global. It used to refuse whenever any background
+    message was on screen, which meant a publish was refused while an unrelated
+    recovery ran — and did not actually stop two publishes of the same recording,
+    because the thing it checked was only set by the worker's first progress
+    callback, so two quick presses both got past it."""
     project_dir = Path(rec["dir"])
     transcript = project_dir / "transcription.txt"
     if not transcript.exists():
         state.status = "No transcript to publish"
         return None
-    if state.bg_msg:
-        state.status = "Another background job is already running"
+    busy = _job_working_in(state, project_dir)
+    if busy is not None:
+        state.status = _busy_reason(busy)
         return None
     try:
         text = transcript.read_text(encoding="utf-8")
@@ -2379,200 +2879,223 @@ def _publish_existing(state, rec):
         return None
     thread = _publish_async(state, project_dir, text, rec.get("name") or "")
     if thread:
-        state.status = "Publishing…"
+        state.status = f"Publishing “{rec.get('name') or project_dir.name}”…"
     return thread
 
 
-def _save_and_open(state, project_dir, text, name=None, language=None, speaker_map=None):
+def _save_and_open(state, job, text, speaker_map=None):
     """Write transcription.txt + meta, refresh the recordings list, and open the
-    transcript in the chosen app. Sets state.status; does not change state.mode.
+    transcript in the chosen app. Returns the one-line outcome for the job to carry;
+    does not change state.mode.
 
     Publishing is not part of this: it starts only from [u] on a recording.
 
-    `name`/`language` default to the pending ones on state (the import flow); the
-    transcription jobs pass the recording's own, since they run in the background
-    and must not depend on settings the user may change meanwhile.
+    Everything it needs comes off the job, which settled it when the user asked for
+    the work. It used to read `state.pending_name`, `state.language` and
+    `state.open_app` live: the import worker relied on those, so an import running
+    while the next recording was being named saved itself under that recording's name,
+    and a language toggle mid-job mislabelled a transcript already being written.
+
+    The name is written only if the recording does not have one. A rename while the
+    job runs is the user's more recent intent, and this used to overwrite it with the
+    name the job started with — a lost update that a lock would only have made
+    reliable rather than fixed.
 
     `speaker_map` (raw label -> 'Speaker N'), when present, is the diarization
     result; its friendly names are stored in meta.json for possible later renaming."""
-    name = state.pending_name if name is None else name
-    language = state.language if language is None else language
+    project_dir = job.project_dir
     transcript_path = project_dir / "transcription.txt"
     try:
         with open(transcript_path, "w", encoding="utf-8") as f:
             f.write(text + "\n")
     except Exception as e:
-        state.status = f"Save error: {e}"
-        return
+        return f"Save error: {e}"
     speakers = sorted(speaker_map.values()) if speaker_map else None
-    _write_meta(project_dir, name=name, language=language, speakers=speakers)
+    existing = _read_meta(project_dir).get("name")
+    _write_meta(project_dir, name=(None if existing else job.name),
+                language=job.language, speakers=speakers)
     state.recordings = list_recordings(state.base_path)
-    label = name or project_dir.name
-    state.status = f"Saved “{label}”"
-    if state.open_app:
-        err = _open_in_app(state.open_app, transcript_path)
-        state.status = (f"Saved — could not open in {state.open_app}"
-                        if err else f"Saved “{label}” & opened in {state.open_app}")
+    label = existing or job.name or project_dir.name
+    if not job.open_app:
+        return f"Saved “{label}”"
+    err = _open_in_app(job.open_app, transcript_path)
+    return (f"Saved — could not open in {job.open_app}" if err
+            else f"Saved “{label}” & opened in {job.open_app}")
 
 
-def _transcribe_and_save(state, project_dir, audio_path, language, name,
-                         diarize_system=False):
-    """Transcribe `audio_path`, save, and open. Runs on a worker thread and reports
-    its step/percentage through state.tx_* for _transcribe_panel to render.
+def _transcribe_and_save(state, job, diarize_system=False):
+    """Transcribe the job's audio, save, and open. Runs on a worker thread and reports
+    its step/percentage on the job, for _jobs_panel to render.
 
     When `diarize_system` is set, transcribe the mic channel as 'Me' and diarize +
     transcribe the system channel into 'Speaker N', producing a labeled transcript.
     Falls back to the plain single-file transcription if diarization is unavailable
-    or the channel files are missing."""
+    or the channel files are missing.
+
+    The save is inside the guard too: it writes a file, merges meta and shells out to
+    open an app, and a failure in any of those used to escape the thread and strand
+    the transcription screen."""
     try:
         if diarize_system:
-            text, speaker_map = _labeled_recording_text(state, project_dir, language)
+            text, speaker_map = _labeled_recording_text(state, job)
         else:
-            text, speaker_map = _plain_transcript(state, audio_path, language), None
+            text, speaker_map = _plain_transcript(job), None
+        message = _save_and_open(state, job, text, speaker_map=speaker_map)
+        _job_finish(state, job, message)
+        state.status = message
     except Exception as e:
+        _log_problem(f"transcribing “{job.label}” failed", e)
+        _job_finish(state, job, f"Transcription error: {e}", failed=True)
         state.status = f"Transcription error: {e}"
-        state.mode = "menu"
-        return
-    _save_and_open(state, project_dir, text, name=name, language=language,
-                   speaker_map=speaker_map)
-    state.mode = "menu"
 
 
-def _plain_transcript(state, audio_path, language):
-    """Transcribe a single WAV, driving the panel's Transcribe step (a real
-    percentage for English, a spinner for Turkish — see transcribe_audio)."""
-    dur = _wav_duration(audio_path)
-    _tx_begin(state, "transcribe", pct=0.0 if (language == "en" and dur) else None)
-    return transcribe_audio(audio_path, language, duration=dur,
-                            on_progress=lambda p: setattr(state, "tx_pct", p))
+def _plain_transcript(job):
+    """Transcribe a single WAV, driving the job's Transcribe step (a real percentage
+    for English, a spinner for Turkish — see transcribe_audio)."""
+    dur = _wav_duration(job.audio_path)
+    _job_begin(job, "transcribe",
+               pct=0.0 if (job.language == "en" and dur) else None)
+    return transcribe_audio(job.audio_path, job.language, duration=dur,
+                            on_progress=lambda p: setattr(job, "pct", p),
+                            on_wait=_job_waiting(job))
 
 
 def _transcribe_existing(state, live, rec):
     """Transcribe an already-recorded audio.wav that has no transcript yet (e.g. a
     recording recovered after an interrupted capture). Uses the recording's own
     saved language/name, and diarizes if speaker labels are on and channel files
-    are present. Runs in a worker thread so the progress screen stays live."""
+    are present. Runs as a job, so the menu stays usable while it works."""
     project_dir = rec["dir"]
     audio_path = project_dir / "audio.wav"
     if not audio_path.exists():
         state.status = "No audio to transcribe"
-        return
+        return None
+    busy = _job_working_in(state, project_dir)
+    if busy is not None:
+        state.status = _busy_reason(busy)
+        return None
     language = rec.get("language") or state.language
     name = rec.get("name") or ""
     diarize_system = state.diarize and (project_dir / "system.wav").exists()
-    state.tx_name = name or project_dir.name
-    state.tx_language = language
-    _tx_begin(state, "diarize" if diarize_system else "transcribe",
-              steps=(["diarize"] if diarize_system else []) + ["transcribe"])
-    state.status = "Starting transcription…"
-    state.mode = "transcribing"
+    job = _job_add(state, Job(
+        "transcribe", project_dir, name or project_dir.name,
+        language=language, name=name, diarize=state.diarize,
+        open_app=state.open_app, base_path=state.base_path,
+        audio_path=audio_path, cfg=state.cfg,
+        steps=(["diarize"] if diarize_system else []) + ["transcribe"]))
+    state.status = f"Transcribing “{job.label}”…"
     live.update(_tui_render(state))
     threading.Thread(
-        target=_transcribe_and_save,
-        args=(state, project_dir, audio_path, language, name),
+        target=_transcribe_and_save, args=(state, job),
         kwargs={"diarize_system": diarize_system}, daemon=True).start()
+    return job
 
 
-def _labeled_recording_text(state, project_dir, language):
+def _labeled_recording_text(state, job):
     """Build the labeled transcript for a recording: mic → 'Me', system → diarized
     'Speaker N'. Returns (text, speaker_map). Falls back to a plain transcript of
     audio.wav (no labels) if diarization fails or the channel files are absent."""
+    project_dir, language = job.project_dir, job.language
     mic_wav = project_dir / "mic.wav"
     sys_wav = project_dir / "system.wav"
 
     def plain():
         # No speaker labels after all — drop that step so the panel stops showing it.
-        state.tx_steps = [s for s in state.tx_steps if s != "diarize"]
-        return _plain_transcript(state, project_dir / "audio.wav", language), None
+        job.steps = [s for s in job.steps if s != "diarize"]
+        return _plain_transcript(job), None
 
     if not sys_wav.exists():
         return plain()
-    _tx_begin(state, "diarize")
+    _job_begin(job, "diarize")
     try:
-        turns = diarize(sys_wav, state.cfg)
+        turns = diarize(sys_wav, job.cfg, on_wait=_job_waiting(job))
     except Exception as e:
-        state.status = f"Speaker labels off (diarization unavailable: {e})"
+        job.message = f"Speaker labels off (diarization unavailable: {e})"
         return plain()
     # Both channels come from the same take, so each is half of the Transcribe step.
     has_mic = mic_wav.exists()
     dur = _wav_duration(sys_wav)
-    _tx_begin(state, "transcribe", pct=0.0 if (language == "en" and dur) else None)
+    _job_begin(job, "transcribe", pct=0.0 if (language == "en" and dur) else None)
     span = 0.5 if has_mic else 1.0
     sys_segments = transcribe_segments(
         sys_wav, language, duration=dur,
-        on_progress=lambda p: setattr(state, "tx_pct", p * span))
+        on_progress=lambda p: setattr(job, "pct", p * span),
+        on_wait=_job_waiting(job))
     mic_segments = []
     if has_mic:
-        state.tx_pct = span if state.tx_pct is not None else None
+        job.pct = span if job.pct is not None else None
         mic_segments = transcribe_segments(
             mic_wav, language, duration=_wav_duration(mic_wav),
-            on_progress=lambda p: setattr(state, "tx_pct", span + p * span))
+            on_progress=lambda p: setattr(job, "pct", span + p * span),
+            on_wait=_job_waiting(job))
     labeled, smap = build_labeled_recording(mic_segments, sys_segments, turns)
     return render_labeled_transcript(labeled), smap
 
 
-def _import_worker(state, src, project_dir):
+def _import_worker(state, job, src, diarize_system):
     """Background worker: extract audio (with progress), then transcribe (with
-    progress), then save+open. Updates state.import_* for the UI to render."""
-    audio_path = project_dir / "audio.wav"
-    # Phase 1: extract audio (real % from ffmpeg when duration is known).
-    dur = _media_duration(src)
-    state.import_phase = "extract"
-    state.import_pct = 0.0 if dur else None
-    state.import_phase_start = time.monotonic()
-    err = _extract_audio(
-        src, audio_path, duration=dur,
-        on_pct=(lambda p: setattr(state, "import_pct", p)) if dur else None,
-    )
-    if err:
-        state.status = f"Import failed: {err}"
-        try:
-            project_dir.rmdir()
-        except Exception:
-            pass
-        state.mode = "menu"
-        return
+    progress), then save+open. Reports progress on the job.
 
-    # Phase 2: transcribe (real % for English via segments; indeterminate for tr).
-    tdur = _media_duration(audio_path) or dur
-    state.import_phase = "transcribe"
-    state.import_pct = 0.0 if (state.language == "en" and tdur) else None
-    state.import_phase_start = time.monotonic()
+    Everything it needs is on the job, settled by _import_file on the UI thread. The
+    language used to be read off the state twice — once to decide whether the panel
+    could show a real percentage, once to pick the model — so a toggle between the two
+    made the panel and the model disagree about the same job."""
+    audio_path, language = job.audio_path, job.language
     try:
-        if state.diarize:
-            text, speaker_map = _labeled_import_text(state, audio_path, tdur)
+        # Phase 1: extract audio (real % from ffmpeg when duration is known).
+        dur = _media_duration(src)
+        _job_begin(job, "extract", pct=0.0 if dur else None)
+        err = _extract_audio(
+            src, audio_path, duration=dur,
+            on_pct=(lambda p: setattr(job, "pct", p)) if dur else None,
+        )
+        if err:
+            try:
+                job.project_dir.rmdir()
+            except Exception:
+                pass
+            _job_finish(state, job, f"Import failed: {err}", failed=True)
+            state.status = f"Import failed: {err}"
+            return
+
+        # Phase 2: transcribe (real % for English via segments; indeterminate for tr).
+        tdur = _media_duration(audio_path) or dur
+        _job_begin(job, "transcribe",
+                   pct=0.0 if (language == "en" and tdur) else None)
+        if diarize_system:
+            text, speaker_map = _labeled_import_text(state, job, tdur)
         else:
             text = transcribe_audio(
-                audio_path, state.language,
-                on_progress=(lambda p: setattr(state, "import_pct", p)),
-                duration=tdur,
+                audio_path, language,
+                on_progress=(lambda p: setattr(job, "pct", p)),
+                duration=tdur, on_wait=_job_waiting(job),
             )
             speaker_map = None
+
+        message = _save_and_open(state, job, text, speaker_map=speaker_map)
+        _job_finish(state, job, message)
+        state.status = message
     except Exception as e:
+        _log_problem(f"importing “{job.label}” failed", e)
+        _job_finish(state, job, f"Transcription error: {e}", failed=True)
         state.status = f"Transcription error: {e}"
-        state.mode = "menu"
-        return
-
-    _save_and_open(state, project_dir, text, speaker_map=speaker_map)
-    state.mode = "menu"
 
 
-def _labeled_import_text(state, audio_path, tdur):
+def _labeled_import_text(state, job, tdur):
     """Labeled transcript for an imported file: diarize the whole mixed file into
     'Speaker N' (no 'Me', since there is no separate mic channel). Returns
     (text, speaker_map). Falls back to a plain transcript if diarization fails."""
     segments = transcribe_segments(
-        audio_path, state.language,
-        on_progress=(lambda p: setattr(state, "import_pct", p)),
-        duration=tdur,
+        job.audio_path, job.language,
+        on_progress=(lambda p: setattr(job, "pct", p)),
+        duration=tdur, on_wait=_job_waiting(job),
     )
-    state.import_phase = "diarize"
-    state.import_pct = None
-    state.import_phase_start = time.monotonic()
+    _job_begin(job, "diarize")
     try:
-        turns = diarize(audio_path, state.cfg)
+        turns = diarize(job.audio_path, job.cfg, on_wait=_job_waiting(job))
     except Exception as e:
-        state.status = f"Speaker labels off (diarization unavailable: {e})"
+        job.message = f"Speaker labels off (diarization unavailable: {e})"
+        job.steps = [s for s in job.steps if s != "diarize"]
         return " ".join(s["text"] for s in segments), None
     labeled, smap = build_labeled_diarized(segments, turns)
     return render_labeled_transcript(labeled), smap
@@ -2596,25 +3119,34 @@ def _import_file(state, live):
         state.mode = "menu"
         return
 
-    project_dir = state.base_path / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     try:
-        project_dir.mkdir(parents=True, exist_ok=True)
+        project_dir = _new_project_dir(state.base_path)
     except Exception as e:
         state.status = f"Folder error: {e}"
         state.mode = "menu"
         return
-    # Default an unnamed import to the source file's base name.
-    if not state.pending_name:
-        state.pending_name = os.path.splitext(os.path.basename(src))[0]
-    _write_meta(project_dir, name=state.pending_name, language=state.language)
+    # Default an unnamed import to the source file's base name. Settled here, on the
+    # UI thread, together with the language and the speaker-label choice: the worker
+    # runs for minutes and must not depend on what the user does meanwhile.
+    name = state.pending_name or os.path.splitext(os.path.basename(src))[0]
+    state.pending_name = name
+    language, diarize_system = state.language, state.diarize
+    _write_meta(project_dir, name=name, language=language)
 
-    state.import_src = os.path.basename(src)
-    state.import_phase = ""
-    state.import_pct = None
-    state.status = "Importing…"
-    state.mode = "importing"
-    threading.Thread(target=_import_worker, args=(state, src, project_dir),
-                     daemon=True).start()
+    job = _job_add(state, Job(
+        "import", project_dir, os.path.basename(src),
+        language=language, name=name, diarize=diarize_system,
+        open_app=state.open_app, base_path=state.base_path,
+        audio_path=project_dir / "audio.wav", cfg=state.cfg,
+        # extract → transcribe → diarize: an import diarizes the mixed file after
+        # transcribing it, the opposite order to a recording's channel split.
+        steps=["extract", "transcribe"] + (["diarize"] if diarize_system else [])))
+    state.status = f"Importing {job.label}…"
+    state.mode = "menu"                   # the work is a job now, not a screen
+    threading.Thread(
+        target=_import_worker, args=(state, job, src, diarize_system),
+        daemon=True).start()
+    return job
 
 
 def _begin_named(state, action):
@@ -2667,6 +3199,9 @@ def _activate_setting(state, live, setting):
 
 def _menu_activate(state, live, cur):
     kind = cur["kind"]
+    if kind == "job":
+        state.mode = "jobs"
+        return
     if kind == "group":
         g = cur["group"]
         if g in state.menu_expanded:
@@ -2684,6 +3219,23 @@ def _menu_activate(state, live, cur):
         _activate_setting(state, live, cur["setting"])
 
 
+def _confirm_delete(state, rec, return_mode):
+    """[d] on a recording: ask, unless a job is still working in that folder.
+
+    Deleting under a running job is the one refusal here that costs money if it is
+    missed — a publish writes its edited transcript and documentation into the folder
+    after paying OpenAI for them, and rmtree in the middle throws that away."""
+    busy = _job_working_in(state, rec["dir"])
+    if busy is not None:
+        state.status = f"{_busy_reason(busy)} — cannot delete it yet"
+        return False
+    state.delete_target = rec["dir"]
+    state.delete_name = _rec_display_name(rec)
+    state.delete_return = return_mode
+    state.mode = "confirm_delete"
+    return True
+
+
 def _start_rename(state, rec, return_mode):
     state.rename_target = rec["dir"]
     state.rename_buffer = rec["name"]
@@ -2691,14 +3243,24 @@ def _start_rename(state, rec, return_mode):
     state.mode = "rename"
 
 
-def _tui_handle_key(key, state, live):
-    """Dispatch a keystroke. Returns False to quit, True to keep running."""
+def _tui_handle_key(key, state, live, items=None):
+    """Dispatch a keystroke. Returns False to quit, True to keep running.
+
+    `items` is the row list the frame the user was looking at was drawn from. Building
+    a fresh one here means a job that started or finished between the frame and the
+    keypress shifts the rows, and [d] then targets a different recording than the one
+    that was highlighted."""
     mode = state.mode
     if mode == "menu":
-        items = _menu_items(state)
+        items = _menu_items(state) if items is None else items
         state.menu_index = max(0, min(state.menu_index, len(items) - 1))
         cur = items[state.menu_index]
         if key in ("q", "Q"):
+            # Never take a job down without asking: a transcription in flight has no
+            # transcript yet, and a publish has already paid for its model calls.
+            if _active_jobs(state):
+                state.mode = "confirm_quit"
+                return True
             return False
         elif key in ("UP", "k"):
             state.menu_index = (state.menu_index - 1) % len(items)
@@ -2714,6 +3276,9 @@ def _tui_handle_key(key, state, live):
                 state.menu_expanded.discard(cur["group"])
         elif key == "ENTER":
             if cur["kind"] == "action" and cur["action"] == "quit":
+                if _active_jobs(state):
+                    state.mode = "confirm_quit"
+                    return True
                 return False
             _menu_activate(state, live, cur)
         elif cur["kind"] == "recording":
@@ -2728,10 +3293,7 @@ def _tui_handle_key(key, state, live):
                 if cur["rec"]["has_transcript"]:
                     _publish_existing(state, cur["rec"])
             elif key in ("d", "D"):
-                state.delete_target = cur["rec"]["dir"]
-                state.delete_name = _rec_display_name(cur["rec"])
-                state.delete_return = "menu"
-                state.mode = "confirm_delete"
+                _confirm_delete(state, cur["rec"], "menu")
     elif mode == "name_input":
         if key == "ESC":
             state.mode = "menu"
@@ -2791,10 +3353,8 @@ def _tui_handle_key(key, state, live):
             if state.viewer_rec and not state.viewer_rec.get("has_transcript"):
                 _transcribe_existing(state, live, state.viewer_rec)
         elif key in ("d", "D"):
-            state.delete_target = state.viewer_rec["dir"]
-            state.delete_name = _rec_display_name(state.viewer_rec)
-            state.delete_return = "menu"          # the recording is gone after delete
-            state.mode = "confirm_delete"
+            # "menu" on the way back: the recording is gone after a delete.
+            _confirm_delete(state, state.viewer_rec, "menu")
         elif key in ("r", "R"):
             _start_rename(state, state.viewer_rec, "viewer")
     elif mode == "rename":
@@ -2813,6 +3373,14 @@ def _tui_handle_key(key, state, live):
             state.rename_buffer = state.rename_buffer[:-1]
         elif key and len(key) == 1 and key.isprintable():
             state.rename_buffer += key
+    elif mode == "jobs":
+        if key in ("ESC", "q", "Q", "LEFT"):
+            state.mode = "menu"
+    elif mode == "confirm_quit":
+        # Anything but [y] stays, the same shape as confirm_stop and confirm_delete.
+        if key in ("y", "Y"):
+            return False
+        state.mode = "menu"
     elif mode == "confirm_delete":
         if key in ("y", "Y"):
             _delete_recording(state, state.delete_target)
@@ -2922,11 +3490,17 @@ def main():
             _recover_async(state)
             running = True
             while running:
-                live.update(_tui_render(state))
+                # Once per frame, and never inside a renderer: the body, the footer
+                # and the key handler all read the job list, and a prune between them
+                # would hand them different ones.
+                _prune_jobs(state)
+                jobs = _jobs_snapshot(state)
+                items = _menu_items(state, jobs) if state.mode == "menu" else None
+                live.update(_tui_frame(state, items, jobs))
                 key = _read_key(0.07)
                 if key is None:
                     continue
-                running = _tui_handle_key(key, state, live)
+                running = _tui_handle_key(key, state, live, items)
     finally:
         # Stop any active recorders (e.g. Ctrl-C mid-recording) so the tap
         # subprocess never lingers, and stop any audio playback.

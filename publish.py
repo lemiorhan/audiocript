@@ -9,6 +9,7 @@ import base64
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -233,6 +234,18 @@ def _publish_via_contents(cfg, folder, files, message, branch):
         f"https://github.com/{repo}/commit/{commit.get('sha', '')}"
 
 
+# One push at a time. Everything before this — both model calls, which are the slow
+# and expensive part — runs in parallel; this does not.
+#
+# The sequence below reads the branch head, builds a commit whose parent is that head,
+# and then moves the ref. Two publishes overlapping would read the same head and the
+# second PATCH would not be a fast-forward: GitHub answers 422 and a job that did
+# everything right reports "Publish failed". Serializing it here is enough for two
+# publishes from this app; a push from anywhere else can still land in between, and
+# that case still surfaces as the 422 it is.
+_PUSH_LOCK = threading.Lock()
+
+
 def publish_files(cfg, folder, files, message):
     """Commit `files` ({name: text}) under `folder` and return the commit's URL.
 
@@ -240,7 +253,14 @@ def publish_files(cfg, folder, files, message):
     lands in one commit named after the recording and nothing has to be cloned. A
     repository with no commits yet cannot be reached that way — GitHub answers the
     branch ref with a plain 404, or with 409 "Git Repository is empty." — so its first
-    files go through the Contents API instead (see `_publish_via_contents`)."""
+    files go through the Contents API instead (see `_publish_via_contents`).
+
+    Serialized against other publishes — see _PUSH_LOCK."""
+    with _PUSH_LOCK:
+        return _publish_files_locked(cfg, folder, files, message)
+
+
+def _publish_files_locked(cfg, folder, files, message):
     repo = cfg["repo"]
     info = _ok(*_gh("GET", f"/repos/{repo}", cfg), f"repo {repo}")
     branch = info.get("default_branch") or "main"
