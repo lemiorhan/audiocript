@@ -40,6 +40,9 @@ os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# pyannote.audio 4 ships with usage metrics on, exported to otel.pyannote.ai; the README
+# promises that diarization runs offline.
+os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "false")
 
 
 def _silence_ml_logging():
@@ -81,9 +84,13 @@ TR_HF_MODEL = "selimc/whisper-large-v3-turbo-turkish"
 EN_GGML_REPO = "distil-whisper/distil-large-v3-ggml"
 EN_GGML_FILE = "ggml-distil-large-v3.bin"
 
-# Speaker diarization (optional, opt-in). A gated Hugging Face model; needs a
-# token and the user must accept its terms once at huggingface.co.
+# Speaker diarization (optional, opt-in). Needs a Hugging Face token, and the user
+# must accept the terms of every repo in PYANNOTE_GATED_REPOS once at huggingface.co.
 PYANNOTE_MODEL = "pyannote/speaker-diarization-3.1"
+# The 3.1 model card names the first two. pyannote 4 loads a PLDA from community-1
+# by default, and the 3.1 config predates that parameter. All three are gated.
+PYANNOTE_GATED_REPOS = (PYANNOTE_MODEL, "pyannote/segmentation-3.0",
+                        "pyannote/speaker-diarization-community-1")
 
 # Cache loaded models so they are not reloaded.
 _hf_pipe = None
@@ -1377,7 +1384,7 @@ def _ensure_diarizer(cfg=None):
     """
     Load and cache the pyannote diarization pipeline. Thread-safe (locked). Raises
     RuntimeError with an actionable message if pyannote, the token, or the gated
-    model are unavailable — callers fail soft on that.
+    models are unavailable — callers fail soft on that.
     """
     global _diar_pipe
     if _diar_pipe is not None:
@@ -1395,15 +1402,17 @@ def _ensure_diarizer(cfg=None):
             raise RuntimeError("pyannote.audio not installed "
                                "(pip install pyannote.audio)") from e
         import torch
+        from huggingface_hub.errors import GatedRepoError
         token = _hf_token(cfg)
         if not _QUIET:
             console.print(f"[dim]Preparing speaker diarization ({PYANNOTE_MODEL})…[/dim]")
-        pipe = Pipeline.from_pretrained(PYANNOTE_MODEL, use_auth_token=token)
-        if pipe is None:
+        try:
+            pipe = Pipeline.from_pretrained(PYANNOTE_MODEL, token=token)
+        except GatedRepoError as e:
             raise RuntimeError(
                 "could not load the diarization model — set a Hugging Face token "
                 "(config 'hf_token' or HF_TOKEN env) and accept the terms at "
-                f"huggingface.co/{PYANNOTE_MODEL}")
+                + ", ".join(f"huggingface.co/{r}" for r in PYANNOTE_GATED_REPOS)) from e
         try:
             pipe.to(torch.device(pick_device()))
         except Exception:
@@ -1421,7 +1430,7 @@ def diarize(wav_path, cfg=None, *, on_wait=None):
     same moment. It also shares the device with the transcription models."""
     pipe = _ensure_diarizer(cfg)
     with _held_for_inference(on_wait):
-        annotation = pipe(str(wav_path))
+        annotation = pipe(str(wav_path)).speaker_diarization
     turns = [(float(seg.start), float(seg.end), str(spk))
              for seg, _, spk in annotation.itertracks(yield_label=True)]
     turns.sort(key=lambda t: t[0])
@@ -2941,6 +2950,8 @@ def _transcribe_and_save(state, job, diarize_system=False):
         else:
             text, speaker_map = _plain_transcript(job), None
         message = _save_and_open(state, job, text, speaker_map=speaker_map)
+        if job.message:
+            message = f"{message} · {job.message}"
         _job_finish(state, job, message)
         state.status = message
     except Exception as e:
@@ -3010,6 +3021,7 @@ def _labeled_recording_text(state, job):
     try:
         turns = diarize(sys_wav, job.cfg, on_wait=_job_waiting(job))
     except Exception as e:
+        _log_problem(f"speaker labels for “{job.label}” are off", e)
         job.message = f"Speaker labels off (diarization unavailable: {e})"
         return plain()
     # Both channels come from the same take, so each is half of the Transcribe step.
@@ -3073,6 +3085,8 @@ def _import_worker(state, job, src, diarize_system):
             speaker_map = None
 
         message = _save_and_open(state, job, text, speaker_map=speaker_map)
+        if job.message:
+            message = f"{message} · {job.message}"
         _job_finish(state, job, message)
         state.status = message
     except Exception as e:
@@ -3094,6 +3108,7 @@ def _labeled_import_text(state, job, tdur):
     try:
         turns = diarize(job.audio_path, job.cfg, on_wait=_job_waiting(job))
     except Exception as e:
+        _log_problem(f"speaker labels for “{job.label}” are off", e)
         job.message = f"Speaker labels off (diarization unavailable: {e})"
         job.steps = [s for s in job.steps if s != "diarize"]
         return " ".join(s["text"] for s in segments), None

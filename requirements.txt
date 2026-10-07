@@ -11,4 +11,8 @@ rich
 torch
 torchvision
 torchaudio
-pyannote.audio  # optional: speaker labels (needs a Hugging Face token; see README)
+# torchcodec comes in through pyannote.audio, and transformers' speech pipeline imports
+# it on every call once it is installed. Below 0.16 it cannot load FFmpeg 9, so with
+# FFmpeg 9 installed every Turkish transcription fails with "Could not load libtorchcodec".
+torchcodec>=0.16
+pyannote.audio>=4  # optional: speaker labels (needs a Hugging Face token; see README). 4 renamed use_auth_token to token

@@ -232,17 +232,22 @@ come from two sources combined:
 
 To enable it (one-time):
 
-1. `pip install pyannote.audio` (already in `requirements.txt`).
+1. `pip install -r requirements.txt`, which brings `pyannote.audio` 4 or newer
+   (`./run.sh` does this for you).
 2. Create a free [Hugging Face token](https://huggingface.co/settings/tokens) and
-   **accept the terms** of the gated model at
-   [`pyannote/speaker-diarization-3.1`](https://huggingface.co/pyannote/speaker-diarization-3.1).
+   **accept the terms** of each gated model it downloads:
+   [`pyannote/speaker-diarization-3.1`](https://huggingface.co/pyannote/speaker-diarization-3.1),
+   [`pyannote/segmentation-3.0`](https://huggingface.co/pyannote/segmentation-3.0) and
+   [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1).
 3. Make the token available as `HF_TOKEN` (env var) or `"hf_token"` in
    `config.json`.
 
 Notes & limits:
 
-- Diarization adds a processing pass and is **slower**; the model downloads once,
-  then runs **fully offline**. If the package or token is missing, Audiocript
+- Diarization adds a processing pass and is **slower**. The models download once;
+  after that **diarization sends neither audio nor transcripts anywhere** and works
+  without a network (when online, loading the models still asks Hugging Face
+  whether they changed). If the package or token is missing, Audiocript
   **falls back** to a normal unlabeled transcript and tells you why.
 - It's **acoustic clustering**, so the remote speaker count can occasionally be off
   and names are generic (`Speaker 1`) until you rename them.

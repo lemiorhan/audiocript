@@ -10,6 +10,7 @@ a fix: guarding unload_model against an inference in flight.
 """
 import threading
 import time
+import types
 
 from support import A, run, workdir
 
@@ -125,7 +126,7 @@ def test_two_diarizations_never_run_at_once():
     class FakeDiarPipe:
         def __call__(self, path):
             detector.enter()
-            return FakeAnnotation()
+            return types.SimpleNamespace(speaker_diarization=FakeAnnotation())
 
     saved = A._diar_pipe
     A._diar_pipe = FakeDiarPipe()
@@ -276,7 +277,7 @@ def test_the_diarizer_load_does_not_block_a_transcription_model_load():
 
     class FakePipelineClass:
         @staticmethod
-        def from_pretrained(name, use_auth_token=None):
+        def from_pretrained(name, token=None):
             diarizer_loading.set()
             release.wait(TIMEOUT)          # stands in for the gated download
             return FakeDiarPipe()

@@ -102,7 +102,31 @@ exit 99
         assert log.read_text().splitlines() == ["upgrade", "mandatory"]
 
 
+def test_torchcodec_decodes_audio_with_the_installed_ffmpeg():
+    """transformers imports torchcodec on every Turkish transcription and pyannote reads
+    the diarized WAV through it. A torchcodec built for older FFmpeg majors than the one
+    installed broke both, and every test that fakes the models stayed green."""
+    import wave
+
+    import numpy as np
+    from torchcodec.decoders import AudioDecoder
+
+    with workdir("torchcodec") as d:
+        path = d / "half-second.wav"
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(np.zeros(8000, dtype="<i2").tobytes())
+        samples = AudioDecoder(str(path)).get_all_samples()
+
+    print(f"  decoded {tuple(samples.data.shape)} at {samples.sample_rate} Hz")
+    assert samples.sample_rate == 16000
+    assert tuple(samples.data.shape) == (1, 8000)
+
+
 if __name__ == "__main__":
     run(["test_aec_dependency_is_optional",
-         "test_setup_retries_changed_optional_dependencies_without_blocking_launch"],
+         "test_setup_retries_changed_optional_dependencies_without_blocking_launch",
+         "test_torchcodec_decodes_audio_with_the_installed_ffmpeg"],
         globals())
